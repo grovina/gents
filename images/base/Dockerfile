@@ -5,10 +5,24 @@
 FROM python:3.13-bookworm
 
 # Node 22 (Claude Code runtime) + the common toolbelt.
+# gh (GitHub CLI) is here because the in-box SSH deploy key only covers
+# `git push` — it can't drive the GitHub API. Agents routinely need to READ a
+# PR's metadata/diff/CI to review it (e.g. "review PR #1, find gaps"); gh + a
+# fleet-wide read-only GH_TOKEN (wired in `gent up`) is what makes that work,
+# instead of falling back to a bare `git fetch pull/N/head` that sees no
+# title, threads, checks, or review state. Installed from GitHub's own apt repo
+# (Debian stable ships no/old gh). vim+unzip fill two small gaps: a box had no
+# editor for `gent shell`, and unzip is a frequent stumble.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg \
+      curl ca-certificates git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends nodejs gh \
  && rm -rf /var/lib/apt/lists/*
 
 # Trust GitHub's SSH host key once, fleet-wide, so git-over-ssh never stops on

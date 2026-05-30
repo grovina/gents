@@ -154,6 +154,8 @@ def cmd_doctor(fleet, _a):
     print(f"{'✓' if sr.is_dir() else '·'} secrets_root {sr} {'' if sr.is_dir() else '(absent — fine until a repo needs a slice)'}")
     sc = fleet["secrets_root"] / "claude-home" / ".credentials.json"
     print(f"{'✓' if sc.exists() else '✗'} shared box login {'present (all boxes share it)' if sc.exists() else 'absent — `gent attach <repo>` and run /login once'}")
+    gh_env = fleet["secrets_root"] / "github.env"
+    print(f"{'✓' if gh_env.exists() else '·'} GitHub token {gh_env} {'present (gh reads the API in every box)' if gh_env.exists() else '(absent — gh has no token; add GH_TOKEN=… here for read-only PR/issue access)'}")
     sys.exit(0 if ok else 1)
 
 
@@ -255,6 +257,20 @@ def cmd_up(fleet, a):
     gitcfg = fleet["secrets_root"] / "gitconfig"
     if gitcfg.exists():
         args += ["-v", f"{gitcfg}:/home/gent/.gitconfig:ro"]
+
+    # Fleet-wide GitHub token so in-box `gh` can READ the GitHub API (PR title,
+    # diff, threads, CI status, issues) — the deploy key only covers `git push`,
+    # not the API. ONE fine-grained PAT, shared by all boxes like the claude
+    # login: drop it at secrets_root/github.env as `GH_TOKEN=...`, auto-applied
+    # when present (gh reads GH_TOKEN with no `gh auth login`). Keep it READ-ONLY
+    # (Pull requests + Issues: read; Contents: none) — that's the point: a write
+    # scope would be a second, fleet-wide push path that defeats the per-repo
+    # deploy key, so the deploy key stays the ONLY way to write, per repo. A box
+    # that genuinely must POST to GitHub gets a write-scoped token in ITS OWN
+    # repo's catalog `env_files` (applied after this, so it overrides).
+    gh_env = fleet["secrets_root"] / "github.env"
+    if gh_env.exists():
+        args += ["--env-file", str(gh_env)]
 
     # Per-repo GitHub deploy key (write-scoped to THIS repo), minted + registered
     # idempotently, mounted read-only at a fixed, repo-agnostic path. Bootstrap
