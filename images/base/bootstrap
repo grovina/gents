@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# gents container entrypoint: start a persistent claude YOLO session in tmux
+# and keep the container alive. Attach from the host with `gents attach <repo>`.
+set -euo pipefail
+
+REPO=/repo
+cd "$REPO"
+
+# Boxes normally authenticate via the SHARED ~/.claude login (a bind-mount —
+# see below), so only warn when there's no shared login yet AND no env token —
+# otherwise this cried wolf on every correctly-configured box.
+if [ ! -f "$HOME/.claude/.credentials.json" ] \
+   && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "gents: WARNING — no shared login yet, and no CLAUDE_CODE_OAUTH_TOKEN /" >&2
+  echo "       ANTHROPIC_API_KEY; claude will be unauthenticated. Run /login once" >&2
+  echo "       in any box (see gents README, auth section)." >&2
+fi
+
+# Seed claude config so the box never blocks on interactive first-run
+# onboarding (theme picker etc). /home/gent is a persistent volume, so this
+# only fires on a fresh box.
+mkdir -p "$HOME/.claude"
+if [ ! -f "$HOME/.claude.json" ]; then
+  cat > "$HOME/.claude.json" <<'JSON'
+{
+  "hasCompletedOnboarding": true,
+  "theme": "dark",
+  "numStartups": 5,
+  "projects": { "/repo": { "hasTrustDialogAccepted": true } }
+}
+JSON
+fi
+# settings.json: ENFORCE the gents baseline on every start by MERGING (so keys
+# claude writes at runtime — e.g. agentPushNotifEnabled — survive, but our
+# values always win). Skip the bypass-mode warning, enable Remote Control at
+# startup, drop the co-authored-by commit trailer.
+SETTINGS="$HOME/.claude/settings.json"
+[ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+_baseline='{skipDangerousModePermissionPrompt: true, remoteControlAtStartup: true, includeCoAuthoredBy: false}'
+if _tmp="$(mktemp)" && jq ". + $_baseline" "$SETTINGS" > "$_tmp" 2>/dev/null; then
+  mv "$_tmp" "$SETTINGS"
+else
+  rm -f "${_tmp:-}"
+  printf '{"skipDangerousModePermissionPrompt": true, "remoteControlAtStartup": true, "includeCoAuthoredBy": false}\n' > "$SETTINGS"
+fi
+
+# Auth: ~/.claude is a SHARED bind-mount across all boxes (gents mounts it), so
+# the login lives there — populated once by `/login` in any box, refreshes
+# propagate to all. Nothing to copy here.
+
+# Git push/pull: a per-repo GitHub deploy key (write-scoped to THIS repo only)
+# is mounted read-only at /secrets/ssh/key — gents mints + registers it and
+# wires the mount from the catalog. Install it as the DEFAULT ssh identity with
+# correct perms so `git push` just works (the host key is already trusted
+# fleet-wide via /etc/ssh/ssh_known_hosts). Inside the box it's simply "the
+# key"; the catalog holds one per repo. Idempotent — refreshed each start.
+if [ -f /secrets/ssh/key ]; then
+  install -d -m 700 "$HOME/.ssh"
+  install -m 600 /secrets/ssh/key "$HOME/.ssh/id_ed25519"
+fi
+
+# Optional per-repo first-run hook — the repo's own business (install deps,
+# start its poller, etc). Best-effort, never blocks the session coming up.
+if [ -f "$REPO/.gent/setup.sh" ]; then
+  echo "gents: running repo hook .gent/setup.sh" >&2
+  bash "$REPO/.gent/setup.sh" || echo "gents: .gent/setup.sh failed (continuing)" >&2
+fi
+
+# Persistent, attachable, SELF-HEALING session. If claude exits — crash, OOM,
+# or a transient auth gap on a box that booted before `/login` populated the
+# shared ~/.claude — relaunch it (same loop the sidecar services use below),
+# so a box never silently rots at a dead shell. For a debugging shell that
+# does NOT auto-restart, use `gent shell <repo>` (a separate window/exec).
+# To stop the loop: `gent down <repo>` (or kill the 'claude' window).
+# tmux config lives in the image at /etc/tmux.conf (truecolor + invisible UI so
+# attaching feels like a local claude) — no per-start heredoc needed here.
+
+# Name the session after the repo (hostname is gent-<repo>) so it's identifiable
+# in the phone app / claude.ai/code when several boxes run under one login.
+REPO_NAME="$(hostname)"; REPO_NAME="${REPO_NAME#gent-}"
+# Deterministic per-box session id so a restart RESUMES the same session instead
+# of spawning a fresh Remote Control session each time (which litters the phone
+# with offline ghosts). One stable, persistent session per box.
+SESSION_ID="$(python3 -c "import uuid,sys;print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.argv[1]))" "gent-$REPO_NAME")"
+# Resume-or-create, re-decided EVERY loop iteration: `claude --session-id X`
+# CREATES session X and refuses an id that already exists ("already in use"),
+# while `--resume X` CONTINUES it. The id is stable per box, so after the very
+# first launch the transcript exists — a plain `--session-id` relaunch (crash,
+# OOM, `gent down`/`up`) would then crash-loop forever on "already in use".
+# So: --resume when the transcript exists, --session-id to create it the first
+# time. Resuming the same id also reconnects the SAME Remote Control session
+# instead of spawning offline ghosts on the phone.
+SESS_FILE="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')/$SESSION_ID.jsonl"
+RUN="$HOME/.gent-run.sh"
+cat > "$RUN" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by the gents bootstrap on every container start. Self-healing
+# claude loop for this box. Stop it with \`gent down $REPO_NAME\`.
+set -u
+while :; do
+  if [ -f "$SESS_FILE" ]; then set -- --resume "$SESSION_ID"; else set -- --session-id "$SESSION_ID"; fi
+  claude --dangerously-skip-permissions -n "$REPO_NAME" "\$@"
+  echo
+  echo "[claude exited — relaunching in 5s; 'gent shell $REPO_NAME' for a shell, 'gent down $REPO_NAME' to stop]"
+  sleep 5
+done
+EOF
+chmod +x "$RUN"
+tmux new-session -d -s gent -n claude -c "$REPO" "exec bash '$RUN'"
+
+# Sidecar services declared in gent.json:services[] — long-running processes
+# that run ALONGSIDE claude (e.g. a chat-bot poller). gents owns their
+# lifecycle in dedicated, auto-restarting tmux windows; claude never spawns
+# them, it just monitors their output (tail -F / Monitor).
+if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
+  n=$(jq '.services | length' "$REPO/gent.json" 2>/dev/null || echo 0)
+  i=0
+  while [ "$i" -lt "${n:-0}" ]; do
+    sname=$(jq -r ".services[$i].name" "$REPO/gent.json")
+    scmd=$(jq -r ".services[$i].cmd" "$REPO/gent.json")
+    echo "gents: starting service '$sname': $scmd" >&2
+    tmux new-window -d -t gent -n "$sname" -c "$REPO" \
+      "while :; do $scmd; echo \"[$sname exited — restarting in 3s]\"; sleep 3; done"
+    i=$((i + 1))
+  done
+fi
+
+echo "gents: claude live in tmux 'gent' (window 0); services in their own windows" >&2
+exec tail -F /dev/null

@@ -1,0 +1,34 @@
+{
+  "secrets_root": "~/.config/agent-secrets",
+  "projects_root": "~/Projects",
+  "image": "gents-base:latest",
+
+  "_comment": "Copy this file to fleet.json and edit — fleet.json is gitignored (it's your machine's private grants). secrets_root is a shared CATALOG of reusable entries (credential files + .env fragments), referenced by relative path; isolation happens here in the grant, so a box sees only what its entry lists and can never get more. projects_root is where your repos live; each repo's `path` is relative to it.",
+
+  "repos": {
+    "myapp": {
+      "path": "myorg/myapp",
+      "allow": true,
+      "_note": "`allow` is the trust gate — gent refuses to start a box whose entry isn't allow:true. This example grants a scoped GCP service-account key (mounted read-only) plus a shared .env fragment and some inline ids.",
+      "resources": { "cpus": 2, "memory": "3g" },
+      "mounts": {
+        "/secrets/gcp/myapp-sa.json": "gcp/myapp-sa.json"
+      },
+      "env_files": ["shared.env"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/gcp/myapp-sa.json",
+        "MY_PROJECT_ID": "myapp-prod"
+      }
+    },
+
+    "minimal": {
+      "path": "myorg/minimal",
+      "allow": true,
+      "_note": "Simplest case: a repo in its own box, no secrets, no env.",
+      "resources": { "cpus": 2, "memory": "2g" },
+      "mounts": {},
+      "env_files": [],
+      "env": {}
+    }
+  }
+}

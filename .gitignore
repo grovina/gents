@@ -1,0 +1,19 @@
+# Secrets never live here — they live under fleet.json:secrets_root
+# (~/.config/agent-secrets). But guard against accidents anyway.
+secrets/
+*.env
+!images/**/*.env
+*.json.key
+*-sa.json
+application_default_credentials.json
+
+# Your machine's private grants. Ship fleet.example.json instead; copy it to
+# fleet.json locally. (gent reads fleet.json.)
+fleet.json
+
+# Claude Code's machine-local settings (absolute paths, per-machine perms).
+.claude/settings.local.json
+
+# Python bytecode cache
+__pycache__/
+*.pyc

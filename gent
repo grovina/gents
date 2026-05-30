@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""gent — keymaster CLI for the sandboxed agent fleet.
+
+Reads fleet.json (machine-side grants, next to this script) and each target
+repo's gent.json (repo-side requirements), and composes a `docker run` that
+mounts only that repo + its granted secret slices, with this machine's
+cpu/mem caps. One long-lived `claude --dangerously-skip-permissions` per repo,
+in tmux, attachable from the host.
+
+Stdlib only. The docker command is always printed before it runs — no magic.
+"""
+import argparse, json, os, re, shlex, subprocess, sys, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FLEET = HERE / "fleet.json"
+
+
+def die(msg):
+    print(f"gent: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def expand(p):
+    return Path(os.path.expanduser(p)).resolve() if p else None
+
+
+def load_fleet():
+    if not FLEET.exists():
+        die(f"no fleet.json at {FLEET} — copy fleet.example.json to fleet.json and add your repos")
+    f = json.loads(FLEET.read_text())
+    f["secrets_root"] = expand(f.get("secrets_root", "~/.config/agent-secrets"))
+    f["projects_root"] = expand(f.get("projects_root", "~/Projects"))
+    return f
+
+
+def repo_cfg(fleet, name):
+    repos = fleet.get("repos", {})
+    if name not in repos:
+        die(f"'{name}' not in fleet.json (known: {', '.join(repos) or 'none'})")
+    cfg = repos[name]
+    if not cfg.get("allow"):
+        die(f"'{name}' is not approved (set \"allow\": true in fleet.json — the trust gate)")
+    cfg["abs_path"] = fleet["projects_root"] / cfg["path"]
+    if not cfg["abs_path"].is_dir():
+        die(f"repo path does not exist: {cfg['abs_path']}")
+    return cfg
+
+
+def read_gent_json(cfg):
+    gj = cfg["abs_path"] / "gent.json"
+    if gj.exists():
+        try:
+            return json.loads(gj.read_text())
+        except json.JSONDecodeError as e:
+            die(f"bad gent.json in {cfg['abs_path']}: {e}")
+    return None
+
+
+def container(name):
+    return f"gent-{name}"
+
+
+def docker(*args, capture=False, check=True):
+    if capture:
+        return subprocess.run(["docker", *args], capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["docker", *args], check=check)
+
+
+def container_state(name):
+    out = docker("ps", "-a", "--filter", f"name=^{container(name)}$",
+                 "--format", "{{.State}}", capture=True)
+    return out or "—"
+
+
+# ── github deploy keys ───────────────────────────────────────────────────────
+
+def github_slug(abs_path):
+    """'owner/repo' for the repo's origin remote if it's on github, else None."""
+    url = subprocess.run(["git", "-C", str(abs_path), "remote", "get-url", "origin"],
+                         capture_output=True, text=True).stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    return m.group(1) if m else None
+
+
+def _gh(*args):
+    """Run gh, returning the CompletedProcess, or None if gh isn't installed."""
+    try:
+        return subprocess.run(["gh", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+
+
+def ensure_deploy_key(fleet, name, cfg):
+    """Idempotent: a per-repo GitHub deploy key in the catalog, registered with
+    WRITE access on this repo only. Returns the private-key path to mount, or
+    None if the repo has no github remote. Never fatal — a box must still come
+    up even if registration fails (e.g. you lack admin on the repo).
+
+    The catalog holds one key per repo (ssh/<repo>-deploy); inside the box it's
+    mounted at a fixed, repo-agnostic path. Blast radius = this one repo, the
+    same scoping as the per-repo GCP SAs."""
+    slug = github_slug(cfg["abs_path"])
+    if not slug:
+        return None
+    keydir = fleet["secrets_root"] / "ssh"
+    keydir.mkdir(parents=True, exist_ok=True)
+    key = keydir / f"{name}-deploy"
+    title = f"gent-{name}"
+
+    created = False
+    if not key.exists():
+        print(f"gent: minting deploy key for {slug}  ({key})")
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                        "-C", title, "-f", str(key)], check=True)
+        key.chmod(0o600)
+        created = True
+
+    listed = _gh("repo", "deploy-key", "list", "-R", slug)
+    if listed is None:
+        print("gent: WARNING — gh not found; can't auto-register the deploy key. "
+              f"Add {key}.pub to {slug} (write) by hand, or install gh.", file=sys.stderr)
+        return key
+    ids = [ln.split()[0] for ln in listed.stdout.splitlines()
+           if len(ln.split()) >= 2 and ln.split()[1] == title]
+    if created and ids:                    # stale key under our title — drop, re-add
+        for kid in ids:
+            _gh("repo", "deploy-key", "delete", kid, "-R", slug)
+        ids = []
+    if not ids:
+        added = _gh("repo", "deploy-key", "add", f"{key}.pub", "-R", slug, "-w", "-t", title)
+        if added.returncode != 0:
+            print(f"gent: WARNING — couldn't register deploy key on {slug} "
+                  f"(need admin on the repo?): {added.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"gent: deploy key registered (write) on {slug}")
+    return key
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_doctor(fleet, _a):
+    ok = True
+    if subprocess.run(["which", "docker"], capture_output=True).returncode:
+        print("✗ docker not found on PATH"); ok = False
+    else:
+        running = subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+        print(f"{'✓' if running else '✗'} docker daemon {'up' if running else 'NOT running (start Docker Desktop)'}")
+        ok = ok and running
+    img = fleet["image"]
+    have = docker("images", "-q", img, capture=True)
+    print(f"{'✓' if have else '✗'} base image {img} {'present' if have else 'missing — run: gent fleet build'}")
+    sr = fleet["secrets_root"]
+    print(f"{'✓' if sr.is_dir() else '·'} secrets_root {sr} {'' if sr.is_dir() else '(absent — fine until a repo needs a slice)'}")
+    sc = fleet["secrets_root"] / "claude-home" / ".credentials.json"
+    print(f"{'✓' if sc.exists() else '✗'} shared box login {'present (all boxes share it)' if sc.exists() else 'absent — `gent attach <repo>` and run /login once'}")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_ls(fleet, _a):
+    print(f"{'REPO':<16}{'STATE':<12}{'CPU/MEM':<12}PATH")
+    for name, cfg in fleet.get("repos", {}).items():
+        res = cfg.get("resources", {})
+        cm = f"{res.get('cpus','-')}/{res.get('memory','-')}"
+        gate = "" if cfg.get("allow") else " (not approved)"
+        print(f"{name:<16}{container_state(name):<12}{cm:<12}{cfg.get('path','?')}{gate}")
+
+
+def cmd_fleet_up(fleet, _a):
+    """Bring up every approved box that isn't already running. Batch-friendly:
+    skips `allow: false` repos and already-running boxes, and never aborts the
+    whole run on one repo's failure (missing image/path) — it reports per repo
+    and moves on. Note `--restart unless-stopped` already revives boxes when the
+    Docker daemon starts, so this is mainly for a fresh checkout or after a
+    `gent fleet down`."""
+    did = False
+    for name, cfg in fleet.get("repos", {}).items():
+        if not cfg.get("allow"):
+            print(f"·  {name:<16} skipped (not approved)"); continue
+        state = container_state(name)
+        if state == "running":
+            print(f"=  {name:<16} already running"); continue
+        if state != "—":              # exited / created / paused — don't clobber
+            print(f"!  {name:<16} exists (state: {state}) — `gent down {name}` to recreate"); continue
+        print(f"↑  {name:<16} starting…")
+        did = True
+        try:
+            cmd_up(fleet, argparse.Namespace(repo=name))
+        except SystemExit:            # cmd_up died on this repo; keep going
+            print(f"✗  {name:<16} failed (see message above)", file=sys.stderr)
+    if not did:
+        print("gent: nothing to bring up.")
+
+
+def cmd_fleet_down(fleet, _a):
+    """Stop + remove every box. Home volumes are always KEPT here — wiping every
+    box's installs/state in one command is too sharp to put behind a fleet flag;
+    wipe deliberately, per box, with `gent down <repo> --wipe`."""
+    did = False
+    for name in fleet.get("repos", {}):
+        if container_state(name) == "—":
+            continue
+        print(f"↓  {name:<16} down")
+        docker("rm", "-f", container(name), check=False)
+        did = True
+    print("gent: home volumes kept (per box: `gent down <repo> --wipe`)."
+          if did else "gent: no boxes to bring down.")
+
+
+def cmd_build(fleet, _a):
+    ctx = HERE / "images" / "base"
+    print(f"gent: building {fleet['image']} from {ctx}")
+    docker("build", "-t", fleet["image"], str(ctx))
+
+
+def cmd_up(fleet, a):
+    cfg = repo_cfg(fleet, a.repo)
+    gj = read_gent_json(cfg)
+    name = a.repo
+    cname = container(name)
+
+    if container_state(name) not in ("—",):
+        die(f"{cname} already exists (state: {container_state(name)}). `gent down {name}` first.")
+    if not docker("images", "-q", fleet["image"], capture=True):
+        die(f"base image {fleet['image']} missing — run: gent fleet build")
+
+    # Per-repo named volume for /home/gent: the agent's installs, caches, shell
+    # history and in-box claude state survive reboot, `down`, and rebuilds.
+    # (System `apt` installs live in / — for those, use the repo's .gent/setup.sh
+    # so the box stays reproducible.) Wipe with `gent down <repo> --wipe`.
+    args = ["run", "-d", "--name", cname, "--hostname", cname,
+            "--restart", "unless-stopped",
+            "-v", f"{cfg['abs_path']}:/repo",
+            "-v", f"gent-{name}-home:/home/gent",
+            "-w", "/repo"]
+
+    res = cfg.get("resources", {})
+    if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]
+    if res.get("memory"): args += ["--memory", str(res["memory"])]
+
+    # Auth: ALL boxes share ONE claude config dir (creds, settings, sessions) —
+    # exactly like your host's many sessions share ~/.claude. One `/login` in any
+    # box populates it; refreshes propagate to all (shared dir = rename-safe);
+    # no per-box login, no daemon. Independent of the host's own Keychain login.
+    shared_claude = fleet["secrets_root"] / "claude-home"
+    shared_claude.mkdir(parents=True, exist_ok=True)
+    args += ["-v", f"{shared_claude}:/home/gent/.claude"]
+
+    # Shared fleet caches (npm/pip/uv) so boxes reuse one warm cache instead of
+    # each re-downloading. Safe (content-addressable); a dedicated dir, not host's.
+    cache = fleet["secrets_root"] / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    args += ["-v", f"{cache}:/cache"]
+    # Curated git identity so in-box commits are attributed to you, not `gent`.
+    gitcfg = fleet["secrets_root"] / "gitconfig"
+    if gitcfg.exists():
+        args += ["-v", f"{gitcfg}:/home/gent/.gitconfig:ro"]
+
+    # Per-repo GitHub deploy key (write-scoped to THIS repo), minted + registered
+    # idempotently, mounted read-only at a fixed, repo-agnostic path. Bootstrap
+    # installs it as ~/.ssh/id_ed25519 so in-box `git push` just works. Inside
+    # the box it's simply "the key"; the catalog holds one per repo.
+    dkey = ensure_deploy_key(fleet, name, cfg)
+    if dkey:
+        args += ["-v", f"{dkey}:/secrets/ssh/key:ro"]
+
+    # Catalog mounts: container_path -> reusable entry under secrets_root, ro.
+    # The catalog is shared (one SA key can serve every repo in a project);
+    # isolation is here, in the grant — a box sees only what this lists.
+    for dest, rel in (cfg.get("mounts") or {}).items():
+        src = fleet["secrets_root"] / rel
+        if not src.exists():
+            die(f"{name}: catalog entry missing: {src}  (-> {dest})")
+        args += ["-v", f"{src}:{dest}:ro"]
+
+    # Reusable .env fragments from the catalog, then inline env.
+    for rel in (cfg.get("env_files") or []):
+        src = fleet["secrets_root"] / rel
+        if not src.exists():
+            die(f"{name}: catalog env_file missing: {src}")
+        args += ["--env-file", str(src)]
+
+    for k, v in (cfg.get("env") or {}).items():
+        args += ["-e", f"{k}={v}"]
+
+    args.append(fleet["image"])
+
+    print("gent: docker " + " ".join(shlex.quote(x) for x in args))
+    docker(*args)
+    print(f"gent: {name} up. attach: gent attach {name}")
+    if gj and gj.get("needs", {}).get("egress"):
+        print(f"gent: note — {name} declares egress {gj['needs']['egress']}; "
+              "enforcement is deferred (open egress for now).")
+
+
+def _wait_session(name, timeout=90):
+    """The container starts detached; bootstrap creates the tmux 'gent' session
+    only after seeding config and running the repo's .gent/setup.sh — which can
+    take a few seconds (longer on a fresh box). Poll so `gent attach` right
+    after `up` doesn't race ahead and hit tmux 'no current target'."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if subprocess.run(["docker", "exec", container(name), "tmux", "has-session", "-t", "gent"],
+                          capture_output=True).returncode == 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _attach(name):
+    # Bootstrap may still be coming up (esp. immediately after `up`/onboard) —
+    # wait for the session so we don't race into tmux 'no current target'.
+    if not _wait_session(name):
+        die(f"{container(name)} is running but its claude session hasn't appeared yet "
+            f"(slow .gent/setup.sh?). Retry `gent attach {name}` shortly, or see `gent logs {name}`.")
+    # Always land on the window named 'claude', never a service window (by name,
+    # not index — order is unreliable once service windows exist).
+    os.execvp("docker", ["docker", "exec", "-it", container(name),
+                         "tmux", "select-window", "-t", "gent:claude", ";", "attach", "-t", "gent"])
+
+
+def cmd_attach(fleet, a):
+    repo_cfg(fleet, a.repo)
+    _attach(a.repo)
+
+
+def here_match(fleet):
+    """Repo name whose configured path contains cwd, or None."""
+    cwd = Path.cwd().resolve()
+    for name, cfg in fleet.get("repos", {}).items():
+        rp = (fleet["projects_root"] / cfg["path"]).resolve()
+        if cwd == rp or rp in cwd.parents:
+            return name
+    return None
+
+
+def cmd_shell(fleet, a):
+    """A fresh terminal inside the box (separate from the claude session).
+    `gent shell myapp`             -> interactive bash
+    `gent shell myapp -- npm test` -> run a one-off command and exit."""
+    repo_cfg(fleet, a.repo)
+    if a.cmd_args:
+        os.execvp("docker", ["docker", "exec", "-it", container(a.repo), "bash", "-lc", " ".join(a.cmd_args)])
+    os.execvp("docker", ["docker", "exec", "-it", container(a.repo), "bash", "-l"])
+
+
+def cmd_peek(fleet, a):
+    repo_cfg(fleet, a.repo)
+    docker("exec", container(a.repo), "tmux", "capture-pane", "-p", "-t", "gent", check=False)
+
+
+def cmd_logs(fleet, a):
+    repo_cfg(fleet, a.repo)
+    docker("logs", "-n", "100", container(a.repo), check=False)
+
+
+def cmd_down(fleet, a):
+    repo_cfg(fleet, a.repo)
+    docker("rm", "-f", container(a.repo), check=False)
+    if getattr(a, "wipe", False):
+        docker("volume", "rm", f"gent-{a.repo}-home", check=False)
+        print(f"gent: {a.repo} down + home volume wiped (clean slate)")
+    else:
+        print(f"gent: {a.repo} down (home volume kept; --wipe to clear installs/state)")
+
+
+def cmd_auth(fleet, _a):
+    """Boxes share ONE login (a shared ~/.claude). Attach any box and run
+    `/login` once — it populates the shared dir and every box is then logged in."""
+    shared_creds = fleet["secrets_root"] / "claude-home" / ".credentials.json"
+    if shared_creds.exists():
+        print(f"gent: boxes already share a login ({shared_creds}).")
+    else:
+        print("gent: boxes share ONE login. `gent attach <repo>` into any box, then `/login` once;")
+        print("       it populates the shared ~/.claude and every box is logged in.")
+
+
+def cmd_deploy_key(fleet, a):
+    """Mint + register this repo's write-scoped GitHub deploy key (idempotent).
+    Runs automatically on `up`; exposed standalone to set it up ahead of time
+    or after rotating."""
+    cfg = repo_cfg(fleet, a.repo)
+    key = ensure_deploy_key(fleet, a.repo, cfg)
+    if not key:
+        die(f"{a.repo}: origin is not a github remote — nothing to set up")
+    print(f"gent: {a.repo} deploy key ready: {key}")
+
+
+REPO_CMDS = ("up", "down", "attach", "shell", "peek", "logs", "deploy-key")
+
+
+def main():
+    fleet = load_fleet()
+    # Nothing is implicit: bare `gent` prints usage and exits, like bare `git`.
+    # Every effect is named — a box command, or the `fleet` admin group.
+    p = argparse.ArgumentParser(prog="gent", description="sandboxed agent fleet (one box per repo)")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    # `gent ls` — the daily glance; a top-level shortcut for `gent fleet ls`.
+    sub.add_parser("ls", help="fleet overview (shortcut for `gent fleet ls`)")
+
+    # `gent fleet …` — host/fleet admin you run rarely (setup, image, login).
+    fp = sub.add_parser("fleet", help="fleet/host admin: ls, doctor, build, auth")
+    fsub = fp.add_subparsers(dest="fleet_cmd", metavar="<command>")
+    fsub.add_parser("ls",     help="list all boxes and their state")
+    fsub.add_parser("up",     help="bring up every approved box not already running")
+    fsub.add_parser("down",   help="stop + remove all boxes (home volumes kept)")
+    fsub.add_parser("doctor", help="check host setup (docker, image, login)")
+    fsub.add_parser("build",  help="build the base image")
+    fsub.add_parser("auth",   help="shared-login status")
+
+    # Per-repo box commands — repo defaults to the cwd's repo when omitted.
+    sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
+    sub.add_parser("attach",     help="attach to a box's claude session").add_argument("repo", nargs="?")
+    sub.add_parser("peek",       help="print a box's claude pane without attaching").add_argument("repo", nargs="?")
+    sub.add_parser("logs",       help="show a box's recent container logs").add_argument("repo", nargs="?")
+    sub.add_parser("deploy-key", help="mint + register this repo's GitHub deploy key").add_argument("repo", nargs="?")
+    sp = sub.add_parser("down", help="stop + remove a box (home volume kept unless --wipe)")
+    sp.add_argument("repo", nargs="?")
+    sp.add_argument("--wipe", action="store_true", help="also delete the home volume")
+    sp = sub.add_parser("shell", help="open a shell in a box (or run a one-off after --)")
+    sp.add_argument("repo", nargs="?")
+    sp.add_argument("cmd_args", nargs="*", help="optional one-off command after --")
+
+    a = p.parse_args()
+    if not a.cmd:                      # bare `gent` → usage, exits non-zero
+        p.print_help(sys.stderr); sys.exit(1)
+    if a.cmd == "fleet":
+        if not a.fleet_cmd:            # bare `gent fleet` → group usage
+            fp.print_help(sys.stderr); sys.exit(1)
+        # Prefer a fleet-specific handler (cmd_fleet_up/down) so it doesn't
+        # collide with the per-repo cmd_up/cmd_down; the rest (ls/doctor/build/
+        # auth) fall through to the shared cmd_* (gent ls == gent fleet ls).
+        fn = globals().get(f"cmd_fleet_{a.fleet_cmd}") or globals()[f"cmd_{a.fleet_cmd}"]
+        return fn(fleet, a)
+    if a.cmd in REPO_CMDS and not getattr(a, "repo", None):
+        a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
+    globals()[f"cmd_{a.cmd.replace('-', '_')}"](fleet, a)
+
+
+if __name__ == "__main__":
+    main()
