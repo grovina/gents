@@ -9,12 +9,12 @@
     "myapp": {
       "path": "myorg/myapp",
       "allow": true,
-      "_note": "`allow` is the trust gate — gent refuses to start a box whose entry isn't allow:true. This example grants a scoped GCP service-account key (mounted read-only) plus a shared .env fragment and some inline ids.",
+      "_note": "`allow` is the trust gate — gent refuses to start a box whose entry isn't allow:true. This example grants a scoped GCP service-account key (mounted read-only), a shared .env fragment, a read-only per-owner GitHub token (so in-box `gh` can read PRs/diffs/CI — see README), and some inline ids.",
       "resources": { "cpus": 2, "memory": "3g" },
       "mounts": {
         "/secrets/gcp/myapp-sa.json": "gcp/myapp-sa.json"
       },
-      "env_files": ["shared.env"],
+      "env_files": ["shared.env", "github/myorg.env"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/gcp/myapp-sa.json",
         "MY_PROJECT_ID": "myapp-prod"

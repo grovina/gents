@@ -190,41 +190,46 @@ A deploy key attaches to exactly one repo, and each box is one repo — a clean
 1:1. Registration needs admin on the repo; if you only have write access, the
 mint is non-fatal (warns) and you'd fall back to a fine-grained PAT.
 
-### GitHub API — `gh` + a fleet-wide **read-only** token
+### GitHub API — `gh` + a per-owner **read-only** token
 
 The deploy key covers `git push`, but **not** the GitHub API: *reading* a PR's
 title, diff, threads, and CI status, or scanning issues. That's `gh`, and `gh`
 needs a token over HTTPS — the SSH key can't drive it. Without one a box can
 only `git fetch pull/N/head` and read the raw diff, blind to everything else.
 
-Drop **one** fine-grained PAT, shared fleet-wide like the claude login, at
-`secrets_root/github.env`:
+A fine-grained PAT is scoped to **one resource owner**, which lines up with the
+catalog's organize-by-resource rule. Mint one read-only PAT per owner and drop
+it under `github/<owner>.env`:
 
 ```bash
-umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.config/agent-secrets/github.env
+umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.config/agent-secrets/github/grovina.env
 ```
 
-`gent up` auto-applies it to every box when present (and `gent fleet doctor`
-shows whether it's wired); `gh` reads `GH_TOKEN` with no `gh auth login`.
+Then grant it to that owner's boxes via the normal `env_files` carrier — it's a
+plain catalog fragment, nothing special:
 
-Keep it **read-only** — Pull requests + Issues: *read*, Contents: *no access* —
-and that's deliberate, not timid. A **write** scope here would be a *second*
-push path, fleet-wide across every repo the token covers, which defeats the
-whole point of the per-repo deploy key. Read-only keeps the deploy key the
-**only** way a box can write, and per repo. The box already has its own code on
-disk (the `/repo` mount) and pushes via the deploy key, so it needs no Contents
-permission at all; the worst a read-only token can do is let one box read
-another of *your own* repos' PR list.
+```jsonc
+"axt": { "env_files": ["github/grovina.env"], … }   // a grovina-owned repo
+```
 
-A fine-grained PAT is scoped to **one resource owner**, so one token covers your
-repos under that owner; repos under other owners need their own token (per repo
-via `env_files`, below). Set an expiry you'll renew.
+`gh` reads `GH_TOKEN` with no `gh auth login`; `gent fleet doctor` flags whether
+`github/grovina.env` is present (a box that lists a missing env_file won't come
+up). A box under a **different** owner (e.g. `cavyai/radios`) simply lists no
+github token — the grovina PAT wouldn't authorize its repo anyway — until you
+mint `github/cavyai.env` for it. This keeps the same per-grant isolation as the
+deploy keys: a box reaches only the owner it's granted.
+
+Keep these tokens **read-only** — Pull requests + Issues: *read*, Contents: *no
+access* — and that's deliberate, not timid. A **write** scope would be a
+*second* push path that defeats the whole point of the per-repo deploy key.
+Read-only keeps the deploy key the **only** way a box can write. The box already
+has its own code on disk (the `/repo` mount) and pushes via the deploy key, so
+it needs no Contents permission at all. Set an expiry you'll renew.
 
 **If a box genuinely must post to GitHub** (open a PR, leave a review comment),
-don't widen the fleet token — give *that one box* a write-scoped token in its
-own repo's `env_files`. It's applied after the fleet-wide one, so it overrides,
-and the blast radius stays that single repo — the same per-repo-identity
-discipline as the deploy keys.
+give *that one box* a write-scoped token in its own repo's `env_files` (it's
+applied last, so it overrides) — the blast radius stays that single repo, the
+same per-repo-identity discipline as the deploy keys.
 
 ## Sidecar services — a box can run a daemon next to claude
 
