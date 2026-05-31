@@ -52,6 +52,12 @@ RUN npm install -g @anthropic-ai/claude-code \
 # kill Remote Control (the /remote-control command never registers). Auto-update
 # stays ON (newest is best).
 # UTF-8 locale so claude's TUI glyphs render (default debian locale is POSIX/C).
+# COLORTERM=truecolor is the lever that actually gives the in-box claude 24-bit
+# color: under tmux it sees TERM=tmux-256color, and Node's supports-color decides
+# truecolor almost entirely from COLORTERM. Without it claude renders in 256-color
+# and its subtle theme backgrounds (inline code, dim recap) degrade to harsh
+# reverse-video blocks. tmux.conf's `terminal-features RGB` only feeds RGB UPWARD
+# to the host terminal — this is the half that reaches claude itself.
 # npm_config_store_dir points pnpm at the fleet-shared store (gents mounts the
 # gent-pnpm-store volume there) so a package version is downloaded once fleet-wide;
 # the explicit path also stops pnpm's "store on another drive" fallback that
@@ -60,6 +66,7 @@ RUN npm install -g @anthropic-ai/claude-code \
 ENV DISABLE_ERROR_REPORTING=1 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    COLORTERM=truecolor \
     NPM_CONFIG_CACHE=/cache/npm \
     PIP_CACHE_DIR=/cache/pip \
     UV_CACHE_DIR=/cache/uv \
