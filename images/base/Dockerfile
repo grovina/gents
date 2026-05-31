@@ -11,18 +11,33 @@ FROM python:3.13-bookworm
 # fleet-wide read-only GH_TOKEN (wired in `gent up`) is what makes that work,
 # instead of falling back to a bare `git fetch pull/N/head` that sees no
 # title, threads, checks, or review state. Installed from GitHub's own apt repo
-# (Debian stable ships no/old gh). vim+unzip fill two small gaps: a box had no
-# editor for `gent shell`, and unzip is a frequent stumble.
+# (Debian stable ships no/old gh).
+#
+# gcloud (google-cloud-cli, from Google's own apt repo) is the same story for
+# GCP: the GCP-provisioned boxes (radios, platform, filmograma) mount a service-
+# account key + GOOGLE_APPLICATION_CREDENTIALS, but that only buys ADC for the
+# repo's own client libraries — the agent still needs the gcloud CLI to actually
+# DO ops (logging read, run deploy, secrets — gsutil + bq ride along in the same
+# package). Credentials without a CLI is exactly the gap gh closed. No-GCP boxes
+# carry the weight unused — the same trade already accepted for ffmpeg. gnupg is
+# pulled in only so apt can dearmor Google's signing key.
+#
+# vim+unzip fill two small gaps: a box had no editor for `gent shell`, and unzip
+# is a frequent stumble.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim \
+      curl ca-certificates gnupg git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list \
+ && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends nodejs gh \
+ && apt-get install -y --no-install-recommends nodejs gh google-cloud-cli \
  && rm -rf /var/lib/apt/lists/*
 
 # Trust GitHub's SSH host key once, fleet-wide, so git-over-ssh never stops on
