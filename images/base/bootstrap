@@ -95,6 +95,11 @@ fi
 # To stop the loop: `gent down <repo>` (or kill the 'claude' window).
 # tmux config lives in the image at /etc/tmux.conf (truecolor + invisible UI so
 # attaching feels like a local claude) — no per-start heredoc needed here.
+# Older bootstraps wrote ~/.tmux.conf, which persists in the home volume and
+# SHADOWS /etc/tmux.conf (it loads second), re-pinning default-terminal
+# screen-256color and silently undoing the truecolor fix on every pre-existing
+# box. Remove it so /etc/tmux.conf is genuinely the single source of truth.
+rm -f "$HOME/.tmux.conf"
 
 # Name the session after the repo (hostname is gent-<repo>) so it's identifiable
 # in the phone app / claude.ai/code when several boxes run under one login.
