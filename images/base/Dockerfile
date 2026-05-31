@@ -36,11 +36,15 @@ RUN echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLs
 
 # Claude Code into a gent-WRITABLE prefix (/opt, not /home so home-volumes don't
 # shadow it, not /usr/lib which is root-only) so the non-root user can
-# auto-update it. + python package managers.
+# auto-update it. + python package managers. + `corepack enable` so `pnpm`/`yarn`
+# resolve deterministically to the version each repo pins in package.json's
+# `packageManager` field (corepack fetches + caches it on first use), instead of
+# relying on a stray global install that vanishes when a box is recreated.
 ENV NPM_CONFIG_PREFIX=/opt/npm-global
 ENV PATH=/opt/npm-global/bin:$PATH
 RUN npm install -g @anthropic-ai/claude-code \
- && pip install --no-cache-dir pdm uv
+ && pip install --no-cache-dir pdm uv \
+ && corepack enable
 
 # Privacy: error reporting (Sentry crash reports) off. Telemetry stays ON —
 # Claude Code gates Remote Control eligibility behind its feature-flag (Statsig)
@@ -48,12 +52,19 @@ RUN npm install -g @anthropic-ai/claude-code \
 # kill Remote Control (the /remote-control command never registers). Auto-update
 # stays ON (newest is best).
 # UTF-8 locale so claude's TUI glyphs render (default debian locale is POSIX/C).
+# npm_config_store_dir points pnpm at the fleet-shared store (gents mounts the
+# gent-pnpm-store volume there) so a package version is downloaded once fleet-wide;
+# the explicit path also stops pnpm's "store on another drive" fallback that
+# stranded a store inside /repo. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 lets corepack
+# fetch a repo's pinned pnpm non-interactively (boxes are unattended).
 ENV DISABLE_ERROR_REPORTING=1 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     NPM_CONFIG_CACHE=/cache/npm \
     PIP_CACHE_DIR=/cache/pip \
-    UV_CACHE_DIR=/cache/uv
+    UV_CACHE_DIR=/cache/uv \
+    npm_config_store_dir=/pnpm-store \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 # Strip tmux's UI fleet-wide so attaching to a box feels like a local terminal,
 # not a multiplexer (truecolor, OSC52 copy-out, extended keys all pass through).

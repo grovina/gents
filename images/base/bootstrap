@@ -59,6 +59,27 @@ if [ -f /secrets/ssh/key ]; then
   install -m 600 /secrets/ssh/key "$HOME/.ssh/id_ed25519"
 fi
 
+# Fleet-shared pnpm store (gents mounts it at /pnpm-store). Take ownership of the
+# mount ROOT so pnpm — running as gent — can populate it; non-recursive, since the
+# package files pnpm writes underneath are already gent's. Cheap + idempotent.
+if [ -d /pnpm-store ]; then sudo chown gent:gent /pnpm-store 2>/dev/null || true; fi
+
+# Derived build outputs declared in gent.json:derived ({path: build-command}).
+# gents mounts a per-box volume at each /repo/<path>, MASKING the host's copy; here
+# we take ownership (a fresh volume mounts root-owned) and run each build so the box
+# has its OWN platform-native artifacts before claude + services come up. The build
+# is best-effort: a failure (e.g. transient network) must never wedge the box — it
+# logs and retries next start. All tool-specific detail lives in the command itself.
+if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
+  jq -r '(.derived // {}) | to_entries[] | "\(.key)\t\(.value)"' "$REPO/gent.json" \
+  | while IFS=$'\t' read -r dpath dcmd; do
+      [ -n "$dpath" ] || continue
+      sudo chown gent:gent "/repo/$dpath" 2>/dev/null || true
+      echo "gents: building derived '$dpath' → $dcmd" >&2
+      ( cd "$REPO" && eval "$dcmd" ) || echo "gents: derived build '$dpath' failed (continuing)" >&2
+    done
+fi
+
 # Optional per-repo first-run hook — the repo's own business (install deps,
 # start its poller, etc). Best-effort, never blocks the session coming up.
 if [ -f "$REPO/.gent/setup.sh" ]; then

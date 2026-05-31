@@ -256,6 +256,43 @@ or in the cloud; the box is the *agent* — the claude session plus a thin daemo
 (a poller or event bridge) that feeds it. Anything LAN- or device-bound stays on
 the host, reachable from the box at `host.docker.internal`.
 
+## Derived build outputs — the box builds its own, the host keeps its own
+
+A repo's files are either **source** (what git tracks — OS-neutral text) or
+**derived** (built *from* source by a tool: `node_modules`, `.venv`, `target/`,
+`dist/`). The `/repo` bind mount shares source live with the host — that's the
+point. But a derived artifact is platform-specific: a macOS `node_modules` is
+*wrong* on a Linux box, and sharing one dir across both OSes means a `pnpm
+install` on either side wipes the other (it has happened). Source is the
+contract; derived is each environment's own business.
+
+So a box **builds its own** derived artifacts on a private volume. Declare them
+in the repo's `gent.json` as `{ path: build-command }`:
+
+```json
+"derived": { "node_modules": "pnpm install --frozen-lockfile" }
+```
+
+For each entry gents mounts a per-box named volume at `/repo/<path>` — which
+**masks** the host's copy (your host checkout is never touched and keeps
+working) — then `chown`s it and runs the build before claude/services start.
+Wiped with the home volume by `gent down <repo> --wipe`. Repos with no `derived`
+are unaffected. It's the general primitive; the build command owns all
+tool-specific detail (Rust → `{"target": "cargo build"}`, etc.).
+
+For pnpm/node the image enables **corepack** (so `pnpm` resolves to each repo's
+pinned `packageManager` version) and points `npm_config_store_dir` at a
+**fleet-shared store volume** (`/pnpm-store`): every package version is
+downloaded *once across all boxes* and reused. The store and a box's private
+`node_modules` are separate mounts, so pnpm *copies* in (a hardlink would cross
+a mount → `EXDEV`) — the win is no re-downloads, not on-disk dedup.
+
+> One-time host step: because the host's own `node_modules` was masked (not
+> built) by the box, run your normal install once on the host (e.g. `pnpm
+> install`) to make the host checkout pristine too. From then on the two never
+> collide — the box writes its real deps to its volume; only inert, relative,
+> lockfile-pinned workspace symlinks land in the shared tree.
+
 ## Not yet (deliberately deferred)
 
 - **Egress allowlist enforcement — not implemented.** `gent.json:needs.egress`

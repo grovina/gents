@@ -147,6 +147,17 @@ def cmd_doctor(fleet, _a):
         running = subprocess.run(["docker", "info"], capture_output=True).returncode == 0
         print(f"{'✓' if running else '✗'} docker daemon {'up' if running else 'NOT running (start Docker Desktop)'}")
         ok = ok and running
+        # VM memory: boxes share ONE Docker Desktop VM. A small VM (the default can
+        # be ~4G) OOM-kills heavy work — a node `pnpm install` peaks past it — even
+        # though the per-box --memory caps look generous (they overcommit the VM).
+        # Soft floor; raise via Docker Desktop → Settings → Resources → Memory.
+        if running:
+            mt = docker("info", "--format", "{{.MemTotal}}", capture=True)
+            gib = int(mt) / 1073741824 if mt.isdigit() else 0
+            floor = 8
+            print(f"{'✓' if gib >= floor else '!'} docker VM memory {gib:.1f} GiB"
+                  + ('' if gib >= floor else f" — low (< {floor}); a heavy `pnpm install` can OOM. "
+                     "Raise it in Docker Desktop → Settings → Resources."))
     img = fleet["image"]
     have = docker("images", "-q", img, capture=True)
     print(f"{'✓' if have else '✗'} base image {img} {'present' if have else 'missing — run: gent fleet build'}")
@@ -253,6 +264,30 @@ def cmd_up(fleet, a):
     cache = fleet["secrets_root"] / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     args += ["-v", f"{cache}:/cache"]
+
+    # Fleet-shared pnpm store (content-addressable package files, no secrets):
+    # every package version is downloaded ONCE across the whole fleet and reused.
+    # A NAMED volume (ext4 in the VM, fast + stable) — deliberately NOT the
+    # bind-mounted /cache above, whose foreign (macOS) filesystem is exactly what
+    # made pnpm strand a 600M store inside /repo. The store and each box's
+    # node_modules are separate mounts, so pnpm copies from here into node_modules
+    # (a hardlink would cross a mount boundary → EXDEV); the win is no re-downloads
+    # fleet-wide, not on-disk dedup. npm_config_store_dir=/pnpm-store is set in the
+    # image. Sibling to /cache; harmless for non-node boxes (an unused empty dir).
+    args += ["-v", "gent-pnpm-store:/pnpm-store"]
+
+    # Derived build outputs (node_modules, .venv, target, …) declared per repo in
+    # gent.json:derived as {path: build-command}. Each is platform-specific, so it
+    # must NOT be shared with the host over the /repo bind mount — instead each box
+    # builds its OWN on a private named volume mounted at /repo/<path>, which MASKS
+    # the host's copy (your host checkout keeps working, untouched). bootstrap
+    # chowns the fresh volume and runs the build before claude/services start.
+    # Wiped with the home volume by `gent down <repo> --wipe`. Repos that declare
+    # no `derived` are unaffected. This is the general primitive; the per-repo
+    # build command (e.g. `pnpm install`) owns all tool-specific detail.
+    for path in ((gj or {}).get("derived") or {}):
+        slug = path.strip("/").replace("/", "-")
+        args += ["-v", f"gent-{name}-{slug}:/repo/{path}"]
     # Curated git identity so in-box commits are attributed to you, not `gent`.
     gitcfg = fleet["secrets_root"] / "gitconfig"
     if gitcfg.exists():
