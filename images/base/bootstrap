@@ -44,6 +44,23 @@ else
   printf '{"skipDangerousModePermissionPrompt": true, "remoteControlAtStartup": true, "includeCoAuthoredBy": false}\n' > "$SETTINGS"
 fi
 
+# Fleet-granted credentials are AUTHORITATIVE. A repo carries its own
+# .claude/settings.json / settings.local.json (mounted in via /repo), and a host
+# checkout's `env` block there pins GOOGLE_APPLICATION_CREDENTIALS at a *host*
+# path (e.g. /Users/you/.config/gcloud/key.json) that doesn't exist in the box.
+# That project-local `env` OUTRANKS the container's own `-e`, so it would
+# silently point the in-box claude at a missing key — masking the SA the fleet
+# actually granted (this is exactly what stranded the platform box's deploys).
+# Re-assert the fleet value at the MANAGED settings tier (the highest — no
+# project file can override it) so the grant always wins. Only the credential
+# PATH is pinned; every other setting still merges normally. Repo-agnostic: any
+# box whose fleet entry sets GOOGLE_APPLICATION_CREDENTIALS is protected.
+if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+  sudo install -d -m 755 /etc/claude-code
+  printf '{"env":{"GOOGLE_APPLICATION_CREDENTIALS":"%s"}}\n' "$GOOGLE_APPLICATION_CREDENTIALS" \
+    | sudo tee /etc/claude-code/managed-settings.json >/dev/null
+fi
+
 # Auth: ~/.claude is a SHARED bind-mount across all boxes (gents mounts it), so
 # the login lives there — populated once by `/login` in any box, refreshes
 # propagate to all. Nothing to copy here.
