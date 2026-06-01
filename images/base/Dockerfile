@@ -55,9 +55,18 @@ RUN echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLs
 # resolve deterministically to the version each repo pins in package.json's
 # `packageManager` field (corepack fetches + caches it on first use), instead of
 # relying on a stray global install that vanishes when a box is recreated.
+#
+# vercel is the npm-native sibling of the gh/gcloud "credentials need a CLI"
+# story: the Vercel-deploying boxes (platform, filmograma, radios — all linked to
+# the one `grovina` Vercel team) carry a VERCEL_TOKEN in env, but a token without
+# a CLI does nothing. The repo tooling shells straight out to `vercel` (link, raw
+# `vercel api`, env pull/push to prod, deploy hooks; see platform's
+# meta/services/vercel.ts), which auto-reads VERCEL_TOKEN — no `vercel login`, no
+# mounted credential file (the auth IS just the token string). No-Vercel boxes
+# carry it unused, the same trade already accepted for gcloud/ffmpeg.
 ENV NPM_CONFIG_PREFIX=/opt/npm-global
 ENV PATH=/opt/npm-global/bin:$PATH
-RUN npm install -g @anthropic-ai/claude-code \
+RUN npm install -g @anthropic-ai/claude-code vercel \
  && pip install --no-cache-dir pdm uv \
  && corepack enable
 

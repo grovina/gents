@@ -167,6 +167,8 @@ def cmd_doctor(fleet, _a):
     print(f"{'✓' if sc.exists() else '✗'} shared box login {'present (all boxes share it)' if sc.exists() else 'absent — `gent attach <repo>` and run /login once'}")
     gh_env = fleet["secrets_root"] / "github" / "grovina.env"
     print(f"{'✓' if gh_env.exists() else '·'} GitHub token {gh_env} {'present (grovina repos reference it via env_files)' if gh_env.exists() else '(absent — grovina-repo boxes that list github/grovina.env will fail to come up; add GH_TOKEN=… here, read-only)'}")
+    vc_env = fleet["secrets_root"] / "vercel" / "grovina.env"
+    print(f"{'✓' if vc_env.exists() else '·'} Vercel token {vc_env} {'present (platform/filmograma/radios reference it via env_files)' if vc_env.exists() else '(absent — Vercel-deploying boxes that list vercel/grovina.env will fail to come up; add VERCEL_TOKEN=… here — a non-expiring token for the grovina team)'}")
     sys.exit(0 if ok else 1)
 
 

@@ -9,15 +9,16 @@
     "myapp": {
       "path": "myorg/myapp",
       "allow": true,
-      "_note": "`allow` is the trust gate — gent refuses to start a box whose entry isn't allow:true. This example grants a scoped GCP service-account key (mounted read-only), a shared .env fragment, a read-only per-owner GitHub token (so in-box `gh` can read PRs/diffs/CI — see README), and some inline ids.",
+      "_note": "`allow` is the trust gate — gent refuses to start a box whose entry isn't allow:true. This example grants a scoped GCP service-account key (mounted read-only), a shared .env fragment, a read-only per-owner GitHub token (so in-box `gh` can read PRs/diffs/CI — see README), a Vercel token (so in-box `vercel` can deploy / push prod env — the CLI auto-reads VERCEL_TOKEN; VERCEL_SCOPE pins the team), and some inline ids. NOTE a Vercel token is full-access within its team (Pro can't scope it to one project), so mint it deliberately and revoke to rotate.",
       "resources": { "cpus": 2, "memory": "3g" },
       "mounts": {
         "/secrets/gcp/myapp-sa.json": "gcp/myapp-sa.json"
       },
-      "env_files": ["shared.env", "github/myorg.env"],
+      "env_files": ["shared.env", "github/myorg.env", "vercel/myteam.env"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/gcp/myapp-sa.json",
-        "MY_PROJECT_ID": "myapp-prod"
+        "MY_PROJECT_ID": "myapp-prod",
+        "VERCEL_SCOPE": "myteam"
       }
     },
 

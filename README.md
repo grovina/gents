@@ -231,6 +231,40 @@ give *that one box* a write-scoped token in its own repo's `env_files` (it's
 applied last, so it overrides) — the blast radius stays that single repo, the
 same per-repo-identity discipline as the deploy keys.
 
+### Vercel — `vercel` + a per-team token
+
+Same shape as `gh`, one rung less safe. Repos with a Vercel frontend drive it
+through the `vercel` CLI (link, raw `vercel api`, `env pull`/`push` to prod,
+deploy hooks), and a token without a CLI does nothing — so `vercel` ships in the
+base image. Auth is a single **token string**: the CLI auto-reads `VERCEL_TOKEN`
+(no `vercel login`, no mounted key file like GCP), so it rides the catalog as a
+plain `env_files` fragment, organized by **Vercel team** (not GitHub owner — the
+two don't have to match; e.g. `cavyai/radios` and `a-tomun/filmograma` both link
+projects that live in the personal `grovina` Vercel team, so they share its
+token):
+
+```bash
+umask 077; echo 'VERCEL_TOKEN=…' > ~/.config/agent-secrets/vercel/grovina.env
+```
+
+```jsonc
+"platform": { "env_files": ["vercel/grovina.env"], "env": { "VERCEL_SCOPE": "grovina" }, … }
+```
+
+`VERCEL_SCOPE` pins the team for account-level `vercel api` calls that aren't
+anchored to a linked project (`.vercel/project.json` carries the team for the
+rest). `gent fleet doctor` flags whether `vercel/grovina.env` is present.
+
+The caveat that makes this *less* safe than the read-only `gh` token: a stock
+Vercel token (Hobby/Pro) **can't be scoped to one project or reduced to read** —
+project/permission scoping is Enterprise-only. So within its team a token is
+**full access**: deploy, rewrite prod env, add/remove domains, delete projects.
+You can't reproduce the GCP gradient (a read-only `radios-dev` SA next to a
+full-deploy `platform-dev`) here. The levers you do have: one token **per
+account**, routed to boxes via `env_files` so a leak is revoked in one place;
+keep teams small so the blast radius is naturally bounded; and revoke at
+`vercel.com/account/tokens` to rotate.
+
 ## Sidecar services — a box can run a daemon next to claude
 
 Some repos need a long-running process *alongside* the agent — a poller, an
