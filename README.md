@@ -248,12 +248,17 @@ umask 077; echo 'VERCEL_TOKEN=…' > ~/.config/agent-secrets/vercel/grovina.env
 ```
 
 ```jsonc
-"platform": { "env_files": ["vercel/grovina.env"], "env": { "VERCEL_SCOPE": "grovina" }, … }
+"platform": { "env_files": ["vercel/grovina.env"], "env": { "VERCEL_SCOPE": "team_xxxxxxxxxxxxxxxxxxxxxxxx" }, … }
 ```
 
 `VERCEL_SCOPE` pins the team for account-level `vercel api` calls that aren't
 anchored to a linked project (`.vercel/project.json` carries the team for the
-rest). `gent fleet doctor` flags whether `vercel/grovina.env` is present.
+rest). Use the team **ID**, not the slug: if your personal-account username
+equals the team slug (here both are `grovina`), the username wins and
+`--scope <slug>` resolves to your empty personal account ("You cannot set your
+Personal Account as the scope"). The `team_…` ID is unambiguous — read it from
+any linked project's `.vercel/project.json` (`orgId`) or `vercel teams ls`.
+`gent fleet doctor` flags whether `vercel/grovina.env` is present.
 
 The caveat that makes this *less* safe than the read-only `gh` token: a stock
 Vercel token (Hobby/Pro) **can't be scoped to one project or reduced to read** —
