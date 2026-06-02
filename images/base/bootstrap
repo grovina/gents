@@ -24,14 +24,24 @@ fi
 # onboarding (theme picker etc). /home/gent is a persistent volume, so this
 # only fires on a fresh box.
 mkdir -p "$HOME/.claude"
-if [ ! -f "$HOME/.claude.json" ]; then
-  cat > "$HOME/.claude.json" <<JSON
-{
-  "hasCompletedOnboarding": true,
-  "theme": "dark",
-  "numStartups": 5,
-  "projects": { "$REPO": { "hasTrustDialogAccepted": true } }
-}
+# Skip first-run onboarding AND pre-trust THIS repo's mount path. MERGE (not
+# create-if-absent): the home volume persists ~/.claude.json across restarts, and
+# an older box's copy pre-trusts only the legacy /repo path — without merging the
+# real repo path in, claude would sit blocked on the trust dialog now that we
+# mount at the actual absolute path. Idempotent; everything else is preserved.
+CJSON="$HOME/.claude.json"
+[ -f "$CJSON" ] || echo '{}' > "$CJSON"
+if _tmp="$(mktemp)" && jq --arg r "$REPO" '
+      .hasCompletedOnboarding = true
+    | (.theme //= "dark") | (.numStartups //= 5)
+    | .projects[$r].hasTrustDialogAccepted = true
+  ' "$CJSON" > "$_tmp" 2>/dev/null; then
+  mv "$_tmp" "$CJSON"
+else
+  rm -f "${_tmp:-}"
+  cat > "$CJSON" <<JSON
+{ "hasCompletedOnboarding": true, "theme": "dark", "numStartups": 5,
+  "projects": { "$REPO": { "hasTrustDialogAccepted": true } } }
 JSON
 fi
 # settings.json: ENFORCE the gents baseline on every start by MERGING (so keys
