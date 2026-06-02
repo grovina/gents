@@ -243,11 +243,19 @@ def cmd_up(fleet, a):
     # history and in-box claude state survive reboot, `down`, and rebuilds.
     # (System `apt` installs live in / — for those, use the repo's .gent/setup.sh
     # so the box stays reproducible.) Wipe with `gent down <repo> --wipe`.
+    # Mount the repo at its REAL host absolute path (not a fixed /repo), and cd
+    # there. This makes the box a path-faithful subset of your machine: claude's
+    # per-project key (the cwd, slashes→dashes) is IDENTICAL host-side and in the
+    # box, so the two share one per-repo namespace (see the project-dir bind
+    # below). It also means each repo encodes DISTINCTLY — the old fixed /repo
+    # collapsed every box into one `-repo` namespace, scrambling memory fleetwide.
+    repo_dir = str(cfg["abs_path"])
     args = ["run", "-d", "--name", cname, "--hostname", cname,
             "--restart", "unless-stopped",
-            "-v", f"{cfg['abs_path']}:/repo",
+            "-v", f"{repo_dir}:{repo_dir}",
             "-v", f"gent-{name}-home:/home/gent",
-            "-w", "/repo"]
+            "-w", repo_dir,
+            "-e", f"GENT_REPO_DIR={repo_dir}"]
 
     res = cfg.get("resources", {})
     if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]
@@ -260,6 +268,18 @@ def cmd_up(fleet, a):
     shared_claude = fleet["secrets_root"] / "claude-home"
     shared_claude.mkdir(parents=True, exist_ok=True)
     args += ["-v", f"{shared_claude}:/home/gent/.claude"]
+
+    # Per-repo Claude project state (memory + transcripts) lives in the HOST's
+    # ~/.claude, keyed by the repo's absolute path — the SAME key the box uses now
+    # that it works from that real path (above). Bind that one dir in, MASKING the
+    # shared claude-home's projects/<key>, so your host sessions and this box read
+    # and write ONE shared per-repo memory + transcript history. claude-home still
+    # supplies the fleet login/creds/settings; only this repo's project subtree is
+    # host-backed. (mkdir so a never-run-on-host repo still gets a clean dir.)
+    encoded = repo_dir.replace("/", "-")
+    host_proj = Path.home() / ".claude" / "projects" / encoded
+    host_proj.mkdir(parents=True, exist_ok=True)
+    args += ["-v", f"{host_proj}:/home/gent/.claude/projects/{encoded}"]
 
     # Shared fleet caches (npm/pip/uv) so boxes reuse one warm cache instead of
     # each re-downloading. Safe (content-addressable); a dedicated dir, not host's.
@@ -280,16 +300,16 @@ def cmd_up(fleet, a):
 
     # Derived build outputs (node_modules, .venv, target, …) declared per repo in
     # gent.json:derived as {path: build-command}. Each is platform-specific, so it
-    # must NOT be shared with the host over the /repo bind mount — instead each box
-    # builds its OWN on a private named volume mounted at /repo/<path>, which MASKS
-    # the host's copy (your host checkout keeps working, untouched). bootstrap
+    # must NOT be shared with the host over the repo bind mount — instead each box
+    # builds its OWN on a private named volume mounted at <repo_dir>/<path>, which
+    # MASKS the host's copy (your host checkout keeps working, untouched). bootstrap
     # chowns the fresh volume and runs the build before claude/services start.
     # Wiped with the home volume by `gent down <repo> --wipe`. Repos that declare
     # no `derived` are unaffected. This is the general primitive; the per-repo
     # build command (e.g. `pnpm install`) owns all tool-specific detail.
     for path in ((gj or {}).get("derived") or {}):
         slug = path.strip("/").replace("/", "-")
-        args += ["-v", f"gent-{name}-{slug}:/repo/{path}"]
+        args += ["-v", f"gent-{name}-{slug}:{repo_dir}/{path}"]
     # Curated git identity so in-box commits are attributed to you, not `gent`.
     gitcfg = fleet["secrets_root"] / "gitconfig"
     if gitcfg.exists():

@@ -112,10 +112,12 @@ the repo dir (it's mounted) and reference it by path.
 
 All boxes share **one** Claude config dir: `claude-home/` in the catalog
 (`~/.config/agent-secrets/claude-home`) is bind-mounted as `~/.claude` in every
-box — creds, settings, and sessions alike, exactly as your host's many `claude`
+box — the login, creds, and settings, exactly as your host's many `claude`
 sessions share a single `~/.claude`. So you log in **once**: `gent attach` into
 any box, run `/login`, and every box is then logged in. Refreshes propagate to
 all (it's the same dir) — no per-box login, no daemon, nothing copied at start.
+(Per-repo **memory and transcripts** are the exception — those come from your
+host's `~/.claude`, not this shared dir; see below.)
 
 It's a full OAuth login, which is what makes **Remote Control** work in a box
 (reachable from the phone app); the inference-only `setup-token` /
@@ -123,6 +125,25 @@ It's a full OAuth login, which is what makes **Remote Control** work in a box
 host's own** Claude login (a separate `~/.claude`) — the fleet has its own.
 
 `gent fleet auth` just reports whether that shared login exists yet.
+
+## Per-repo memory & history — one brain per repo, shared with your host
+
+A box mounts its repo at the **real host absolute path** (e.g.
+`/Users/you/Projects/acme/api`), not a fixed `/repo`, and works from there. That
+makes the box a path-faithful subset of your machine: Claude keys per-project
+state (memory, transcripts) by the working directory, so the box and your own
+host sessions for that repo compute the **same** key. gent then binds your
+host's `~/.claude/projects/<that-key>/` straight into the box, so the two share
+**one** per-repo memory and one transcript history — what the autonomous box
+learns, your host sessions see, and vice versa.
+
+This is also what keeps memory **un-scrambled**. The shared `claude-home` login
+is one dir across the whole fleet; if every box worked from the same `/repo`
+path they'd all collapse into a single `projects/-repo/` namespace and stomp on
+each other's memory. The real-path mount gives every repo a distinct key, and
+the host bind keeps each repo's brain in exactly one place. `claude-home` still
+supplies the fleet login/creds/settings; only each repo's own project subtree is
+host-backed.
 
 > Caveat: all boxes share one OAuth credential. If the provider rotates refresh
 > tokens, one box's refresh could log the others out → just `/login` again in
@@ -223,7 +244,7 @@ Keep these tokens **read-only** — Pull requests + Issues: *read*, Contents: *n
 access* — and that's deliberate, not timid. A **write** scope would be a
 *second* push path that defeats the whole point of the per-repo deploy key.
 Read-only keeps the deploy key the **only** way a box can write. The box already
-has its own code on disk (the `/repo` mount) and pushes via the deploy key, so
+has its own code on disk (the repo bind mount) and pushes via the deploy key, so
 it needs no Contents permission at all. Set an expiry you'll renew.
 
 **If a box genuinely must post to GitHub** (open a PR, leave a review comment),
@@ -284,7 +305,7 @@ spawns. Declare them in the repo's `gent.json`:
 
 gents owns their lifecycle: each runs in its own auto-restarting tmux window
 inside the box (so a crash self-heals, like the claude window). The command
-runs from `/repo`, so the daemon executes the repo's **current source** — edit
+runs from the repo's mount path, so the daemon executes the repo's **current source** — edit
 the code and restart the window (or `gent down/up`) to reload, no image rebuild.
 A repo's own first-run `.gent/setup.sh` (best-effort, runs before the services)
 is the place to install their deps.
@@ -299,7 +320,7 @@ the host, reachable from the box at `host.docker.internal`.
 
 A repo's files are either **source** (what git tracks — OS-neutral text) or
 **derived** (built *from* source by a tool: `node_modules`, `.venv`, `target/`,
-`dist/`). The `/repo` bind mount shares source live with the host — that's the
+`dist/`). The repo bind mount shares source live with the host — that's the
 point. But a derived artifact is platform-specific: a macOS `node_modules` is
 *wrong* on a Linux box, and sharing one dir across both OSes means a `pnpm
 install` on either side wipes the other (it has happened). Source is the
@@ -312,7 +333,7 @@ in the repo's `gent.json` as `{ path: build-command }`:
 "derived": { "node_modules": "pnpm install --frozen-lockfile" }
 ```
 
-For each entry gents mounts a per-box named volume at `/repo/<path>` — which
+For each entry gents mounts a per-box named volume at `<repo>/<path>` — which
 **masks** the host's copy (your host checkout is never touched and keeps
 working) — then `chown`s it and runs the build before claude/services start.
 Wiped with the home volume by `gent down <repo> --wipe`. Repos with no `derived`

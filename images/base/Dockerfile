@@ -24,8 +24,14 @@ FROM python:3.13-bookworm
 #
 # vim+unzip fill two small gaps: a box had no editor for `gent shell`, and unzip
 # is a frequent stumble.
+#
+# postgresql-client (psql) is the DB sibling of the gh/gcloud/vercel story: the
+# DB-touching boxes (platform, filmograma, radios) reach Postgres through a tunnel
+# and the repo tooling shells out to `psql` for migrations/grants/queries (e.g.
+# platform's `./m app migrate` / `./m db setup` flat-out needed it). No-DB boxes
+# carry it unused — the same trade already accepted for gcloud/ffmpeg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates gnupg git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim \
+      curl ca-certificates gnupg git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim postgresql-client \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -112,5 +118,8 @@ RUN chmod +x /usr/local/bin/bootstrap \
  && echo 'export PATH=/opt/npm-global/bin:$PATH' > /etc/profile.d/gents-path.sh
 
 USER gent
-WORKDIR /repo
+# Neutral default workdir: gent mounts each repo at its real host absolute path
+# and the bootstrap cd's there (GENT_REPO_DIR), so there's no fixed repo path to
+# pin here — /home/gent always exists and keeps an interactive `gent shell` sane.
+WORKDIR /home/gent
 ENTRYPOINT ["/usr/local/bin/bootstrap"]

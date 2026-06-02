@@ -3,7 +3,11 @@
 # and keep the container alive. Attach from the host with `gents attach <repo>`.
 set -euo pipefail
 
-REPO=/repo
+# The repo is mounted at its real HOST absolute path (gent passes it as
+# GENT_REPO_DIR) so the box is a path-faithful subset of your machine and shares
+# one per-repo claude namespace with host sessions. Fallback to the legacy /repo
+# for any box started by an older gent that didn't set it.
+REPO="${GENT_REPO_DIR:-/repo}"
 cd "$REPO"
 
 # Boxes normally authenticate via the SHARED ~/.claude login (a bind-mount —
@@ -21,12 +25,12 @@ fi
 # only fires on a fresh box.
 mkdir -p "$HOME/.claude"
 if [ ! -f "$HOME/.claude.json" ]; then
-  cat > "$HOME/.claude.json" <<'JSON'
+  cat > "$HOME/.claude.json" <<JSON
 {
   "hasCompletedOnboarding": true,
   "theme": "dark",
   "numStartups": 5,
-  "projects": { "/repo": { "hasTrustDialogAccepted": true } }
+  "projects": { "$REPO": { "hasTrustDialogAccepted": true } }
 }
 JSON
 fi
@@ -45,7 +49,7 @@ else
 fi
 
 # Fleet-granted credentials are AUTHORITATIVE. A repo carries its own
-# .claude/settings.json / settings.local.json (mounted in via /repo), and a host
+# .claude/settings.json / settings.local.json (mounted in via the repo), and a host
 # checkout's `env` block there pins GOOGLE_APPLICATION_CREDENTIALS at a *host*
 # path (e.g. /Users/you/.config/gcloud/key.json) that doesn't exist in the box.
 # That project-local `env` OUTRANKS the container's own `-e`, so it would
@@ -82,7 +86,7 @@ fi
 if [ -d /pnpm-store ]; then sudo chown gent:gent /pnpm-store 2>/dev/null || true; fi
 
 # Derived build outputs declared in gent.json:derived ({path: build-command}).
-# gents mounts a per-box volume at each /repo/<path>, MASKING the host's copy; here
+# gents mounts a per-box volume at each <repo>/<path>, MASKING the host's copy; here
 # we take ownership (a fresh volume mounts root-owned) and run each build so the box
 # has its OWN platform-native artifacts before claude + services come up. The build
 # is best-effort: a failure (e.g. transient network) must never wedge the box — it
@@ -91,7 +95,7 @@ if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   jq -r '(.derived // {}) | to_entries[] | "\(.key)\t\(.value)"' "$REPO/gent.json" \
   | while IFS=$'\t' read -r dpath dcmd; do
       [ -n "$dpath" ] || continue
-      sudo chown gent:gent "/repo/$dpath" 2>/dev/null || true
+      sudo chown gent:gent "$REPO/$dpath" 2>/dev/null || true
       echo "gents: building derived '$dpath' → $dcmd" >&2
       ( cd "$REPO" && eval "$dcmd" ) || echo "gents: derived build '$dpath' failed (continuing)" >&2
     done
