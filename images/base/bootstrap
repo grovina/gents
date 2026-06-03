@@ -192,6 +192,69 @@ fi
 
 echo "gents: claude live in tmux 'gent' (window 0); services in their own windows" >&2
 
+# Greet on startup: once claude's TUI has settled, replay the box's hello (if any)
+# so a freshly `up`ed box is oriented/kicked exactly like it is after a gent-clear.
+# Backgrounded (child of PID 1, dies with the container); fires ONCE per container
+# start — a claude crash-relaunch inside $RUN does NOT re-greet, only a real box
+# (re)start does. No-op for boxes without a .gent/hello.md.
+if [ -s "$REPO/.gent/hello.md" ]; then
+  ( trap : INT
+    # The pane exists immediately (the supervisor loop runs bash), but claude
+    # takes a few seconds to boot its TUI — and a resumed box can spend MINUTES
+    # auto-compacting a large transcript first. Sending into that churn drops the
+    # paste. So wait for claude to be genuinely IDLE: the pane unchanged for a few
+    # seconds AND not showing "esc to interrupt" (which it shows only while busy).
+    # Generous cap; if it never goes idle, SKIP rather than blast into a busy
+    # session — a missed greeting is recoverable (`gent-hello`), a dropped one
+    # mid-compaction just looks broken.
+    prev=""; stable=0; ready=0
+    for _ in $(seq 1 300); do
+      tmux has-session -t gent 2>/dev/null || exit 0
+      cur="$(tmux capture-pane -p -t gent:claude 2>/dev/null || true)"
+      if [ -n "$cur" ] && [ "$cur" = "$prev" ] && ! printf '%s' "$cur" | grep -q "esc to interrupt"; then
+        stable=$((stable + 1)); if [ "$stable" -ge 3 ]; then ready=1; break; fi
+      else
+        stable=0
+      fi
+      prev="$cur"; sleep 1
+    done
+    if [ "$ready" = 1 ]; then gent-hello
+    else echo "gents: startup greeting skipped — claude never went idle within cap" >&2; fi
+  ) &
+fi
+
+# Periodic context-refresh NUDGE. If the repo's gent.json sets clear.every (e.g.
+# "6h"), poke the claude pane on that cadence with an invitation to wrap up and
+# run `gent-clear`. This is the ONLY thing on a timer — it never clears anything
+# itself. The MODEL decides whether/when it's actually ready (work checkpointed,
+# durable state saved) and runs `gent-clear`, which does the /clear + replays
+# .gent/hello.md. Opt-in: no clear.every → no nudge loop. Backgrounded as a child
+# of PID 1, so it dies with the container; it also self-exits if the session goes.
+CLEAR_EVERY_RAW=""
+if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
+  CLEAR_EVERY_RAW="$(jq -r '.clear.every // empty' "$REPO/gent.json" 2>/dev/null || true)"
+fi
+if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -qE '^[0-9]+$'; then
+  _n="${CLEAR_EVERY_RAW%[smhd]}"; _u="${CLEAR_EVERY_RAW#"$_n"}"
+  case "$_u" in
+    s|"") CLEAR_EVERY_SEC="$_n" ;;
+    m)    CLEAR_EVERY_SEC=$((_n * 60)) ;;
+    h)    CLEAR_EVERY_SEC=$((_n * 3600)) ;;
+    d)    CLEAR_EVERY_SEC=$((_n * 86400)) ;;
+    *)    CLEAR_EVERY_SEC=0 ;;
+  esac
+  if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ]; then
+    NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then run \`gent-clear\` as your final action to reset your context. Mid-task? Ignore this; you'll be nudged again later."
+    echo "gents: periodic clear nudge every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)" >&2
+    ( trap : INT
+      while :; do
+        sleep "$CLEAR_EVERY_SEC"
+        tmux has-session -t gent 2>/dev/null || exit 0
+        tmux send-keys -t gent:claude "$NUDGE_TEXT" Enter 2>/dev/null || true
+      done ) &
+  fi
+fi
+
 # PID 1 fate-shares with the tmux session. If the whole session ever dies
 # (kill-server, OOM, a signal that escapes the loop trap above), exit so
 # Docker's `--restart unless-stopped` recreates the box and re-runs this

@@ -107,10 +107,16 @@ ENV DISABLE_ERROR_REPORTING=1 \
 # not a multiplexer (truecolor, OSC52 copy-out, extended keys all pass through).
 COPY tmux.conf /etc/tmux.conf
 COPY bootstrap /usr/local/bin/bootstrap
+# gent-hello / gent-clear: the in-box re-greet + context-reset commands. gent-hello
+# replays the repo's .gent/hello.md into the claude pane (the bootstrap fires it on
+# startup; gent-clear fires it after a /clear). On PATH so both just work from the
+# model's Bash tool.
+COPY gent-hello /usr/local/bin/gent-hello
+COPY gent-clear /usr/local/bin/gent-clear
 # Non-root by default (keeps bind-mount file ownership sane, shrinks the
 # default blast radius) but with passwordless sudo so the agent can install
 # anything it needs inside — "generous inside the box".
-RUN chmod +x /usr/local/bin/bootstrap \
+RUN chmod +x /usr/local/bin/bootstrap /usr/local/bin/gent-hello /usr/local/bin/gent-clear \
  && useradd -m -s /bin/bash -u 1000 gent \
  && echo 'gent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/gent \
  && chown -R gent:gent /opt/npm-global \

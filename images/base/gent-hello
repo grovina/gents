@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# gent-hello — paste this box's .gent/hello.md into the claude pane as the next
+# prompt. The shared "(re-)greet" primitive: the bootstrap calls it once the box
+# comes up, and gent-clear calls it right after a /clear. A box's hello is its
+# standing brief — who it is, what to resume watching, where its work lives — so
+# a freshly-started OR freshly-cleared session is oriented the same way.
+#
+# No-op (silent, exit 0) if the repo ships no hello — most boxes don't, and
+# that's the default. Uses tmux bracketed paste (-p) so a multi-line hello goes
+# in as ONE prompt instead of each newline submitting a fragment.
+set -u
+
+REPO="${GENT_REPO_DIR:-$(pwd)}"
+PANE="gent:claude"
+HELLO="$REPO/.gent/hello.md"
+
+[ -s "$HELLO" ] || exit 0
+tmux has-session -t gent 2>/dev/null || exit 0
+
+# Strip any trailing newline before loading the buffer: a paste that ends in \n
+# leaves the cursor on a fresh blank line, so the Enter below submits THAT empty
+# line and the message just sits in the input box. $(...) drops trailing newlines;
+# interior newlines (a multi-line hello) are preserved.
+printf '%s' "$(cat "$HELLO")" | tmux load-buffer -b gent-hello -
+tmux paste-buffer -b gent-hello -t "$PANE" -p -d
+tmux send-keys -t "$PANE" Enter

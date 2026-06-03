@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gent-clear — reset THIS box's claude context, then re-orient the fresh session.
+#
+# The MODEL runs this (e.g. as the last action after a periodic nudge) once IT
+# judges it's ready: work checkpointed, anything durable committed or written to
+# memory. There is no machine gate on "ready" — that call is the model's, on
+# purpose. All this script does is the mechanical part:
+#
+#   1. send `/clear` into the claude pane (drops the conversation history), then
+#   2. replay the box's .gent/hello.md (via gent-hello) as the next prompt, so
+#      the now-empty session is re-greeted with its standing brief. No-op if the
+#      repo ships no hello.
+#
+# Run it from inside the box: `gent-clear`. It targets its OWN pane (gent:claude)
+# via tmux, so the keystrokes queue behind the current turn and take effect once
+# this command's turn ends — i.e. run it as your final action.
+set -u
+
+PANE="gent:claude"
+
+if ! tmux has-session -t gent 2>/dev/null; then
+  echo "gent-clear: no 'gent' tmux session — nothing to clear" >&2
+  exit 1
+fi
+
+# 1. Clear. Submitted first, so it lands before the hello below.
+tmux send-keys -t "$PANE" "/clear" Enter
+
+# 2. Re-greet. A short pause lets /clear register in the TUI before the hello
+# lands; gent-hello is a no-op when the repo has no .gent/hello.md.
+sleep 1
+gent-hello
+echo "gent-clear: cleared" >&2

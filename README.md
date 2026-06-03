@@ -353,6 +353,51 @@ a mount → `EXDEV`) — the win is no re-downloads, not on-disk dedup.
 > collide — the box writes its real deps to its volume; only inert, relative,
 > lockfile-pinned workspace symlinks land in the shared tree.
 
+## Periodic context refresh — nudge, the model clears itself
+
+A long-lived box accretes context: hours of turns the agent no longer needs but
+keeps paying for. The fix is a periodic `/clear` — but a blind, timed clear can
+nuke a box mid-task, before it's written down what mattered. So gents splits it
+the way pickle does: a timer only **nudges**, and the **model** decides when it's
+actually safe to clear and pulls the trigger itself.
+
+Opt a box in via its `gent.json`:
+
+```json
+"clear": { "every": "6h" }
+```
+
+On that cadence the box's pane gets a one-line nudge — *"good stopping point?
+wrap up, commit, save memory, then run `gent-clear`."* Nothing is cleared by the
+timer. The agent, when **it** judges it's ready (work checkpointed, anything
+durable committed or saved to memory), runs the in-box command **`gent-clear`**,
+which does the mechanical part: send `/clear` into its own pane, then replay the
+box's hello (below) to re-orient the fresh session. Mid-task? It ignores the
+nudge and gets poked again next interval. `every` takes `s`/`m`/`h`/`d` suffixes
+(bare number = seconds); no `clear` key → no nudge, the default.
+
+The split is the point: the supervisor judges *cadence* (cheap, wall-clock), the
+model judges *readiness* (what's owed, what's saved) — neither can clear an
+unprepared box.
+
+### A custom "hi" per box — `.gent/hello.md`
+
+Drop a `.gent/hello.md` in the repo and gents replays it into the claude pane as
+a prompt — the box's standing brief: who it is, what to resume watching, where
+its work lives. It fires at two moments:
+
+- **on box startup** (`gent up`) — once claude's TUI has settled, so a fresh box
+  is oriented/kicked without you attaching, and
+- **after `gent-clear`** — a `/clear` wipes the conversation, including whatever
+  the agent was watching (any `Monitor`), so the hello re-orients the empty
+  session.
+
+It's versioned with the repo like `.gent/setup.sh`, multi-line is fine (it's
+pasted as one prompt). No `.gent/hello.md` → nothing is replayed (the default —
+claude still reloads the repo's `CLAUDE.md` either way). The same primitive is
+exposed as the in-box command `gent-hello` if you ever want to re-send it by
+hand.
+
 ## Not yet (deliberately deferred)
 
 - **Egress allowlist enforcement — not implemented.** `gent.json:needs.egress`
