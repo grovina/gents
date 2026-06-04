@@ -30,7 +30,11 @@ mkdir -p "$HOME/.claude"
 # real repo path in, claude would sit blocked on the trust dialog now that we
 # mount at the actual absolute path. Idempotent; everything else is preserved.
 CJSON="$HOME/.claude.json"
-[ -f "$CJSON" ] || echo '{}' > "$CJSON"
+# Reset to {} if missing, EMPTY, or unparseable — not just absent. A disk-full
+# write can leave a 0-byte file; `-f` passes it through, and then `jq` on empty
+# input exits 0 with empty output, so the merge below would mv empty-over-empty
+# and claude crash-loops on "invalid JSON" forever. Validate before merging.
+{ [ -s "$CJSON" ] && jq -e . "$CJSON" >/dev/null 2>&1; } || echo '{}' > "$CJSON"
 if _tmp="$(mktemp)" && jq --arg r "$REPO" '
       .hasCompletedOnboarding = true
     | (.theme //= "dark") | (.numStartups //= 5)
@@ -49,7 +53,9 @@ fi
 # values always win). Skip the bypass-mode warning, enable Remote Control at
 # startup, drop the co-authored-by commit trailer.
 SETTINGS="$HOME/.claude/settings.json"
-[ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+# Same guard as .claude.json: reset on empty/unparseable, not just absent — else
+# the jq merge below mv's empty-over-empty and the baseline never applies.
+{ [ -s "$SETTINGS" ] && jq -e . "$SETTINGS" >/dev/null 2>&1; } || echo '{}' > "$SETTINGS"
 _baseline='{skipDangerousModePermissionPrompt: true, remoteControlAtStartup: true, includeCoAuthoredBy: false}'
 if _tmp="$(mktemp)" && jq ". + $_baseline" "$SETTINGS" > "$_tmp" 2>/dev/null; then
   mv "$_tmp" "$SETTINGS"
