@@ -141,19 +141,21 @@ rm -f "$HOME/.tmux.conf"
 # Name the session after the repo (hostname is gent-<repo>) so it's identifiable
 # in the phone app / claude.ai/code when several boxes run under one login.
 REPO_NAME="$(hostname)"; REPO_NAME="${REPO_NAME#gent-}"
-# Deterministic per-box session id so a restart RESUMES the same session instead
-# of spawning a fresh Remote Control session each time (which litters the phone
-# with offline ghosts). One stable, persistent session per box.
-SESSION_ID="$(python3 -c "import uuid,sys;print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.argv[1]))" "gent-$REPO_NAME")"
-# Resume-or-create, re-decided EVERY loop iteration: `claude --session-id X`
-# CREATES session X and refuses an id that already exists ("already in use"),
-# while `--resume X` CONTINUES it. The id is stable per box, so after the very
-# first launch the transcript exists — a plain `--session-id` relaunch (crash,
-# OOM, `gent down`/`up`) would then crash-loop forever on "already in use".
-# So: --resume when the transcript exists, --session-id to create it the first
-# time. Resuming the same id also reconnects the SAME Remote Control session
-# instead of spawning offline ghosts on the phone.
-SESS_FILE="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')/$SESSION_ID.jsonl"
+# Per-box session continuity that FOLLOWS a /clear. The box keeps a persistent
+# session across restarts (crash, OOM, `gent down`/`up`) so the phone reconnects
+# the SAME Remote Control session instead of accumulating offline ghosts — but a
+# /clear must stick. `/clear` doesn't wipe the live transcript: it FREEZES it and
+# starts a brand-new <id>.jsonl, so claude silently migrates to a new session id
+# (the launch cmdline still names the old one). A supervisor pinned to one id
+# therefore RESURRECTS the pre-clear conversation on the next relaunch — the bug
+# this replaces. So we resume the NEWEST transcript in the project dir, which is
+# the same session across plain restarts AND the post-clear session after a
+# gent-clear. Only when NO transcript exists yet (true first boot) do we mint a
+# deterministic, box-OWNED id — never grafting a host session that merely happens
+# to be newest (boxed repos aren't driven from the host, so "newest" is the box's
+# own; the deterministic id is just the first-boot seed + a stable phone name).
+PINNED_ID="$(python3 -c "import uuid,sys;print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.argv[1]))" "gent-$REPO_NAME")"
+PROJ_DIR="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
 RUN="$HOME/.gent-run.sh"
 cat > "$RUN" <<EOF
 #!/usr/bin/env bash
@@ -168,8 +170,15 @@ set -u
 # A no-op handle (not SIG_IGN) keeps the loop alive; claude resets handlers on
 # exec, so it still receives a normal Ctrl+C.
 trap : INT
+PINNED_ID="$PINNED_ID"
+PROJ_DIR="$PROJ_DIR"
 while :; do
-  if [ -f "$SESS_FILE" ]; then set -- --resume "$SESSION_ID"; else set -- --session-id "$SESSION_ID"; fi
+  # Newest transcript = the box's current session: unchanged across a plain
+  # restart, advanced to the fresh one after a gent-clear. None yet -> first boot,
+  # so CREATE the box-owned seed id (--session-id; --resume of a nonexistent id
+  # errors, --session-id of an existing one errors, hence the branch).
+  newest="\$(ls -t "\$PROJ_DIR"/*.jsonl 2>/dev/null | head -1)"
+  if [ -n "\$newest" ]; then set -- --resume "\$(basename "\$newest" .jsonl)"; else set -- --session-id "\$PINNED_ID"; fi
   claude --dangerously-skip-permissions -n "$REPO_NAME" "\$@"
   echo
   echo "[claude exited — relaunching in 5s; 'gent shell $REPO_NAME' for a shell, 'gent down $REPO_NAME' to stop]"

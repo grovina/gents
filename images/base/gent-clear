@@ -1,33 +1,66 @@
 #!/usr/bin/env bash
-# gent-clear — reset THIS box's claude context, then re-orient the fresh session.
+# gent-clear — do exactly what typing /clear does in THIS box's claude session,
+# then re-greet the fresh session with the box's hello — but ONLY once the clear
+# is observed to have actually landed.
 #
-# The MODEL runs this (e.g. as the last action after a periodic nudge) once IT
-# judges it's ready: work checkpointed, anything durable committed or written to
-# memory. There is no machine gate on "ready" — that call is the model's, on
-# purpose. All this script does is the mechanical part:
+# The MODEL runs this as its FINAL action. gent-clear runs via the Bash tool, so
+# the pane is busy and the "/clear" keystroke QUEUES behind the current turn; it
+# fires once the turn ends. So output nothing after calling gent-clear — anything
+# you say keeps the turn alive and delays (or strands) the clear.
 #
-#   1. send `/clear` into the claude pane (drops the conversation history), then
-#   2. replay the box's .gent/hello.md (via gent-hello) as the next prompt, so
-#      the now-empty session is re-greeted with its standing brief. No-op if the
-#      repo ships no hello.
+# `/clear` does not edit the current transcript: it FREEZES it and starts a brand-
+# new <id>.jsonl. We use that new file as PROOF the clear happened — only once it
+# appears do we replay the hello. If it never appears (e.g. the turn never ended,
+# so the queued keystroke never fired), we greet NOTHING: pasting a hello into a
+# still-uncleared session is the exact bug this replaces. A missed greet is
+# recoverable (`gent-hello`); a false greet into stale context just looks broken.
 #
-# Run it from inside the box: `gent-clear`. It targets its OWN pane (gent:claude)
-# via tmux, so the keystrokes queue behind the current turn and take effect once
-# this command's turn ends — i.e. run it as your final action.
+# The supervisor (~/.gent-run.sh) independently resumes the NEWEST transcript, so
+# the new post-clear session is what survives the next restart — no bookkeeping
+# here; the clear sticks on its own.
 set -u
 
 PANE="gent:claude"
+REPO="${GENT_REPO_DIR:-$(pwd)}"
+PROJ="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
 
 if ! tmux has-session -t gent 2>/dev/null; then
   echo "gent-clear: no 'gent' tmux session — nothing to clear" >&2
   exit 1
 fi
 
-# 1. Clear. Submitted first, so it lands before the hello below.
+# The current session's transcript. /clear migrates claude to a NEW newest file;
+# the watcher waits for that filename to change.
+before="$(ls -t "$PROJ"/*.jsonl 2>/dev/null | head -1 || true)"
+
+# Type /clear. Busy pane -> queues behind the turn -> fires when the turn ends.
 tmux send-keys -t "$PANE" "/clear" Enter
 
-# 2. Re-greet. A short pause lets /clear register in the TUI before the hello
-# lands; gent-hello is a no-op when the repo has no .gent/hello.md.
-sleep 1
-gent-hello
-echo "gent-clear: cleared" >&2
+# Detached watcher (setsid + closed stdio) so it OUTLIVES both this Bash tool call
+# and the model turn that ends right after: wait for the clear to land, then — once
+# the fresh TUI settles — replay the hello.
+export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before"
+setsid bash -c '
+  cleared=0
+  for _ in $(seq 1 300); do
+    tmux has-session -t gent 2>/dev/null || exit 0
+    now="$(ls -t "$GENT_PROJ"/*.jsonl 2>/dev/null | head -1 || true)"
+    [ -n "$now" ] && [ "$now" != "$GENT_BEFORE" ] && { cleared=1; break; }
+    sleep 1
+  done
+  [ "$cleared" = 1 ] || { echo "gent-clear: clear never landed (turn not ended?) — no re-greet" >&2; exit 0; }
+  # Wait for the fresh session to go idle — same gate as the startup greet: pane
+  # unchanged for a few seconds and not showing "esc to interrupt" — then greet.
+  prev=""; stable=0; ready=0
+  for _ in $(seq 1 300); do
+    tmux has-session -t gent 2>/dev/null || exit 0
+    cur="$(tmux capture-pane -p -t "$GENT_PANE" 2>/dev/null || true)"
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ] && ! printf "%s" "$cur" | grep -q "esc to interrupt"; then
+      stable=$((stable + 1)); [ "$stable" -ge 3 ] && { ready=1; break; }
+    else stable=0; fi
+    prev="$cur"; sleep 1
+  done
+  [ "$ready" = 1 ] && gent-hello || echo "gent-clear: fresh session never went idle — greet skipped (run gent-hello)" >&2
+' </dev/null >/dev/null 2>&1 &
+
+echo "gent-clear: /clear queued; the fresh session will be re-greeted once it lands" >&2
