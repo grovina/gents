@@ -77,10 +77,11 @@ RUN npm install -g @anthropic-ai/claude-code vercel \
  && corepack enable
 
 # Privacy: error reporting (Sentry crash reports) off. Telemetry stays ON —
-# Claude Code gates Remote Control eligibility behind its feature-flag (Statsig)
-# check, which rides the telemetry channel; DISABLE_TELEMETRY=1 would silently
-# kill Remote Control (the /remote-control command never registers). Auto-update
-# stays ON (newest is best).
+# Claude Code gates Remote Control eligibility behind its feature-flag check
+# (GrowthBook — cached in ~/.claude.json as cachedGrowthBookFeatures), which
+# rides the telemetry channel; DISABLE_TELEMETRY=1 would silently kill Remote
+# Control (the /remote-control command never registers). Auto-update stays ON
+# (newest is best).
 # UTF-8 locale so claude's TUI glyphs render (default debian locale is POSIX/C).
 # COLORTERM=truecolor is the lever that actually gives the in-box claude 24-bit
 # color: under tmux it sees TERM=tmux-256color, and Node's supports-color decides

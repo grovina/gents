@@ -442,6 +442,65 @@ def cmd_auth(fleet, _a):
         print("       it populates the shared ~/.claude and every box is logged in.")
 
 
+def cmd_fleet_refresh_auth(fleet, _a):
+    """Keep the shared box login fresh while the fleet idles (built for cron).
+
+    Every box shares ONE 8-hour OAuth access token. An ACTIVE box re-mints it as
+    a side effect of its own calls, so this is normally a no-op. But if the WHOLE
+    fleet sits idle past expiry, nothing triggers a refresh: each box's Remote
+    Control socket drops at expiry and doesn't recover until its session
+    restarts. This is that restart, on a timer.
+
+    A still-valid token is reused as-is (verified: restarting doesn't re-mint an
+    unexpired token), so acting early would bounce sessions for nothing — we wait
+    for actual expiry. Then we bounce ONE box first (its restart re-mints the
+    token and writes the shared file), confirm the new expiry landed, and only
+    THEN bounce the rest (which read the fresh token). Never all at once: the
+    refresh token is single-use, so 9 boxes racing on it would strand 8."""
+    creds = fleet["secrets_root"] / "claude-home" / ".credentials.json"
+    if not creds.exists():
+        print("gent: no shared login yet — `gent attach <repo>` then `/login` once.")
+        return
+    try:
+        exp_ms = json.loads(creds.read_text())["claudeAiOauth"]["expiresAt"]
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        die(f"can't read token expiry from {creds}: {e}")
+    GRACE = 60  # seconds; catch right-at-expiry ticks without acting early
+    remaining = exp_ms / 1000 - time.time()
+    if remaining > GRACE:
+        print(f"gent: shared token valid for ~{int(remaining // 60)}m — nothing to do.")
+        return
+    running = [n for n in fleet.get("repos", {}) if container_state(n) == "running"]
+    if not running:
+        print("gent: token expired but no boxes running — nothing to refresh.")
+        return
+    leader, rest = running[0], running[1:]
+    print(f"gent: shared token expired — re-minting via {leader}, then reconnecting "
+          f"{len(rest)} more.")
+    # Leader: kill claude; the box's self-healing supervisor relaunches it, and on
+    # startup claude re-mints the expired token and writes the shared file. Poll
+    # until expiresAt advances so we know the refresh landed before touching the rest.
+    docker("exec", container(leader), "pkill", "-x", "claude", check=False)
+    deadline, new_exp = time.time() + 90, exp_ms
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            new_exp = json.loads(creds.read_text())["claudeAiOauth"]["expiresAt"]
+        except (json.JSONDecodeError, KeyError, OSError):
+            continue
+        if new_exp > exp_ms:
+            break
+    if new_exp <= exp_ms:
+        die(f"{leader} did not re-mint the token within 90s — the refresh token may be "
+            f"revoked/expired. Re-login: `gent attach {leader}`, then `/login`. "
+            f"Left the other boxes untouched.")
+    print(f"gent: token re-minted (valid ~{int((new_exp / 1000 - time.time()) // 60)}m). "
+          f"reconnecting: {', '.join(rest) or '(none)'}")
+    for n in rest:
+        docker("exec", container(n), "pkill", "-x", "claude", check=False)
+    print(f"gent: done — {len(running)} session(s) bounced; Remote Control reconnects shortly.")
+
+
 def cmd_deploy_key(fleet, a):
     """Mint + register this repo's write-scoped GitHub deploy key (idempotent).
     Runs automatically on `up`; exposed standalone to set it up ahead of time
@@ -475,6 +534,7 @@ def main():
     fsub.add_parser("doctor", help="check host setup (docker, image, login)")
     fsub.add_parser("build",  help="build the base image")
     fsub.add_parser("auth",   help="shared-login status")
+    fsub.add_parser("refresh-auth", help="re-mint the shared login if it expired while the fleet idled (for cron)")
 
     # Per-repo box commands — repo defaults to the cwd's repo when omitted.
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
@@ -498,7 +558,8 @@ def main():
         # Prefer a fleet-specific handler (cmd_fleet_up/down) so it doesn't
         # collide with the per-repo cmd_up/cmd_down; the rest (ls/doctor/build/
         # auth) fall through to the shared cmd_* (gent ls == gent fleet ls).
-        fn = globals().get(f"cmd_fleet_{a.fleet_cmd}") or globals()[f"cmd_{a.fleet_cmd}"]
+        key = a.fleet_cmd.replace('-', '_')
+        fn = globals().get(f"cmd_fleet_{key}") or globals()[f"cmd_{key}"]
         return fn(fleet, a)
     if a.cmd in REPO_CMDS and not getattr(a, "repo", None):
         a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
