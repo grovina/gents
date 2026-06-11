@@ -29,6 +29,13 @@ mkdir -p "$HOME/.claude"
 # an older box's copy pre-trusts only the legacy /repo path — without merging the
 # real repo path in, claude would sit blocked on the trust dialog now that we
 # mount at the actual absolute path. Idempotent; everything else is preserved.
+# resumeReturnDismissed: the supervisor relaunches with `--resume`, and a resumed
+# session that's grown large enough triggers an interactive "Resume from summary
+# vs. as-is" picker that BLOCKS the TUI waiting on a keypress — fatal for an
+# unattended box. This is the exact flag claude's own "Don't ask me again" option
+# persists (it gates the picker: shown only when this is falsy); pre-setting it
+# makes every box resume as-is silently. We manage length via periodic /clear
+# anyway, so summary-on-resume is unwanted regardless.
 CJSON="$HOME/.claude.json"
 # Reset to {} if missing, EMPTY, or unparseable — not just absent. A disk-full
 # write can leave a 0-byte file; `-f` passes it through, and then `jq` on empty
@@ -38,6 +45,7 @@ CJSON="$HOME/.claude.json"
 if _tmp="$(mktemp)" && jq --arg r "$REPO" '
       .hasCompletedOnboarding = true
     | (.theme //= "dark") | (.numStartups //= 5)
+    | .resumeReturnDismissed = true
     | .projects[$r].hasTrustDialogAccepted = true
   ' "$CJSON" > "$_tmp" 2>/dev/null; then
   mv "$_tmp" "$CJSON"
@@ -45,6 +53,7 @@ else
   rm -f "${_tmp:-}"
   cat > "$CJSON" <<JSON
 { "hasCompletedOnboarding": true, "theme": "dark", "numStartups": 5,
+  "resumeReturnDismissed": true,
   "projects": { "$REPO": { "hasTrustDialogAccepted": true } } }
 JSON
 fi
