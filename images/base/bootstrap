@@ -304,6 +304,49 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
   fi
 fi
 
+# Telegram inbound-Monitor watchdog. A tg box (gent.json declares a `tg poll`
+# service) surfaces inbound by arming a persistent harness Monitor on `tg watch`,
+# which pipes new messages into the live claude session. That Monitor is
+# SESSION-BOUND and the harness can drop it with NO signal (context compaction,
+# event-rate kill, session end); when it does, the child `tg watch` process dies
+# with the task (verified by teardown test), so inbound silently stops surfacing
+# while the agent still believes it's listening — the exact bug that bit lastro.
+# Only the MODEL can arm a harness Monitor, so the box can't re-arm directly: it
+# pokes the pane and lets the model do it. The durable spine is the box-supervised
+# `tg poll` → var/telegram/history.jsonl (independent of any session), so a gap is
+# only ever a DELAY — on each re-arm the model reconciles history (latest in vs
+# out per chat) and handles whatever landed meanwhile. This ONE loop covers all
+# three death modes AND the initial arm: at session start (and after gent-clear)
+# the Monitor isn't up yet → it reads as "down" → we poke → model arms+reconciles.
+# Self-gating means the single loop is harmless on non-tg boxes; opt-in via the
+# service. Liveness is a plain process check — reliable because task teardown
+# always kills the child (if a drop ever orphaned a live process, the worst case
+# is a missed poke, recovered by reconcile at the next genuine arm).
+TG_BOX=0
+if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
+  jq -e '[.services[]?.cmd] | any(startswith("tg poll"))' "$REPO/gent.json" >/dev/null 2>&1 && TG_BOX=1
+fi
+if [ "$TG_BOX" = 1 ]; then
+  REARM_TEXT="⚠️ Telegram inbound Monitor is DOWN — the persistent \`tg watch\` task isn't running, so new messages aren't surfacing here. Re-arm it now: start a persistent Monitor on \`tg watch\`. Then reconcile the gap: in var/telegram/history.jsonl, for any chat whose latest inbound (direction:in) is newer than its latest outbound (direction:out), handle the unanswered message(s). The poller never stopped, so nothing is lost — just catch up."
+  echo "gents: telegram monitor watchdog armed (tg box)" >&2
+  ( trap : INT
+    sleep 30   # let a fresh session settle (hello, etc.) before the first check
+    while :; do
+      tmux has-session -t gent 2>/dev/null || exit 0
+      if pgrep -f 'tg watch' >/dev/null 2>&1; then sleep 60; continue; fi
+      # Monitor down — poke the model to re-arm + reconcile, then DEBOUNCE: wait for
+      # `tg watch` to reappear (up to ~5min) before checking again, so we don't queue
+      # a fresh re-arm every tick while the model is acting on the first one.
+      tmux send-keys -t gent:claude "$REARM_TEXT" Enter 2>/dev/null || true
+      for _ in $(seq 1 60); do
+        tmux has-session -t gent 2>/dev/null || exit 0
+        pgrep -f 'tg watch' >/dev/null 2>&1 && break
+        sleep 5
+      done
+      sleep 60
+    done ) &
+fi
+
 # PID 1 fate-shares with the tmux session. If the whole session ever dies
 # (kill-server, OOM, a signal that escapes the loop trap above), exit so
 # Docker's `--restart unless-stopped` recreates the box and re-runs this
