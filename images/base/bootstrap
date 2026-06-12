@@ -305,49 +305,83 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
 fi
 
 # Unified event bus + watchdog. The box surfaces every async wake-up — inbound
-# telegram AND due reminders (gent-schedule) — through ONE append-only stream
-# ($GENT_STATE_DIR/events.jsonl) that the agent watches with ONE Monitor:
-# `gent-events watch`. Box-supervised SOURCES feed the stream, independent of any
-# session (so they're durable across /clear + restart): a schedule daemon fires
-# due reminders, and — on a telegram box — a bridge runs the configured watch
-# command and pipes each line in. The win: the heavy telegram watch (tailing
-# history.jsonl) now runs in the box-supervised bridge, NOT as a harness Monitor,
-# so only the thin final hop (`gent-events watch` tailing events.jsonl) is
-# session-bound and harness-droppable. The harness can drop that Monitor with NO
-# signal (compaction, event-rate kill) and a restart kills it; only the MODEL can
-# re-arm a harness Monitor, so the watchdog pokes the pane. (It survives /clear —
-# verified — so gent-clear leaves it alone.) A drop is only ever a DELAY: the
-# durable spines are history.jsonl + schedule.jsonl, so on re-arm the model
-# reconciles with the source's reconcile command + `gent-schedule due`. Opt-in: a
-# `.telegram` block (or a `tg poll` service) turns the bus on for a telegram box; a
-# non-telegram box opts in with `.events: true` (scheduler only, no bridge).
-TG_WATCH=""; TG_RECONCILE=""
+# telegram, due reminders, AND cron triggers — through ONE append-only event
+# stream that the agent watches with ONE Monitor, kept alive by the watchdog.
+# Box-supervised SOURCES feed the stream independent of any session (durable across
+# /clear + restart): the schedule daemon (`gent-schedule fire-due` — reminders +
+# cron) and, on a telegram box, a bridge that runs the watch command and pipes each
+# line in. The WIN: heavy source work (telegram watch, an HA stream) runs in
+# box-supervised processes, NOT as harness Monitors; only the thin final Monitor
+# hop is session-bound/harness-droppable, and the watchdog re-arms it (poking the
+# pane, since only the MODEL can arm a harness Monitor) + has the model reconcile
+# from the durable spines. (It survives /clear — verified — so gent-clear leaves it
+# alone.) Config in gent.json:
+#   .telegram {watch,reconcile}  → telegram box: bridge + Monitor `gent-events watch`
+#   .events {path,cron,tz}       → stream / cron-file paths (relative = repo-anchored)
+#                                  + cron TZ; defaults $GENT_STATE_DIR/{events.jsonl,
+#                                  cron.json}, UTC. `.events:true` = bus on, defaults.
+#   .monitor {watch,reconcile,live} → a box that watches its OWN raw stream (e.g.
+#                                  homer tails its events.log); else Monitor defaults
+#                                  to `gent-events watch`. `.live` = liveness regex.
+TG_WATCH=""; TG_RECONCILE=""; MON_WATCH=""; MON_RECONCILE=""; MON_LIVE=""
+EV_PATH=""; CRON_PATH=""; SCHED_TZ=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   TG_WATCH="$(jq -r '.telegram.watch // empty' "$REPO/gent.json" 2>/dev/null || true)"
   TG_RECONCILE="$(jq -r '.telegram.reconcile // empty' "$REPO/gent.json" 2>/dev/null || true)"
   if [ -z "$TG_WATCH" ] && jq -e '[.services[]?.cmd] | any(startswith("tg poll"))' "$REPO/gent.json" >/dev/null 2>&1; then
     TG_WATCH="tg watch"; TG_RECONCILE="tg pending"   # legacy default: a `tg poll` service ⇒ the tg CLI
   fi
+  MON_WATCH="$(jq -r '.monitor.watch // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  MON_RECONCILE="$(jq -r '.monitor.reconcile // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  MON_LIVE="$(jq -r '.monitor.live // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  EV_PATH="$(jq -r '.events.path // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  CRON_PATH="$(jq -r '.events.cron // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  SCHED_TZ="$(jq -r '.events.tz // empty' "$REPO/gent.json" 2>/dev/null || true)"
 fi
 EVENT_BUS=0
-[ -n "$TG_WATCH" ] && EVENT_BUS=1
+{ [ -n "$TG_WATCH" ] || [ -n "$MON_WATCH" ]; } && EVENT_BUS=1
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
-  jq -e '.events == true' "$REPO/gent.json" >/dev/null 2>&1 && EVENT_BUS=1
+  jq -e '.events == true or (.events | type == "object")' "$REPO/gent.json" >/dev/null 2>&1 && EVENT_BUS=1
 fi
 if [ "$EVENT_BUS" = 1 ]; then
-  # Source 1 — schedule daemon: fire due reminders into the bus every 60s. Durable
-  # (gent-schedule's append-only log survives /clear + restart).
+  # Resolve relative event/cron paths against the repo (keeps gent.json portable),
+  # export them for the daemon + the model's shells (gent-schedule/gent-events read
+  # GENT_EVENTS_PATH / GENT_CRON_PATH / GENT_SCHEDULE_TZ).
+  _abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$REPO" "$1";; esac; }
+  [ -n "$EV_PATH" ] && export GENT_EVENTS_PATH="$(_abspath "$EV_PATH")"
+  [ -n "$CRON_PATH" ] && export GENT_CRON_PATH="$(_abspath "$CRON_PATH")"
+  [ -n "$SCHED_TZ" ] && export GENT_SCHEDULE_TZ="$SCHED_TZ"
+  { for _v in GENT_EVENTS_PATH GENT_CRON_PATH GENT_SCHEDULE_TZ; do
+      eval "_val=\${$_v:-}"; [ -n "$_val" ] && printf 'export %s=%q\n' "$_v" "$_val"; done; } \
+    | sudo tee /etc/profile.d/gents-events.sh >/dev/null 2>&1 || true
+
+  # The Monitor the agent arms (+ liveness pattern + reconcile hint). Telegram and
+  # .events-only boxes watch `gent-events watch`; a box with its own raw stream sets
+  # .monitor.watch (e.g. homer `tail -F events.log`).
+  [ -n "$MON_WATCH" ] || MON_WATCH="gent-events watch"
+  if [ -z "$MON_LIVE" ]; then
+    case "$MON_WATCH" in
+      "gent-events watch") MON_LIVE="gent-events watch" ;;
+      *) MON_LIVE="$MON_WATCH" ;;   # imperfect — set .monitor.live for a custom watch
+    esac
+  fi
+  RECONCILE_HINT="run \`gent-schedule due\`"
+  [ -n "$MON_RECONCILE" ] && RECONCILE_HINT="$MON_RECONCILE"
+  [ -n "$TG_RECONCILE" ] && RECONCILE_HINT="run \`$TG_RECONCILE\` and \`gent-schedule due\`"
+  REARM_TEXT="⚠️ Your event Monitor is DOWN — \`$MON_WATCH\` isn't running, so new events aren't surfacing here. Re-arm it now: start a persistent Monitor on \`$MON_WATCH\`. Then reconcile what landed while it was down: $RECONCILE_HINT, and handle anything outstanding. The box-supervised sources never stopped, so nothing is lost — just catch up."
+
+  # Source 1 — schedule daemon: fire due reminders + matching cron triggers into the
+  # stream, minute-aligned (cron needs each minute checked exactly once).
   ( trap : INT
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      gent-schedule fire-due >/dev/null 2>&1 || true
-      sleep 60
+      ( cd "$REPO" && gent-schedule fire-due ) >/dev/null 2>&1 || true
+      sleep $(( 61 - 10#$(date +%S) ))
     done ) &
-  echo "gents: schedule daemon armed (gent-schedule fire-due / 60s)" >&2
+  echo "gents: schedule daemon armed (gent-schedule fire-due, minute-aligned)" >&2
 
-  # Source 2 — telegram bridge (telegram boxes only): run the configured watch
-  # command box-supervised and wrap each output line as a telegram event, so
-  # telegram and reminders share ONE Monitor. Self-restarts if the watch exits.
+  # Source 2 — telegram bridge (telegram boxes): run the watch command box-supervised
+  # and wrap each line as a telegram event. Self-restarts if the watch exits.
   if [ -n "$TG_WATCH" ]; then
     ( trap : INT
       while :; do
@@ -359,18 +393,15 @@ if [ "$EVENT_BUS" = 1 ]; then
     echo "gents: telegram→events bridge armed (source: $TG_WATCH)" >&2
   fi
 
-  # The watchdog — keep the ONE unified Monitor (`gent-events watch`) armed.
-  RECONCILE_HINT="run \`gent-schedule due\`"
-  [ -n "$TG_RECONCILE" ] && RECONCILE_HINT="run \`$TG_RECONCILE\` and \`gent-schedule due\`"
-  REARM_TEXT="⚠️ Your unified event Monitor is DOWN — \`gent-events watch\` isn't running, so new events (telegram + reminders) aren't surfacing here. Re-arm it now: start a persistent Monitor on \`gent-events watch\`. Then reconcile what landed while it was down: $RECONCILE_HINT and handle anything outstanding. The box-supervised sources never stopped, so nothing is lost — just catch up."
-  echo "gents: unified event watchdog armed (monitor: gent-events watch)" >&2
+  # The watchdog — keep the ONE Monitor armed.
+  echo "gents: event watchdog armed (monitor: $MON_WATCH)" >&2
   ( trap : INT
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      # Liveness — is the `gent-events watch` Monitor running? A bare `pgrep`
-      # excludes its own PID; NEVER wrap it in a shell whose argv holds the pattern.
-      if pgrep -f 'gent-events watch' >/dev/null 2>&1; then sleep 60; continue; fi
+      # Liveness — is the Monitor running? A bare `pgrep` excludes its own PID;
+      # NEVER wrap it in a shell whose argv holds the pattern.
+      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then sleep 60; continue; fi
       # Monitor down — poke the model to re-arm + reconcile. Deliver it like
       # gent-hello: a bare `send-keys "$text" Enter` into a BUSY pane leaves the text
       # unsent in the composer, so wait for the pane to go idle (stable + not showing
@@ -391,7 +422,7 @@ if [ "$EVENT_BUS" = 1 ]; then
       # DEBOUNCE: wait for the Monitor to reappear (up to ~5min) before re-checking.
       for _ in $(seq 1 60); do
         tmux has-session -t gent 2>/dev/null || exit 0
-        pgrep -f 'gent-events watch' >/dev/null 2>&1 && break
+        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && break
         sleep 5
       done
       sleep 60

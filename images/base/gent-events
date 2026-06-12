@@ -28,7 +28,7 @@ def state_dir():
 def events_path():
     d = state_dir()
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "events.jsonl")
+    return os.environ.get("GENT_EVENTS_PATH") or os.path.join(d, "events.jsonl")
 
 
 def cmd_emit(argv):

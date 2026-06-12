@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""gent-schedule — durable, cross-session reminders for the box's agent.
+"""gent-schedule — the box's one scheduler: durable reminders + cron triggers.
 
-The box has no at/cron/systemd that outlives a session, so an agent can't leave a
-note for its future self that survives a /clear or restart. This fixes that: a
-box-supervised tick (the schedule daemon in the bootstrap) fires due reminders into
-the unified event bus (`gent-events emit reminder …`), surfacing them through the one
-Monitor the agent already watches.
+Two kinds of timed wake-up, one daemon, fired into the box's unified event stream
+(see gent-events) so they surface through the one Monitor the agent watches:
 
-State is an append-only log ($GENT_STATE_DIR/schedule.jsonl, default ~/.local/state/
-gent), folded on read — add / fire / done records, never rewritten, crash-safe.
+  REMINDERS — "do X later / eventually" (interval or one-shot, AT-LEAST-ONCE).
+    gent-schedule add --note "<text>" [--in <dur> | --at <iso>] [--every <dur>]
+    gent-schedule list | due | done <id> | rm <id>
+  Stored append-only in $GENT_STATE_DIR/schedule.jsonl (add/fire/done, fold-on-read).
+  A fired reminder stays in `due` until you `done` it, so one missed while the
+  (flaky) Monitor was down is caught at the next reconcile. Recurring (`--every`)
+  reschedules from NOW (no catch-up burst). A note is a nudge — you pick the moment.
 
-  gent-schedule add --note "<text>" [--in <dur> | --at <iso>] [--every <dur>]
-  gent-schedule list                  pending reminders, soonest first
-  gent-schedule due                   pending + past fire_at — what to reconcile after a Monitor gap
-  gent-schedule done <id>             acknowledge: handled, drop it
-  gent-schedule rm <id>               cancel a pending reminder (alias for done)
-  gent-schedule fire-due              [daemon, internal] emit events for newly-due reminders
+  CRON TRIGGERS — "fire at this wall-clock slot" (calendar, NO backfill).
+  A hand-edited JSON array at $GENT_CRON_PATH (default $GENT_STATE_DIR/cron.json):
+    [{"name":"morning_digest","cron":"32 8 * * *","enabled":true,
+      "event":{"topic":"morning_digest","note":"…"}}]
+  5-field cron (min hour dom month dow, dow 0=Sun) in $GENT_SCHEDULE_TZ (default
+  UTC). On a matching minute the entry's `event` payload is emitted verbatim (kind
+  defaults to "scheduled", `name` added). No backfill — a daemon that was down
+  doesn't replay missed slots; de-dup is per (name, minute). Edit the file freely;
+  it's re-read every tick.
 
-A note is a NUDGE ("do this soon"), not a command — the agent picks the moment.
-Recurring (`--every <dur>`) reschedules from NOW on fire, so a daemon that was down
-doesn't fire a catch-up burst. Delivery is AT-LEAST-ONCE: a fired reminder stays in
-`due` until you `done` it, so one missed while the Monitor was down is caught by the
-next reconcile — the reminder analogue of `tg pending`. Durations: sums of <n><unit>
-tokens, unit d|h|m|s (e.g. `2d`, `90m`, `1d6h`).
+The daemon (`gent-schedule fire-due`, run minute-aligned by the bootstrap) fires
+both. Events land in $GENT_EVENTS_PATH (default $GENT_STATE_DIR/events.jsonl).
 """
 import sys
 import os
@@ -30,7 +31,11 @@ import re
 import json
 import uuid
 import datetime
-import subprocess
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 
 def state_dir():
@@ -38,10 +43,26 @@ def state_dir():
         os.path.expanduser("~"), ".local", "state", "gent")
 
 
-def sched_path():
+def _path(env, name):
     d = state_dir()
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "schedule.jsonl")
+    return os.environ.get(env) or os.path.join(d, name)
+
+
+def sched_path():
+    return _path("GENT_SCHEDULE_PATH", "schedule.jsonl")
+
+
+def cron_path():
+    return _path("GENT_CRON_PATH", "cron.json")
+
+
+def events_path():
+    return _path("GENT_EVENTS_PATH", "events.jsonl")
+
+
+def cron_state_path():
+    return _path("GENT_CRON_STATE_PATH", "cron-fired.json")
 
 
 def now():
@@ -51,6 +72,16 @@ def now():
 def iso(dt):
     return dt.isoformat()
 
+
+def emit_event(obj):
+    """Append one event (ts added) to the unified event stream."""
+    obj = dict(obj)
+    obj.setdefault("ts", iso(now()))
+    with open(events_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# ── reminders (append-only schedule.jsonl) ────────────────────────────────────
 
 def parse_dur(s):
     total, matched = 0, False
@@ -62,13 +93,12 @@ def parse_dur(s):
     return total
 
 
-def append(rec):
+def append_sched(rec):
     with open(sched_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def fold():
-    """id -> {add, fired, done} from the append-only log (last-writer wins per op)."""
     items = {}
     p = sched_path()
     if not os.path.exists(p):
@@ -148,12 +178,12 @@ def cmd_add(argv):
     elif recur:
         fire = now() + datetime.timedelta(seconds=recur)
     else:
-        sys.exit("add: need --in, --at, or --every")
+        sys.exit("add: need --in, --at, or --every (for a calendar slot, add a cron entry to %s)" % cron_path())
     rid = uuid.uuid4().hex[:8]
     rec = {"op": "add", "id": rid, "fire_at": iso(fire), "note": note, "created_at": iso(now())}
     if recur:
         rec["recur_ms"] = recur * 1000
-    append(rec)
+    append_sched(rec)
     print("scheduled %s for %s%s" % (rid, iso(fire), " (every %s)" % every if every else ""))
 
 
@@ -193,13 +223,104 @@ def cmd_done(argv):
     if items[rid]["done"]:
         print("%s already done" % rid)
         return
-    append({"op": "done", "id": rid, "at": iso(now())})
+    append_sched({"op": "done", "id": rid, "at": iso(now())})
     print("done %s" % rid)
 
 
+# ── cron triggers (calendar slots, ported from homer; no backfill) ────────────
+
+def _expand_cron_field(field, lo, hi):
+    values = set()
+    for part in field.split(","):
+        step = 1
+        token = part
+        if "/" in token:
+            token, step_s = token.split("/", 1)
+            step = int(step_s)
+        if token == "*":
+            start, end = lo, hi
+        elif "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start, end = int(start_s), int(end_s)
+        else:
+            start = end = int(token)
+        values.update(range(start, end + 1, step))
+    return {v for v in values if lo <= v <= hi}
+
+
+def _cron_matches(expr, dt):
+    """True if 5-field cron `expr` (min hour dom month dow) matches local dt.
+    dow uses cron convention 0=Sunday..6=Saturday; dom/dow are ANDed."""
+    minute, hour, dom, month, dow = expr.split()
+    cron_dow = (dt.weekday() + 1) % 7
+    return (
+        dt.minute in _expand_cron_field(minute, 0, 59)
+        and dt.hour in _expand_cron_field(hour, 0, 23)
+        and dt.day in _expand_cron_field(dom, 1, 31)
+        and dt.month in _expand_cron_field(month, 1, 12)
+        and cron_dow in _expand_cron_field(dow, 0, 6)
+    )
+
+
+def _local_tz():
+    name = os.environ.get("GENT_SCHEDULE_TZ", "UTC")
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.UTC
+
+
+def _fire_cron():
+    p = cron_path()
+    if not os.path.exists(p):
+        return
+    try:
+        entries = json.loads(open(p, encoding="utf-8").read())
+    except Exception as e:
+        emit_event({"kind": "homer_status", "msg": "gent-schedule: bad cron file: %r" % e})
+        return
+    if not isinstance(entries, list):
+        return
+    dt = datetime.datetime.now(_local_tz())
+    minute_key = dt.strftime("%Y-%m-%dT%H:%M")
+    sp = cron_state_path()
+    fired = {}
+    if os.path.exists(sp):
+        try:
+            fired = json.loads(open(sp, encoding="utf-8").read())
+        except Exception:
+            fired = {}
+    changed = False
+    for ent in entries:
+        if not isinstance(ent, dict) or not ent.get("enabled", True):
+            continue
+        name = ent.get("name", "unnamed")
+        cron = ent.get("cron")
+        if not cron:
+            continue
+        try:
+            hit = _cron_matches(cron, dt)
+        except Exception as e:
+            emit_event({"kind": "homer_status", "msg": "gent-schedule: bad cron %r: %r" % (name, e)})
+            continue
+        if hit and fired.get(name) != minute_key:
+            fired[name] = minute_key
+            changed = True
+            event = dict(ent.get("event") or {})
+            event.setdefault("kind", "scheduled")
+            event["name"] = name
+            emit_event(event)
+    if changed:
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump(fired, f)
+
+
 def cmd_fire_due(_argv):
-    """Daemon tick: emit one event per newly-due reminder (pending, past fire_at, not yet
-    fired); reschedule recurring ones from now. Stays pending until the agent `done`s it."""
+    """Daemon tick: fire due reminders (at-least-once) + matching cron triggers
+    (calendar, no-backfill). Run minute-aligned by the bootstrap."""
+    # Reminders.
     items = fold()
     n = now()
     for rid, it in items.items():
@@ -208,13 +329,14 @@ def cmd_fire_due(_argv):
         if fire_at_of(it) > n:
             continue
         a = it["add"]
-        append({"op": "fire", "id": rid, "at": iso(n)})
-        subprocess.run(["gent-events", "emit", "reminder", "id=%s" % rid, "note=%s" % a["note"]],
-                       check=False)
+        append_sched({"op": "fire", "id": rid, "at": iso(n)})
+        emit_event({"kind": "reminder", "id": rid, "note": a["note"]})
         if a.get("recur_ms"):
             nxt = n + datetime.timedelta(seconds=a["recur_ms"] // 1000)
-            append({"op": "add", "id": uuid.uuid4().hex[:8], "fire_at": iso(nxt),
-                    "note": a["note"], "created_at": iso(n), "recur_ms": a["recur_ms"]})
+            append_sched({"op": "add", "id": uuid.uuid4().hex[:8], "fire_at": iso(nxt),
+                          "note": a["note"], "created_at": iso(n), "recur_ms": a["recur_ms"]})
+    # Cron triggers.
+    _fire_cron()
 
 
 def main():
