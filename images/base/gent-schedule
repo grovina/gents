@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""gent-schedule — durable, cross-session reminders for the box's agent.
+
+The box has no at/cron/systemd that outlives a session, so an agent can't leave a
+note for its future self that survives a /clear or restart. This fixes that: a
+box-supervised tick (the schedule daemon in the bootstrap) fires due reminders into
+the unified event bus (`gent-events emit reminder …`), surfacing them through the one
+Monitor the agent already watches.
+
+State is an append-only log ($GENT_STATE_DIR/schedule.jsonl, default ~/.local/state/
+gent), folded on read — add / fire / done records, never rewritten, crash-safe.
+
+  gent-schedule add --note "<text>" [--in <dur> | --at <iso>] [--every <dur>]
+  gent-schedule list                  pending reminders, soonest first
+  gent-schedule due                   pending + past fire_at — what to reconcile after a Monitor gap
+  gent-schedule done <id>             acknowledge: handled, drop it
+  gent-schedule rm <id>               cancel a pending reminder (alias for done)
+  gent-schedule fire-due              [daemon, internal] emit events for newly-due reminders
+
+A note is a NUDGE ("do this soon"), not a command — the agent picks the moment.
+Recurring (`--every <dur>`) reschedules from NOW on fire, so a daemon that was down
+doesn't fire a catch-up burst. Delivery is AT-LEAST-ONCE: a fired reminder stays in
+`due` until you `done` it, so one missed while the Monitor was down is caught by the
+next reconcile — the reminder analogue of `tg pending`. Durations: sums of <n><unit>
+tokens, unit d|h|m|s (e.g. `2d`, `90m`, `1d6h`).
+"""
+import sys
+import os
+import re
+import json
+import uuid
+import datetime
+import subprocess
+
+
+def state_dir():
+    return os.environ.get("GENT_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "gent")
+
+
+def sched_path():
+    d = state_dir()
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "schedule.jsonl")
+
+
+def now():
+    return datetime.datetime.now(datetime.UTC)
+
+
+def iso(dt):
+    return dt.isoformat()
+
+
+def parse_dur(s):
+    total, matched = 0, False
+    for n, u in re.findall(r"(\d+)\s*([dhms])", s or ""):
+        matched = True
+        total += int(n) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[u]
+    if not matched:
+        sys.exit("bad duration %r (use e.g. 2d, 90m, 1d6h)" % s)
+    return total
+
+
+def append(rec):
+    with open(sched_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def fold():
+    """id -> {add, fired, done} from the append-only log (last-writer wins per op)."""
+    items = {}
+    p = sched_path()
+    if not os.path.exists(p):
+        return items
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            op, rid = r.get("op"), r.get("id")
+            if not rid:
+                continue
+            if op == "add":
+                items[rid] = {"add": r, "fired": False, "done": False}
+            elif op == "fire" and rid in items:
+                items[rid]["fired"] = True
+            elif op == "done" and rid in items:
+                items[rid]["done"] = True
+    return items
+
+
+def pending(items):
+    return {rid: it for rid, it in items.items() if not it["done"]}
+
+
+def fire_at_of(it):
+    return datetime.datetime.fromisoformat(it["add"]["fire_at"])
+
+
+def humanize(dt):
+    secs = (dt - now()).total_seconds()
+    past = secs < 0
+    secs = abs(secs)
+    d, h, m = int(secs // 86400), int(secs % 86400 // 3600), int(secs % 3600 // 60)
+    parts = []
+    if d:
+        parts.append("%dd" % d)
+    if h:
+        parts.append("%dh" % h)
+    if m and not d:
+        parts.append("%dm" % m)
+    s = " ".join(parts) or "<1m"
+    return "%s ago" % s if past else "in %s" % s
+
+
+def cmd_add(argv):
+    note = in_d = at = every = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--note":
+            note = argv[i + 1]; i += 2
+        elif a == "--in":
+            in_d = argv[i + 1]; i += 2
+        elif a == "--at":
+            at = argv[i + 1]; i += 2
+        elif a == "--every":
+            every = argv[i + 1]; i += 2
+        else:
+            sys.exit("add: unknown arg %r" % a)
+    if not note:
+        sys.exit("add: --note required")
+    recur = parse_dur(every) if every else None
+    if at:
+        try:
+            fire = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except Exception:
+            sys.exit("add: bad --at %r (use ISO 8601, e.g. 2026-06-15T09:00:00Z)" % at)
+        if fire.tzinfo is None:
+            fire = fire.replace(tzinfo=datetime.UTC)
+    elif in_d:
+        fire = now() + datetime.timedelta(seconds=parse_dur(in_d))
+    elif recur:
+        fire = now() + datetime.timedelta(seconds=recur)
+    else:
+        sys.exit("add: need --in, --at, or --every")
+    rid = uuid.uuid4().hex[:8]
+    rec = {"op": "add", "id": rid, "fire_at": iso(fire), "note": note, "created_at": iso(now())}
+    if recur:
+        rec["recur_ms"] = recur * 1000
+    append(rec)
+    print("scheduled %s for %s%s" % (rid, iso(fire), " (every %s)" % every if every else ""))
+
+
+def cmd_list(_argv):
+    items = pending(fold())
+    if not items:
+        print("no pending reminders")
+        return
+    rows = sorted(items.values(), key=fire_at_of)
+    print("%d pending reminder(s):" % len(rows))
+    for it in rows:
+        a = it["add"]
+        recur = " (every %ds)" % (a["recur_ms"] // 1000) if a.get("recur_ms") else ""
+        flag = " ⏰fired" if it["fired"] else ""
+        print("  %s  %-16s %s%s%s" % (a["id"], humanize(fire_at_of(it)), a["note"], recur, flag))
+
+
+def cmd_due(_argv):
+    items = pending(fold())
+    n = now()
+    rows = sorted([it for it in items.values() if fire_at_of(it) <= n], key=fire_at_of)
+    if not rows:
+        print("no due reminders — nothing missed")
+        return
+    for it in rows:
+        a = it["add"]
+        print("  %s  %s  (run `gent-schedule done %s` once handled)" % (a["id"], a["note"], a["id"]))
+
+
+def cmd_done(argv):
+    if not argv:
+        sys.exit("usage: gent-schedule done <id>")
+    rid = argv[0]
+    items = fold()
+    if rid not in items:
+        sys.exit("no reminder %s" % rid)
+    if items[rid]["done"]:
+        print("%s already done" % rid)
+        return
+    append({"op": "done", "id": rid, "at": iso(now())})
+    print("done %s" % rid)
+
+
+def cmd_fire_due(_argv):
+    """Daemon tick: emit one event per newly-due reminder (pending, past fire_at, not yet
+    fired); reschedule recurring ones from now. Stays pending until the agent `done`s it."""
+    items = fold()
+    n = now()
+    for rid, it in items.items():
+        if it["done"] or it["fired"]:
+            continue
+        if fire_at_of(it) > n:
+            continue
+        a = it["add"]
+        append({"op": "fire", "id": rid, "at": iso(n)})
+        subprocess.run(["gent-events", "emit", "reminder", "id=%s" % rid, "note=%s" % a["note"]],
+                       check=False)
+        if a.get("recur_ms"):
+            nxt = n + datetime.timedelta(seconds=a["recur_ms"] // 1000)
+            append({"op": "add", "id": uuid.uuid4().hex[:8], "fire_at": iso(nxt),
+                    "note": a["note"], "created_at": iso(n), "recur_ms": a["recur_ms"]})
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: gent-schedule <add|list|due|done|rm|fire-due> ...")
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    return {
+        "add": cmd_add, "list": cmd_list, "due": cmd_due,
+        "done": cmd_done, "rm": cmd_done, "fire-due": cmd_fire_due,
+    }.get(cmd, lambda _a: sys.exit("gent-schedule: unknown subcommand %r" % cmd))(rest)
+
+
+if __name__ == "__main__":
+    main()

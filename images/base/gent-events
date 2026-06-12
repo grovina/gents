@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""gent-events — the box's unified event bus.
+
+ONE append-only stream ($GENT_STATE_DIR/events.jsonl, default ~/.local/state/gent)
+carries EVERY async wake-up — inbound telegram, due reminders, and whatever else a
+box wires in — and the agent arms ONE Monitor on `gent-events watch`. Box-supervised
+sources (the schedule daemon, the telegram bridge) feed it with `gent-events emit`.
+This is the gents analogue of pickle's events.jsonl: one inbox, one Monitor, many
+sources. The durable per-source logs (telegram history.jsonl, schedule.jsonl) remain
+the reconcile backstop — events.jsonl is the realtime surface, lossy by design if the
+Monitor is down (a gap is recovered by `tg pending` / `gent-schedule due` on re-arm).
+
+  gent-events emit <kind> [key=value ...]   append an event (ts added automatically)
+  gent-events watch                         tail + format the stream (the Monitor command)
+"""
+import sys
+import os
+import json
+import datetime
+import subprocess
+
+
+def state_dir():
+    return os.environ.get("GENT_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "gent")
+
+
+def events_path():
+    d = state_dir()
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "events.jsonl")
+
+
+def cmd_emit(argv):
+    if not argv:
+        sys.exit("usage: gent-events emit <kind> [key=value ...]")
+    ev = {"kind": argv[0], "ts": datetime.datetime.now(datetime.UTC).isoformat()}
+    for kv in argv[1:]:
+        if "=" not in kv:
+            sys.exit("emit: args after <kind> must be key=value (got %r)" % kv)
+        k, v = kv.split("=", 1)
+        ev[k] = v
+    # A single write of a small line is atomic on POSIX — concurrent sources are safe.
+    with open(events_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+
+def _fmt(ev):
+    k = ev.get("kind")
+    if k == "reminder":
+        rid = ev.get("id", "?")
+        return "⏰ Reminder [%s]: %s  (run `gent-schedule done %s` once handled)" % (
+            rid, ev.get("note", ""), rid)
+    if k == "telegram":
+        return ev.get("line") or ev.get("text") or json.dumps(ev, ensure_ascii=False)
+    extra = " ".join("%s=%s" % (kk, vv) for kk, vv in ev.items() if kk not in ("kind", "ts"))
+    return "• %s %s" % (k, extra)
+
+
+def cmd_watch(_argv):
+    path = events_path()
+    open(path, "a").close()  # ensure it exists so `tail -F` has a target immediately
+    p = subprocess.Popen(["tail", "-n", "0", "-F", path], stdout=subprocess.PIPE, text=True)
+    try:
+        for line in p.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if str(ev.get("kind", "")).startswith("self_"):
+                continue  # outbound / self events don't echo back into the session
+            print(_fmt(ev), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        p.terminate()
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: gent-events <emit|watch> ...")
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "emit":
+        return cmd_emit(rest)
+    if cmd == "watch":
+        return cmd_watch(rest)
+    sys.exit("gent-events: unknown subcommand %r (want emit|watch)" % cmd)
+
+
+if __name__ == "__main__":
+    main()

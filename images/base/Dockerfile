@@ -114,10 +114,17 @@ COPY bootstrap /usr/local/bin/bootstrap
 # model's Bash tool.
 COPY gent-hello /usr/local/bin/gent-hello
 COPY gent-clear /usr/local/bin/gent-clear
+# gent-events / gent-schedule: the box's unified event bus + durable scheduler.
+# events.jsonl is ONE stream (telegram + reminders + …) the agent watches via one
+# Monitor; gent-schedule lets the agent leave durable, cross-session reminders that
+# fire from a box-supervised daemon (no at/cron/systemd on the box).
+COPY gent-events /usr/local/bin/gent-events
+COPY gent-schedule /usr/local/bin/gent-schedule
 # Non-root by default (keeps bind-mount file ownership sane, shrinks the
 # default blast radius) but with passwordless sudo so the agent can install
 # anything it needs inside — "generous inside the box".
 RUN chmod +x /usr/local/bin/bootstrap /usr/local/bin/gent-hello /usr/local/bin/gent-clear \
+ && chmod +x /usr/local/bin/gent-events /usr/local/bin/gent-schedule \
  && useradd -m -s /bin/bash -u 1000 gent \
  && echo 'gent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/gent \
  && chown -R gent:gent /opt/npm-global \
