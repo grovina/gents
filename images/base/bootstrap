@@ -333,10 +333,13 @@ if [ "$TG_BOX" = 1 ]; then
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      # Liveness: a bare `pgrep` excludes its own PID, so the pattern doesn't
-      # self-match here — but NEVER wrap this in a shell whose argv contains the
-      # pattern (e.g. `bash -lc "pgrep -f 'tg watch'"`) or it matches that wrapper.
-      if pgrep -f 'tg watch' >/dev/null 2>&1; then sleep 60; continue; fi
+      # Liveness: inbound is surfaced by a persistent Monitor that either runs
+      # `tg watch` OR tails history.jsonl directly — both are valid and different
+      # boxes do it differently (e.g. axt tails), so match EITHER, else the
+      # watchdog false-pokes a box whose monitor is a tail. A bare `pgrep` excludes
+      # its own PID — but NEVER wrap this in a shell whose argv contains the pattern
+      # (e.g. `bash -lc "pgrep -f …"`) or it matches that wrapper.
+      if pgrep -f 'tg watch|history\.jsonl' >/dev/null 2>&1; then sleep 60; continue; fi
       # Monitor down — poke the model to re-arm + reconcile. Deliver it like
       # gent-hello: a bare `send-keys "$text" Enter` into a BUSY pane leaves the
       # text unsent in the composer (the Enter is swallowed mid-turn). So wait for
@@ -360,7 +363,7 @@ if [ "$TG_BOX" = 1 ]; then
       # so we don't re-poke every tick while the model is acting on the first one.
       for _ in $(seq 1 60); do
         tmux has-session -t gent 2>/dev/null || exit 0
-        pgrep -f 'tg watch' >/dev/null 2>&1 && break
+        pgrep -f 'tg watch|history\.jsonl' >/dev/null 2>&1 && break
         sleep 5
       done
       sleep 60
