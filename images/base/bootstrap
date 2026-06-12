@@ -333,11 +333,31 @@ if [ "$TG_BOX" = 1 ]; then
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
+      # Liveness: a bare `pgrep` excludes its own PID, so the pattern doesn't
+      # self-match here — but NEVER wrap this in a shell whose argv contains the
+      # pattern (e.g. `bash -lc "pgrep -f 'tg watch'"`) or it matches that wrapper.
       if pgrep -f 'tg watch' >/dev/null 2>&1; then sleep 60; continue; fi
-      # Monitor down — poke the model to re-arm + reconcile, then DEBOUNCE: wait for
-      # `tg watch` to reappear (up to ~5min) before checking again, so we don't queue
-      # a fresh re-arm every tick while the model is acting on the first one.
-      tmux send-keys -t gent:claude "$REARM_TEXT" Enter 2>/dev/null || true
+      # Monitor down — poke the model to re-arm + reconcile. Deliver it like
+      # gent-hello: a bare `send-keys "$text" Enter` into a BUSY pane leaves the
+      # text unsent in the composer (the Enter is swallowed mid-turn). So wait for
+      # the pane to go idle (stable + not showing "esc to interrupt"), then
+      # bracketed-paste the text and submit with a separate Enter — the same
+      # primitive that makes the hello reliably land.
+      prev=""; stable=0; ready=0
+      for _ in $(seq 1 120); do
+        tmux has-session -t gent 2>/dev/null || exit 0
+        cur="$(tmux capture-pane -p -t gent:claude 2>/dev/null || true)"
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ] && ! printf '%s' "$cur" | grep -q 'esc to interrupt'; then
+          stable=$((stable + 1)); [ "$stable" -ge 3 ] && { ready=1; break; }
+        else stable=0; fi
+        prev="$cur"; sleep 1
+      done
+      [ "$ready" = 1 ] || continue   # never went idle within ~2min — retry next cycle
+      printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
+      tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
+      tmux send-keys -t gent:claude Enter
+      # DEBOUNCE: wait for `tg watch` to reappear (up to ~5min) before re-checking,
+      # so we don't re-poke every tick while the model is acting on the first one.
       for _ in $(seq 1 60); do
         tmux has-session -t gent 2>/dev/null || exit 0
         pgrep -f 'tg watch' >/dev/null 2>&1 && break
