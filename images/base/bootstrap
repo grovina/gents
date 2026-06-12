@@ -304,11 +304,11 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
   fi
 fi
 
-# Telegram inbound-Monitor watchdog. A tg box (gent.json declares a `tg poll`
-# service) surfaces inbound by arming a persistent harness Monitor on `tg watch`,
-# which pipes new messages into the live claude session. The harness can drop
-# that Monitor with NO signal (context compaction, event-rate kill); when it does
-# the child `tg watch` process dies with the task (verified by teardown test), so
+# Telegram inbound-Monitor watchdog. A telegram box surfaces inbound by arming a
+# persistent harness Monitor (a "watch" command — `tg watch`, or filmograma's
+# `./m telegram watch`) that pipes new messages into the live claude session. The
+# harness can drop that Monitor with NO signal (context compaction, event-rate
+# kill); when it does the child watch process dies with the task (verified), so
 # inbound silently stops surfacing while the agent still believes it's listening —
 # the exact bug that bit lastro. A container restart kills it outright too. (It
 # does NOT die on /clear — the Monitor survives the clear and keeps feeding the
@@ -316,32 +316,45 @@ fi
 # it alone.) Only the MODEL can arm a harness Monitor, so the box can't re-arm
 # directly: it pokes the pane and lets the model do it. The durable spine is the
 # box-supervised `tg poll` → var/telegram/history.jsonl (independent of any
-# session), so a gap is only ever a DELAY — on each re-arm the model reconciles
-# history (latest in vs out per chat) and handles whatever landed meanwhile. This
-# ONE loop covers both silent-drop death modes AND the initial arm at a fresh
-# container start: the Monitor isn't up → it reads as "down" → we poke → model
-# arms+reconciles. Self-gating means the single loop is harmless on non-tg boxes;
-# opt-in via the service. Liveness is a plain process check — reliable because
-# task teardown always kills the child (if a drop ever orphaned a live process,
-# the worst case is a missed poke, recovered by reconcile at the next genuine arm).
-TG_BOX=0
+# session), so a gap is only ever a DELAY — on each re-arm the model runs the
+# "reconcile" command (pending/ack) and catches up. This ONE loop covers both
+# silent-drop death modes AND the initial arm at a fresh container start: the
+# Monitor isn't up → it reads as "down" → we poke → model arms+reconciles.
+# Tool-agnostic + opt-in: a box declares gent.json `.telegram` {watch, reconcile}
+# (any telegram tooling), or legacy-defaults to the `tg` CLI when it runs a
+# `tg poll` service; absent both, the loop never starts. Liveness is a plain
+# process check — reliable because task teardown always kills the child (if a drop
+# ever orphaned a live process, the worst case is a missed poke, recovered by
+# reconcile at the next genuine arm).
+TG_WATCH=""; TG_RECONCILE=""; TG_LIVE=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
-  jq -e '[.services[]?.cmd] | any(startswith("tg poll"))' "$REPO/gent.json" >/dev/null 2>&1 && TG_BOX=1
+  TG_WATCH="$(jq -r '.telegram.watch // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  TG_RECONCILE="$(jq -r '.telegram.reconcile // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  TG_LIVE="$(jq -r '.telegram.live // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  # Legacy default: a `tg poll` service means the tg CLI (no .telegram block needed).
+  if [ -z "$TG_WATCH" ] && jq -e '[.services[]?.cmd] | any(startswith("tg poll"))' "$REPO/gent.json" >/dev/null 2>&1; then
+    TG_WATCH="tg watch"; TG_RECONCILE="tg pending"
+  fi
 fi
-if [ "$TG_BOX" = 1 ]; then
-  REARM_TEXT="⚠️ Telegram inbound Monitor is DOWN — the persistent \`tg watch\` task isn't running, so new messages aren't surfacing here. Re-arm it now: start a persistent Monitor on \`tg watch\`. Then reconcile the gap: run \`tg pending\` and handle every chat/thread it lists (it shows inbound newer than your last reply). The poller never stopped, so nothing is lost — just catch up."
-  echo "gents: telegram monitor watchdog armed (tg box)" >&2
+if [ -n "$TG_WATCH" ]; then
+  [ -n "$TG_RECONCILE" ] || TG_RECONCILE="$TG_WATCH"   # degenerate fallback; configs set both
+  # Liveness pattern: the watch command's distinctive tail (any leading `./path `
+  # stripped, so `./m telegram watch` → `telegram watch`) OR a history.jsonl tail
+  # (some monitors ARE a raw `tail -F …history.jsonl`). Override via `.telegram.live`.
+  if [ -z "$TG_LIVE" ]; then
+    _core="$(printf '%s' "$TG_WATCH" | sed -E 's#^\./[^[:space:]]+[[:space:]]+##')"
+    TG_LIVE="${_core}|history\\.jsonl"
+  fi
+  REARM_TEXT="⚠️ Telegram inbound Monitor is DOWN — the persistent \`$TG_WATCH\` task isn't running, so new messages aren't surfacing here. Re-arm it now: start a persistent Monitor on \`$TG_WATCH\`. Then reconcile the gap: run \`$TG_RECONCILE\` and handle every chat/thread it lists (inbound newer than your last reply or ack). The poller never stopped, so nothing is lost — just catch up."
+  echo "gents: telegram monitor watchdog armed (watch: $TG_WATCH)" >&2
   ( trap : INT
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      # Liveness: inbound is surfaced by a persistent Monitor that either runs
-      # `tg watch` OR tails history.jsonl directly — both are valid and different
-      # boxes do it differently (e.g. axt tails), so match EITHER, else the
-      # watchdog false-pokes a box whose monitor is a tail. A bare `pgrep` excludes
-      # its own PID — but NEVER wrap this in a shell whose argv contains the pattern
-      # (e.g. `bash -lc "pgrep -f …"`) or it matches that wrapper.
-      if pgrep -f 'tg watch|history\.jsonl' >/dev/null 2>&1; then sleep 60; continue; fi
+      # Liveness — match the configured watch command OR a history.jsonl tail. A bare
+      # `pgrep` excludes its own PID; NEVER wrap it in a shell whose argv holds the
+      # pattern (e.g. `bash -lc "pgrep -f …"`) or it matches that wrapper.
+      if pgrep -f "$TG_LIVE" >/dev/null 2>&1; then sleep 60; continue; fi
       # Monitor down — poke the model to re-arm + reconcile. Deliver it like
       # gent-hello: a bare `send-keys "$text" Enter` into a BUSY pane leaves the
       # text unsent in the composer (the Enter is swallowed mid-turn). So wait for
@@ -361,11 +374,11 @@ if [ "$TG_BOX" = 1 ]; then
       printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
       tmux send-keys -t gent:claude Enter
-      # DEBOUNCE: wait for `tg watch` to reappear (up to ~5min) before re-checking,
+      # DEBOUNCE: wait for the monitor to reappear (up to ~5min) before re-checking,
       # so we don't re-poke every tick while the model is acting on the first one.
       for _ in $(seq 1 60); do
         tmux has-session -t gent 2>/dev/null || exit 0
-        pgrep -f 'tg watch|history\.jsonl' >/dev/null 2>&1 && break
+        pgrep -f "$TG_LIVE" >/dev/null 2>&1 && break
         sleep 5
       done
       sleep 60
