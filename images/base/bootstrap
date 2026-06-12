@@ -254,6 +254,15 @@ fi
 # durable state saved) and runs `gent-clear`, which does the /clear + replays
 # .gent/hello.md. Opt-in: no clear.every → no nudge loop. Backgrounded as a child
 # of PID 1, so it dies with the container; it also self-exits if the session goes.
+#
+# IDLE-SKIP: we only nudge when something has actually happened since our last
+# baseline. Without this, an idle box churns forever — it clears, the fresh
+# session holds only the hello, the next nudge fires into it, and since "idle" IS
+# a good stopping point the model clears AGAIN: an empty clear + re-greet every
+# cadence on a quiet box. The newest transcript's path+size is the activity
+# fingerprint (a /clear starts a fresh <id>.jsonl; turns append; a fully idle
+# interval — including a pristine post-clear session — leaves it identical), so an
+# unchanged fingerprint means "nothing happened, including the last clear" → skip.
 CLEAR_EVERY_RAW=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   CLEAR_EVERY_RAW="$(jq -r '.clear.every // empty' "$REPO/gent.json" 2>/dev/null || true)"
@@ -271,10 +280,26 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
     NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then run \`gent-clear\` as your final action to reset your context. Mid-task? Ignore this; you'll be nudged again later."
     echo "gents: periodic clear nudge every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)" >&2
     ( trap : INT
+      fp() { local n; n="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true)"; [ -n "$n" ] && printf '%s:%s' "$n" "$(wc -c < "$n" 2>/dev/null || echo 0)"; }
+      base="$(fp)"
       while :; do
         sleep "$CLEAR_EVERY_SEC"
         tmux has-session -t gent 2>/dev/null || exit 0
+        [ "$(fp)" = "$base" ] && continue   # nothing happened since last baseline (incl. an idle post-clear session) — skip
         tmux send-keys -t gent:claude "$NUDGE_TEXT" Enter 2>/dev/null || true
+        # Re-baseline AFTER the nudge is fully handled — wait for the session to go
+        # quiescent (incl. any gent-clear: new transcript + re-greet), capped — so
+        # the nudge's OWN churn isn't misread as fresh activity on the next tick.
+        prev=""; stable=0
+        for _ in $(seq 1 300); do
+          tmux has-session -t gent 2>/dev/null || exit 0
+          cur="$(fp)"
+          if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+            stable=$((stable + 1)); [ "$stable" -ge 15 ] && break
+          else stable=0; fi
+          prev="$cur"; sleep 1
+        done
+        base="$cur"
       done ) &
   fi
 fi
