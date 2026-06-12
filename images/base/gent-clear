@@ -49,6 +49,17 @@ setsid bash -c '
     sleep 1
   done
   [ "$cleared" = 1 ] || { echo "gent-clear: clear never landed (turn not ended?) — no re-greet" >&2; exit 0; }
+  # /clear ORPHANS a session-bound Monitor: the harness Monitor does not survive
+  # the clear, but its child process (a `tg watch`, or a `tail -F history.jsonl`)
+  # OUTLIVES the cleared session (verified) — events then go nowhere, yet the box
+  # telegram watchdog still SEES that process and reads "monitor up", so it never
+  # re-arms the fresh session (silent inbound gap) and a fresh orphan piles up on
+  # every clear. Kill the inbound monitor here so the fresh session reads as down
+  # and the watchdog re-arms a LIVE one bound to it. No-op on boxes that have no
+  # such monitor; the poller (`tg poll`) matches neither pattern, so it keeps
+  # running and history.jsonl never stops.
+  pkill -f "tg watch" 2>/dev/null || true
+  pkill -f "tail .*history\.jsonl" 2>/dev/null || true
   # Wait for the fresh session to go idle — same gate as the startup greet: pane
   # unchanged for a few seconds and not showing "esc to interrupt" — then greet.
   prev=""; stable=0; ready=0
