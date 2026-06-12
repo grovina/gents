@@ -327,7 +327,7 @@ if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   jq -e '[.services[]?.cmd] | any(startswith("tg poll"))' "$REPO/gent.json" >/dev/null 2>&1 && TG_BOX=1
 fi
 if [ "$TG_BOX" = 1 ]; then
-  REARM_TEXT="⚠️ Telegram inbound Monitor is DOWN — the persistent \`tg watch\` task isn't running, so new messages aren't surfacing here. Re-arm it now: start a persistent Monitor on \`tg watch\`. Then reconcile the gap: in var/telegram/history.jsonl, for any chat whose latest inbound (direction:in) is newer than its latest outbound (direction:out), handle the unanswered message(s). The poller never stopped, so nothing is lost — just catch up."
+  REARM_TEXT="⚠️ Telegram inbound Monitor is DOWN — the persistent \`tg watch\` task isn't running, so new messages aren't surfacing here. Re-arm it now: start a persistent Monitor on \`tg watch\`. Then reconcile the gap: run \`tg pending\` and handle every chat/thread it lists (it shows inbound newer than your last reply). The poller never stopped, so nothing is lost — just catch up."
   echo "gents: telegram monitor watchdog armed (tg box)" >&2
   ( trap : INT
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
