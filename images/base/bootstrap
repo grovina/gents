@@ -188,6 +188,13 @@ while :; do
   # errors, --session-id of an existing one errors, hence the branch).
   newest="\$(ls -t "\$PROJ_DIR"/*.jsonl 2>/dev/null | head -1)"
   if [ -n "\$newest" ]; then set -- --resume "\$(basename "\$newest" .jsonl)"; else set -- --session-id "\$PINNED_ID"; fi
+  # Self-heal a corrupted ~/.claude.json BEFORE each launch — a truncated write
+  # (e.g. the host sleeping mid-write) otherwise strands claude on the config-error
+  # dialog on relaunch, taking the box offline. Same baseline the bootstrap writes
+  # at boot; only triggers when the file is empty/unparseable, so it's a no-op
+  # normally and never clobbers good config.
+  { [ -s "\$HOME/.claude.json" ] && jq -e . "\$HOME/.claude.json" >/dev/null 2>&1; } || \
+    printf '{"hasCompletedOnboarding":true,"theme":"dark","numStartups":5,"resumeReturnDismissed":true,"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$REPO" > "\$HOME/.claude.json"
   claude --dangerously-skip-permissions -n "$REPO_NAME" "\$@"
   echo
   echo "[claude exited — relaunching in 5s; 'gent shell $REPO_NAME' for a shell, 'gent down $REPO_NAME' to stop]"
