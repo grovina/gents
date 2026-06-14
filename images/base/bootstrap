@@ -375,7 +375,7 @@ if [ "$EVENT_BUS" = 1 ]; then
   RECONCILE_HINT="run \`gent-schedule due\`"
   [ -n "$MON_RECONCILE" ] && RECONCILE_HINT="$MON_RECONCILE"
   [ -n "$TG_RECONCILE" ] && RECONCILE_HINT="run \`$TG_RECONCILE\` and \`gent-schedule due\`"
-  REARM_TEXT="⚠️ Your event Monitor is DOWN — \`$MON_WATCH\` isn't running, so new events aren't surfacing here. Re-arm it now: start a persistent Monitor on \`$MON_WATCH\`. Then reconcile what landed while it was down: $RECONCILE_HINT, and handle anything outstanding. The box-supervised sources never stopped, so nothing is lost — just catch up."
+  REARM_TEXT="🔄 Quick check — your event Monitor (\`$MON_WATCH\`) doesn't look like it's running. Please make sure it's up: if it's down, re-arm it, then glance at $RECONCILE_HINT to catch anything that arrived meanwhile. Nothing's lost — the box keeps the sources running regardless."
 
   # Source 1 — schedule daemon: fire due reminders + matching cron triggers into the
   # stream, minute-aligned (cron needs each minute checked exactly once).
@@ -400,8 +400,14 @@ if [ "$EVENT_BUS" = 1 ]; then
     echo "gents: telegram→events bridge armed (source: $TG_WATCH)" >&2
   fi
 
-  # The watchdog — keep the ONE Monitor armed.
-  echo "gents: event watchdog armed (monitor: $MON_WATCH)" >&2
+  # The watchdog — keep the ONE Monitor armed. Every detection is logged to
+  # $WATCHDOG_LOG, classified real-drop vs. self-recovering false-alarm, so the
+  # pokes are auditable. Telemetry only — the log never gates anything.
+  _wdir="${GENT_EVENTS_PATH:-}"; _wdir="${_wdir%/*}"; [ -n "$_wdir" ] || _wdir="$HOME/.local/state/gent"
+  mkdir -p "$_wdir" 2>/dev/null || true
+  WATCHDOG_LOG="$_wdir/watchdog.log"
+  _wlog() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$WATCHDOG_LOG" 2>/dev/null || true; }
+  echo "gents: event watchdog armed (monitor: $MON_WATCH; log: $WATCHDOG_LOG)" >&2
   ( trap : INT
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
@@ -409,10 +415,23 @@ if [ "$EVENT_BUS" = 1 ]; then
       # Liveness — is the Monitor running? A bare `pgrep` excludes its own PID;
       # NEVER wrap it in a shell whose argv holds the pattern.
       if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then sleep 60; continue; fi
-      # Monitor down — poke the model to re-arm + reconcile. Deliver it like
-      # gent-hello: a bare `send-keys "$text" Enter` into a BUSY pane leaves the text
-      # unsent in the composer, so wait for the pane to go idle (stable + not showing
-      # "esc to interrupt"), then bracketed-paste + a separate Enter.
+      # Looks down. Before poking, CONFIRM it isn't a brief blip (a CLI restart or
+      # pgrep race): re-check over ~6s. If it returns on its own it was a false
+      # alarm — log it and DON'T poke. This is how we tell real drops from noise.
+      recovered=0
+      for _ in 1 2 3; do
+        sleep 2
+        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { recovered=1; break; }
+      done
+      if [ "$recovered" = 1 ]; then
+        _wlog "FALSE-ALARM '$MON_LIVE' vanished then self-recovered <6s; no poke. now: $(pgrep -af "$MON_LIVE" 2>/dev/null | tr '\n' '|')"
+        sleep 60; continue
+      fi
+      _wlog "DOWN '$MON_LIVE' absent >6s; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
+      # Poke the model to re-arm + reconcile. Deliver it like gent-hello: a bare
+      # `send-keys "$text" Enter` into a BUSY pane leaves the text unsent in the
+      # composer, so wait for the pane to go idle (stable + not "esc to interrupt"),
+      # then bracketed-paste + a separate Enter.
       prev=""; stable=0; ready=0
       for _ in $(seq 1 120); do
         tmux has-session -t gent 2>/dev/null || exit 0
@@ -422,16 +441,18 @@ if [ "$EVENT_BUS" = 1 ]; then
         else stable=0; fi
         prev="$cur"; sleep 1
       done
-      [ "$ready" = 1 ] || continue   # never went idle within ~2min — retry next cycle
+      [ "$ready" = 1 ] || { _wlog "pane never idle within ~2min; deferring poke"; continue; }
       printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
       tmux send-keys -t gent:claude Enter
       # DEBOUNCE: wait for the Monitor to reappear (up to ~5min) before re-checking.
+      rearmed=0
       for _ in $(seq 1 60); do
         tmux has-session -t gent 2>/dev/null || exit 0
-        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && break
+        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { rearmed=1; break; }
         sleep 5
       done
+      [ "$rearmed" = 1 ] && _wlog "re-armed after poke" || _wlog "NOT re-armed within ~5min after poke"
       sleep 60
     done ) &
 fi
