@@ -255,7 +255,19 @@ def cmd_up(fleet, a):
             "-v", f"{repo_dir}:{repo_dir}",
             "-v", f"gent-{name}-home:/home/gent",
             "-w", repo_dir,
-            "-e", f"GENT_REPO_DIR={repo_dir}"]
+            "-e", f"GENT_REPO_DIR={repo_dir}",
+            # Suppress claude.ai account MCP connectors (Gmail/Calendar/Drive/…) in
+            # every box BY DEFAULT. The fleet shares ONE login, so those connectors
+            # ride the account into all boxes; this env var makes claude drop the
+            # whole set at session start (it short-circuits before fetching them —
+            # values 0/false/no/off all trigger it). Account-level, so there's no
+            # per-box grant for it — the env var IS the boundary. Host sessions are
+            # a separate process and keep their connectors. Re-up-safe (set on every
+            # `up`), unlike the per-connector `/mcp` → Disable toggle. A box that
+            # SHOULD have the connectors opts back in via fleet.json `env`
+            # (`"ENABLE_CLAUDEAI_MCP_SERVERS": "1"`) — applied below, after this, so
+            # the later -e wins (e.g. homer, which uses them for home automation).
+            "-e", "ENABLE_CLAUDEAI_MCP_SERVERS=0"]
 
     res = cfg.get("resources", {})
     if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]
