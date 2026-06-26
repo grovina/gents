@@ -14,7 +14,7 @@ FROM python:3.13-bookworm
 # (Debian stable ships no/old gh).
 #
 # gcloud (google-cloud-cli, from Google's own apt repo) is the same story for
-# GCP: the GCP-provisioned boxes (radios, platform, filmograma) mount a service-
+# GCP: a GCP-provisioned box mounts a service-
 # account key + GOOGLE_APPLICATION_CREDENTIALS, but that only buys ADC for the
 # repo's own client libraries — the agent still needs the gcloud CLI to actually
 # DO ops (logging read, run deploy, secrets — gsutil + bq ride along in the same
@@ -25,10 +25,9 @@ FROM python:3.13-bookworm
 # vim+unzip fill two small gaps: a box had no editor for `gent shell`, and unzip
 # is a frequent stumble.
 #
-# postgresql-client (psql) is the DB sibling of the gh/gcloud/vercel story: the
-# DB-touching boxes (platform, filmograma, radios) reach Postgres through a tunnel
-# and the repo tooling shells out to `psql` for migrations/grants/queries (e.g.
-# platform's `./m app migrate` / `./m db setup` flat-out needed it). No-DB boxes
+# postgresql-client (psql) is the DB sibling of the gh/gcloud/vercel story: a
+# DB-touching box reaches Postgres through a tunnel and the repo tooling shells
+# out to `psql` for migrations/grants/queries. No-DB boxes
 # carry it unused — the same trade already accepted for gcloud/ffmpeg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates gnupg git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim postgresql-client \
@@ -63,13 +62,12 @@ RUN echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLs
 # relying on a stray global install that vanishes when a box is recreated.
 #
 # vercel is the npm-native sibling of the gh/gcloud "credentials need a CLI"
-# story: the Vercel-deploying boxes (platform, filmograma, radios — all linked to
-# the one `grovina` Vercel team) carry a VERCEL_TOKEN in env, but a token without
+# story: a Vercel-deploying box carries a VERCEL_TOKEN in env, but a token without
 # a CLI does nothing. The repo tooling shells straight out to `vercel` (link, raw
-# `vercel api`, env pull/push to prod, deploy hooks; see platform's
-# meta/services/vercel.ts), which auto-reads VERCEL_TOKEN — no `vercel login`, no
-# mounted credential file (the auth IS just the token string). No-Vercel boxes
-# carry it unused, the same trade already accepted for gcloud/ffmpeg.
+# `vercel api`, env pull/push to prod, deploy hooks), which auto-reads
+# VERCEL_TOKEN — no `vercel login`, no mounted credential file (the auth IS just
+# the token string). No-Vercel boxes carry it unused, the same trade already
+# accepted for gcloud/ffmpeg.
 ENV NPM_CONFIG_PREFIX=/opt/npm-global
 ENV PATH=/opt/npm-global/bin:$PATH
 RUN npm install -g @anthropic-ai/claude-code vercel \

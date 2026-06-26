@@ -223,22 +223,22 @@ catalog's organize-by-resource rule. Mint one read-only PAT per owner and drop
 it under `github/<owner>.env`:
 
 ```bash
-umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.config/agent-secrets/github/grovina.env
+umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.config/agent-secrets/github/myorg.env
 ```
 
 Then grant it to that owner's boxes via the normal `env_files` carrier — it's a
 plain catalog fragment, nothing special:
 
 ```jsonc
-"axt": { "env_files": ["github/grovina.env"], … }   // a grovina-owned repo
+"myapp": { "env_files": ["github/myorg.env"], … }   // a myorg-owned repo
 ```
 
-`gh` reads `GH_TOKEN` with no `gh auth login`; `gent fleet doctor` flags whether
-`github/grovina.env` is present (a box that lists a missing env_file won't come
-up). A box under a **different** owner (e.g. `cavyai/radios`) simply lists no
-github token — the grovina PAT wouldn't authorize its repo anyway — until you
-mint `github/cavyai.env` for it. This keeps the same per-grant isolation as the
-deploy keys: a box reaches only the owner it's granted.
+`gh` reads `GH_TOKEN` with no `gh auth login`; a box that lists a missing
+env_file won't come up (`gent up` fails fast on it). A box under a **different**
+owner (e.g. `otherorg/otherapp`) simply lists no github token — the `myorg` PAT
+wouldn't authorize its repo anyway — until you mint `github/otherorg.env` for
+it. This keeps the same per-grant isolation as the deploy keys: a box reaches
+only the owner it's granted.
 
 Keep these tokens **read-only** — Pull requests + Issues: *read*, Contents: *no
 access* — and that's deliberate, not timid. A **write** scope would be a
@@ -260,33 +260,31 @@ deploy hooks), and a token without a CLI does nothing — so `vercel` ships in t
 base image. Auth is a single **token string**: the CLI auto-reads `VERCEL_TOKEN`
 (no `vercel login`, no mounted key file like GCP), so it rides the catalog as a
 plain `env_files` fragment, organized by **Vercel team** (not GitHub owner — the
-two don't have to match; e.g. `cavyai/radios` and `a-tomun/filmograma` both link
-projects that live in the personal `grovina` Vercel team, so they share its
-token):
+two don't have to match; e.g. two repos under different GitHub owners can both
+link projects that live in one personal Vercel team, so they share its token):
 
 ```bash
-umask 077; echo 'VERCEL_TOKEN=…' > ~/.config/agent-secrets/vercel/grovina.env
+umask 077; echo 'VERCEL_TOKEN=…' > ~/.config/agent-secrets/vercel/myteam.env
 ```
 
 ```jsonc
-"platform": { "env_files": ["vercel/grovina.env"], "env": { "VERCEL_SCOPE": "team_xxxxxxxxxxxxxxxxxxxxxxxx" }, … }
+"myapp": { "env_files": ["vercel/myteam.env"], "env": { "VERCEL_SCOPE": "team_xxxxxxxxxxxxxxxxxxxxxxxx" }, … }
 ```
 
 `VERCEL_SCOPE` pins the team for account-level `vercel api` calls that aren't
 anchored to a linked project (`.vercel/project.json` carries the team for the
 rest). Use the team **ID**, not the slug: if your personal-account username
-equals the team slug (here both are `grovina`), the username wins and
+equals the team slug (the same word for both), the username wins and
 `--scope <slug>` resolves to your empty personal account ("You cannot set your
 Personal Account as the scope"). The `team_…` ID is unambiguous — read it from
 any linked project's `.vercel/project.json` (`orgId`) or `vercel teams ls`.
-`gent fleet doctor` flags whether `vercel/grovina.env` is present.
 
 The caveat that makes this *less* safe than the read-only `gh` token: a stock
 Vercel token (Hobby/Pro) **can't be scoped to one project or reduced to read** —
 project/permission scoping is Enterprise-only. So within its team a token is
 **full access**: deploy, rewrite prod env, add/remove domains, delete projects.
-You can't reproduce the GCP gradient (a read-only `radios-dev` SA next to a
-full-deploy `platform-dev`) here. The levers you do have: one token **per
+You can't reproduce the GCP gradient (a read-only dev SA next to a full-deploy
+deployer SA) here. The levers you do have: one token **per
 account**, routed to boxes via `env_files` so a leak is revoked in one place;
 keep teams small so the blast radius is naturally bounded; and revoke at
 `vercel.com/account/tokens` to rotate.

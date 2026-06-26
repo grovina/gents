@@ -165,10 +165,9 @@ def cmd_doctor(fleet, _a):
     print(f"{'✓' if sr.is_dir() else '·'} secrets_root {sr} {'' if sr.is_dir() else '(absent — fine until a repo needs a slice)'}")
     sc = fleet["secrets_root"] / "claude-home" / ".credentials.json"
     print(f"{'✓' if sc.exists() else '✗'} shared box login {'present (all boxes share it)' if sc.exists() else 'absent — `gent attach <repo>` and run /login once'}")
-    gh_env = fleet["secrets_root"] / "github" / "grovina.env"
-    print(f"{'✓' if gh_env.exists() else '·'} GitHub token {gh_env} {'present (grovina repos reference it via env_files)' if gh_env.exists() else '(absent — grovina-repo boxes that list github/grovina.env will fail to come up; add GH_TOKEN=… here, read-only)'}")
-    vc_env = fleet["secrets_root"] / "vercel" / "grovina.env"
-    print(f"{'✓' if vc_env.exists() else '·'} Vercel token {vc_env} {'present (platform/filmograma/radios reference it via env_files)' if vc_env.exists() else '(absent — Vercel-deploying boxes that list vercel/grovina.env will fail to come up; add VERCEL_TOKEN=… here — a non-expiring token for the grovina team)'}")
+    # NB: per-repo catalog slices (github/<owner>.env, vercel/<team>.env, SA keys,
+    # …) aren't pre-flighted here — they're owner/team-specific, and `gent up`
+    # already fails fast on a box whose fleet entry lists a missing catalog entry.
     sys.exit(0 if ok else 1)
 
 
@@ -266,7 +265,7 @@ def cmd_up(fleet, a):
             # `up`), unlike the per-connector `/mcp` → Disable toggle. A box that
             # SHOULD have the connectors opts back in via fleet.json `env`
             # (`"ENABLE_CLAUDEAI_MCP_SERVERS": "1"`) — applied below, after this, so
-            # the later -e wins (e.g. homer, which uses them for home automation).
+            # the later -e wins (e.g. a box that uses them for home automation).
             "-e", "ENABLE_CLAUDEAI_MCP_SERVERS=0"]
 
     res = cfg.get("resources", {})

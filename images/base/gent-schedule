@@ -227,7 +227,7 @@ def cmd_done(argv):
     print("done %s" % rid)
 
 
-# ── cron triggers (calendar slots, ported from homer; no backfill) ────────────
+# ── cron triggers (calendar slots; no backfill) ───────────────────────────────
 
 def _expand_cron_field(field, lo, hi):
     values = set()
@@ -279,7 +279,7 @@ def _fire_cron():
     try:
         entries = json.loads(open(p, encoding="utf-8").read())
     except Exception as e:
-        emit_event({"kind": "homer_status", "msg": "gent-schedule: bad cron file: %r" % e})
+        emit_event({"kind": "schedule_error", "msg": "gent-schedule: bad cron file: %r" % e})
         return
     if not isinstance(entries, list):
         return
@@ -303,7 +303,7 @@ def _fire_cron():
         try:
             hit = _cron_matches(cron, dt)
         except Exception as e:
-            emit_event({"kind": "homer_status", "msg": "gent-schedule: bad cron %r: %r" % (name, e)})
+            emit_event({"kind": "schedule_error", "msg": "gent-schedule: bad cron %r: %r" % (name, e)})
             continue
         if hit and fired.get(name) != minute_key:
             fired[name] = minute_key

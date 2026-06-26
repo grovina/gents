@@ -53,6 +53,8 @@ def _fmt(ev):
             rid, ev.get("note", ""), rid)
     if k == "telegram":
         return ev.get("line") or ev.get("text") or json.dumps(ev, ensure_ascii=False)
+    if k == "schedule_error":
+        return "⚠️ schedule: %s" % ev.get("msg", "")
     extra = " ".join("%s=%s" % (kk, vv) for kk, vv in ev.items() if kk not in ("kind", "ts"))
     return "• %s %s" % (k, extra)
 

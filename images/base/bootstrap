@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gents container entrypoint: start a persistent claude YOLO session in tmux
-# and keep the container alive. Attach from the host with `gents attach <repo>`.
+# and keep the container alive. Attach from the host with `gent attach <repo>`.
 set -euo pipefail
 
 # The repo is mounted at its real HOST absolute path (gent passes it as
@@ -79,7 +79,7 @@ fi
 # path (e.g. /Users/you/.config/gcloud/key.json) that doesn't exist in the box.
 # That project-local `env` OUTRANKS the container's own `-e`, so it would
 # silently point the in-box claude at a missing key — masking the SA the fleet
-# actually granted (this is exactly what stranded the platform box's deploys).
+# actually granted (this is exactly what once stranded a box's deploys).
 # Re-assert the fleet value at the MANAGED settings tier (the highest — no
 # project file can override it) so the grant always wins. Only the credential
 # PATH is pinned; every other setting still merges normally. Repo-agnostic: any
@@ -328,7 +328,7 @@ fi
 #                                  + cron TZ; defaults $GENT_STATE_DIR/{events.jsonl,
 #                                  cron.json}, UTC. `.events:true` = bus on, defaults.
 #   .monitor {watch,reconcile,live} → a box that watches its OWN raw stream (e.g.
-#                                  homer tails its events.log); else Monitor defaults
+#                                  `tail -F events.log`); else Monitor defaults
 #                                  to `gent-events watch`. `.live` = liveness regex.
 TG_WATCH=""; TG_RECONCILE=""; MON_WATCH=""; MON_RECONCILE=""; MON_LIVE=""
 EV_PATH=""; CRON_PATH=""; SCHED_TZ=""
@@ -364,7 +364,7 @@ if [ "$EVENT_BUS" = 1 ]; then
 
   # The Monitor the agent arms (+ liveness pattern + reconcile hint). Telegram and
   # .events-only boxes watch `gent-events watch`; a box with its own raw stream sets
-  # .monitor.watch (e.g. homer `tail -F events.log`).
+  # .monitor.watch (e.g. `tail -F events.log`).
   [ -n "$MON_WATCH" ] || MON_WATCH="gent-events watch"
   if [ -z "$MON_LIVE" ]; then
     case "$MON_WATCH" in
