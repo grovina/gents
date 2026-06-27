@@ -126,6 +126,39 @@ host's own** Claude login (a separate `~/.claude`) — the fleet has its own.
 
 `gent fleet auth` just reports whether that shared login exists yet.
 
+## Your own host session — `gent host` (idle-proof Remote Control)
+
+Boxes stay reachable from the phone while idle for two reasons: a supervisor
+relaunches a crashed claude, and an *active* box re-mints its 8h OAuth token as a
+side effect of its own API calls, so **Remote Control** never lapses. A claude
+you run **on the host** by hand — outside any box — has neither. Left idle past
+token expiry, its Remote Control socket drops and doesn't come back until the
+session restarts (the phone can't poke a dropped socket).
+
+`gent host` gives that host session the same two safety nets — one command:
+
+```
+gent host up        # tmux + self-healing supervisor + keepalive, all armed
+gent host status    # session state + token expiry + keepalive job
+gent host attach    # join the session
+```
+
+- **`up`** runs `claude` in a tmux session under a supervisor that relaunches it
+  on exit and resumes the newest transcript, so the phone reconnects the *same*
+  session. Run it from the dir whose conversation you want to resume. It also
+  arms the launchd keepalive automatically (idempotent; re-run after a gent
+  update to re-arm). `gent host install-keepalive` stays for arming it by hand.
+- **keepalive** (a child of the supervisor, plus the launchd job `up` installs) is the
+  host-side twin of `gent fleet refresh-auth`: when the token nears expiry it
+  **pokes** an idle session with a one-line, ignore-me prompt to force an in-place
+  re-mint (skipped if the session is busy — it's re-minting itself); only once the
+  token has actually lapsed (e.g. after the laptop slept) does it **bounce** claude
+  so the supervisor relaunches it and reconnects Remote Control.
+
+Set the session name with `"host": {"name": "…"}` in `fleet.json`. Needs tmux on
+the host (`brew install tmux`); on macOS the token is read from the login
+Keychain, elsewhere from `~/.claude/.credentials.json`.
+
 ## Per-repo memory & history — one brain per repo, shared with your host
 
 A box mounts its repo at the **real host absolute path** (e.g.

@@ -3,6 +3,11 @@
   "projects_root": "~/Projects",
   "image": "gents-base:latest",
 
+  "host": {
+    "name": "host",
+    "_note": "OPTIONAL. Only for `gent host …` — a claude you run ON this machine (not in a box) and reach from your phone. Boxes don't need this. `name` is the tmux session + display name (pick anything). `gent host up` runs it under a self-healing supervisor AND arms a launchd keepalive job (one command) so an IDLE session re-mints its token before expiry and never drops Remote Control. Requires tmux on the host (`brew install tmux`)."
+  },
+
   "_comment": "Copy this file to fleet.json and edit — fleet.json is gitignored (it's your machine's private grants). secrets_root is a shared CATALOG of reusable entries (credential files + .env fragments), referenced by relative path; isolation happens here in the grant, so a box sees only what its entry lists and can never get more. projects_root is where your repos live; each repo's `path` is relative to it.",
 
   "repos": {
