@@ -139,6 +139,7 @@ session restarts (the phone can't poke a dropped socket).
 
 ```
 gent host up        # tmux + self-healing supervisor + keepalive, all armed
+gent host down      # stop it (kill tmux + reap any orphaned claude)
 gent host status    # session state + token expiry + keepalive job
 gent host attach    # join the session
 ```

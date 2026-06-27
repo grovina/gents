@@ -693,6 +693,38 @@ def cmd_host_attach(fleet, a):
     subprocess.run(["tmux", "attach", "-t", name])
 
 
+def cmd_host_down(fleet, a):
+    """Stop the host session: kill its tmux session and remove the run script.
+    Also reaps any orphaned `claude -n <name>` that outlived the tmux pane (a
+    detached Remote Control session claude can keep alive on its own, which
+    nothing would relaunch). Leaves the launchd keepalive — it's a no-op while
+    the session is down and `up` re-arms it; pass --keepalive to remove it too."""
+    name = host_name(fleet)
+    if tmux_has(name):
+        subprocess.run(["tmux", "kill-session", "-t", name])
+        print(f"gent: host session '{name}' stopped.")
+    else:
+        print(f"gent: host session '{name}' not running.")
+    # Match the EXACT name argument (space or end-of-line after it) so a different
+    # session's claude — e.g. your own `claude -n gents` shell — is never touched.
+    orphans = [p for p in subprocess.run(
+        ["pgrep", "-f", f"claude -n {name}( |$)"],
+        capture_output=True, text=True).stdout.split() if p.isdigit()]
+    if orphans:
+        subprocess.run(["kill", *orphans], capture_output=True)
+        print(f"gent: reaped {len(orphans)} orphaned '{name}' claude process(es).")
+    run = Path.home() / f".gent-{name}-run.sh"
+    if run.exists():
+        run.unlink()
+    if getattr(a, "keepalive", False) and sys.platform == "darwin":
+        label = f"gent-host-keepalive-{name}"
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                       capture_output=True)
+        plist.unlink(missing_ok=True)
+        print(f"gent: keepalive job removed.")
+
+
 def cmd_host_keepalive(fleet, a):
     """Keep an idle host session's Remote Control alive (built for cron/launchd).
 
@@ -834,6 +866,8 @@ def main():
     hsub = hp.add_subparsers(dest="host_cmd", metavar="<command>")
     hup = hsub.add_parser("up", help="start the supervised host session in tmux (resumes newest transcript)")
     hup.add_argument("--cwd", help="working dir for the session (default: current dir)")
+    hdn = hsub.add_parser("down", help="stop the host session (kill tmux + remove run script)")
+    hdn.add_argument("--keepalive", action="store_true", help="also remove the launchd keepalive job")
     hsub.add_parser("attach", help="attach to the host session")
     hsub.add_parser("status", help="show session state + token expiry + keepalive job")
     hk = hsub.add_parser("keepalive", help="poke/bounce the host session so idle Remote Control survives (for cron)")
