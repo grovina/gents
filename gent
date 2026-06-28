@@ -652,6 +652,28 @@ def host_token_remaining():
         return None
 
 
+# Make `gent host attach` feel like `gent attach <box>`. The boxes load a
+# system-wide /etc/tmux.conf (images/base/tmux.conf); the host session instead
+# runs on the user's own tmux server, so it'd inherit their config (usually no
+# `mouse on`) and the wheel falls through to claude as arrow keys. Apply the same
+# behavioral options here, scoped to THIS session (set-option -t) so we never
+# touch the user's other tmux sessions. Session-scoped options only.
+HOST_TMUX_OPTS = (
+    ("mouse", "on"),          # wheel scrolls claude's TUI, like the boxes
+    ("status", "off"),        # tmux disappears — host claude IS the CLI
+    ("focus-events", "on"),   # claude wants pane focus in/out
+)
+
+def apply_host_tmux_opts(name):
+    """Idempotent; safe to call on every up/attach (incl. an already-running
+    session, so the fix lands without a restart)."""
+    if not tmux_has(name):
+        return
+    for opt, val in HOST_TMUX_OPTS:
+        subprocess.run(["tmux", "set-option", "-t", name, opt, val],
+                       check=False, capture_output=True)
+
+
 def cmd_host_up(fleet, a):
     """Start (or report) this host's supervised claude session in tmux. Resumes
     the newest transcript in the launch dir, so the phone reconnects the SAME
@@ -676,6 +698,7 @@ def cmd_host_up(fleet, a):
         run.chmod(0o755)
         subprocess.run(["tmux", "new-session", "-d", "-s", name, "-n", "claude",
                         "-c", str(cwd), f"exec bash {shlex.quote(str(run))}"], check=True)
+        apply_host_tmux_opts(name)
         print(f"gent: host session '{name}' up in tmux (cwd {cwd}).")
     # Arm the launchd keepalive every time (idempotent), so a single `up` is all it
     # takes — no separate install step, and a re-run re-arms it after a gent update.
@@ -690,6 +713,7 @@ def cmd_host_attach(fleet, a):
     name = host_name(fleet)
     if not tmux_has(name):
         die(f"host session '{name}' not running — `gent host up` first.")
+    apply_host_tmux_opts(name)  # also fixes an already-running session in place
     subprocess.run(["tmux", "attach", "-t", name])
 
 
