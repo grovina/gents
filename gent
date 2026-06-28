@@ -29,7 +29,13 @@ def load_fleet():
     if not FLEET.exists():
         die(f"no fleet.json at {FLEET} — copy fleet.example.json to fleet.json and add your repos")
     f = json.loads(FLEET.read_text())
-    f["secrets_root"] = expand(f.get("secrets_root", "~/.config/agent-secrets"))
+    # state_root: the single relocatable home for all precious, non-git fleet
+    # state — the secrets catalog + per-box app-state. rsync this one dir (plus the
+    # repos and ~/.claude/projects) and the fleet's identity moves with it.
+    # secrets_root defaults UNDER state_root; an explicit secrets_root still wins.
+    f["state_root"] = expand(f.get("state_root", "~/.gent/state"))
+    sr = f.get("secrets_root")
+    f["secrets_root"] = expand(sr) if sr else f["state_root"] / "secrets"
     f["projects_root"] = expand(f.get("projects_root", "~/Projects"))
     return f
 
@@ -350,6 +356,17 @@ def cmd_up(fleet, a):
         if not src.exists():
             die(f"{name}: catalog entry missing: {src}  (-> {dest})")
         args += ["-v", f"{src}:{dest}:ro"]
+
+    # Per-box precious app state, pulled OUT of the home volume / repo into the
+    # relocatable state_root (~/.gent/state/app/<box>/<rel>) so a fleet move is a
+    # plain dir copy — no `docker volume` export. Mounted read-WRITE (the app owns
+    # it); when dest is under /home/gent it nests over the home volume, masking that
+    # subtree so the state lands on the host bind, not the volume. (e.g.
+    # filmograma's ~/.local/state/filmograma telegram state.)
+    for dest, rel in (cfg.get("state_mounts") or {}).items():
+        src = fleet["state_root"] / "app" / name / rel
+        src.mkdir(parents=True, exist_ok=True)
+        args += ["-v", f"{src}:{dest}"]
 
     # Reusable .env fragments from the catalog, then inline env.
     for rel in (cfg.get("env_files") or []):

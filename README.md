@@ -111,7 +111,7 @@ the repo dir (it's mounted) and reference it by path.
 ## Auth for the in-box claude — `/login` once, in any box
 
 All boxes share **one** Claude config dir: `claude-home/` in the catalog
-(`~/.config/agent-secrets/claude-home`) is bind-mounted as `~/.claude` in every
+(`~/.gent/state/secrets/claude-home`) is bind-mounted as `~/.claude` in every
 box — the login, creds, and settings, exactly as your host's many `claude`
 sessions share a single `~/.claude`. So you log in **once**: `gent attach` into
 any box, run `/login`, and every box is then logged in. Refreshes propagate to
@@ -185,7 +185,7 @@ host-backed.
 
 ## Secrets — a shared catalog, not per-project silos
 
-`fleet.json:secrets_root` (default `~/.config/agent-secrets`) is a **catalog**
+`fleet.json:secrets_root` (default `~/.gent/state/secrets`) is a **catalog**
 of reusable credentials and config — files *and* `.env` fragments. One
 `gcp/myproject-sa.json` can serve every repo in that GCP project; one API-key
 fragment can be shared by everything that talks to that service. Organize it by
@@ -220,11 +220,11 @@ for ROLE in roles/aiplatform.user roles/secretmanager.secretAccessor; do
     --member "serviceAccount:${SA}@${PROJECT}.iam.gserviceaccount.com" \
     --role "$ROLE"
 done
-mkdir -p ~/.config/agent-secrets/gcp
+mkdir -p ~/.gent/state/secrets/gcp
 gcloud iam service-accounts keys create \
-  ~/.config/agent-secrets/gcp/myapp-sa.json \
+  ~/.gent/state/secrets/gcp/myapp-sa.json \
   --iam-account "${SA}@${PROJECT}.iam.gserviceaccount.com"
-chmod 600 ~/.config/agent-secrets/gcp/myapp-sa.json
+chmod 600 ~/.gent/state/secrets/gcp/myapp-sa.json
 ```
 
 ### Git push/pull — a per-repo deploy key, not your personal SSH key
@@ -257,7 +257,7 @@ catalog's organize-by-resource rule. Mint one read-only PAT per owner and drop
 it under `github/<owner>.env`:
 
 ```bash
-umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.config/agent-secrets/github/myorg.env
+umask 077; echo 'GH_TOKEN=github_pat_…' > ~/.gent/state/secrets/github/myorg.env
 ```
 
 Then grant it to that owner's boxes via the normal `env_files` carrier — it's a
@@ -298,7 +298,7 @@ two don't have to match; e.g. two repos under different GitHub owners can both
 link projects that live in one personal Vercel team, so they share its token):
 
 ```bash
-umask 077; echo 'VERCEL_TOKEN=…' > ~/.config/agent-secrets/vercel/myteam.env
+umask 077; echo 'VERCEL_TOKEN=…' > ~/.gent/state/secrets/vercel/myteam.env
 ```
 
 ```jsonc

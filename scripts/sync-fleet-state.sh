@@ -6,7 +6,7 @@
 #   ./scripts/sync-fleet-state.sh [user@host]      # default: grovina@grovitec.local
 #
 # For every box in fleet.json (+ the gents control repo) it copies:
-#   - the secrets catalog (~/.config/agent-secrets, minus reproducible cache/)
+#   - the gent state root (~/.gent/state: secrets + app/<box>, minus reproducible cache/)
 #   - each repo working tree  (git + gitignored state; minus node_modules/.venv/build dirs
 #                              and homer's homeassistant/ data, which is a Track-B/HA concern)
 #   - each repo's Claude memory + transcripts, RENAMED to the target's abs-path key
@@ -36,10 +36,10 @@ EXC=(--exclude='node_modules/' --exclude='.venv/' --exclude='venv/' --exclude='t
      --exclude='engine/data/')                     # filmograma: ANCINE/Drive download CSVs (~4.7G, "not part of the deployable artifact")
 
 echo "==> target $TARGET   (memory key ${LKEY}-*  ->  ${RKEY}-*)"
-$SSH "$TARGET" 'mkdir -p ~/.config ~/.claude/projects ~/Projects'
+$SSH "$TARGET" 'mkdir -p ~/.gent/state ~/.claude/projects ~/Projects'
 
-echo "==> secrets catalog"
-rsync -az --exclude 'cache/' -e "$SSH" "$HOME/.config/agent-secrets/" "$TARGET:.config/agent-secrets/"
+echo "==> gent state root (secrets + app/<box>, minus reproducible cache)"
+rsync -az --exclude 'secrets/cache/' -e "$SSH" "$HOME/.gent/state/" "$TARGET:.gent/state/"
 
 for p in "${REPOS[@]}"; do
   src="$HOME/Projects/$p"
