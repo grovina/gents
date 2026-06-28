@@ -386,6 +386,64 @@ def cmd_up(fleet, a):
     if gj and gj.get("needs", {}).get("egress"):
         print(f"gent: note — {name} declares egress {gj['needs']['egress']}; "
               "enforcement is deferred (open egress for now).")
+    ensure_host_stack(fleet, name, cfg, gj)
+
+
+def compose_project(cfg):
+    # Match the project name a manual `docker compose up` in the repo dir uses (the
+    # dir basename), so gent ADOPTS an already-running stack instead of duplicating it.
+    return cfg["abs_path"].name
+
+
+def ensure_host_stack(fleet, name, cfg, gj):
+    """Bring up a repo's host-side docker-compose stack (e.g. homer's Home
+    Assistant / esphome / device-host) and join the box to its network, so the box
+    reaches the stack by SERVICE NAME (homeassistant:8123) — no host.docker.internal,
+    identical on macOS Docker Desktop and Linux Docker Engine. Idempotent: `compose
+    up -d` adopts a running stack; the network-join no-ops if already attached. The
+    stack is INFRA — it outlives the box (`gent down` leaves it up; stop it with
+    `gent stack down <repo>`)."""
+    hs = (gj or {}).get("host_stack")
+    if not hs:
+        return
+    compose = cfg["abs_path"] / hs.get("compose", "docker-compose.yml")
+    if not compose.exists():
+        die(f"{name}: host_stack compose not found: {compose}")
+    proj = compose_project(cfg)
+    print(f"gent: {name} host_stack — docker compose up -d ({compose.name}, project {proj})")
+    subprocess.run(["docker", "compose", "-p", proj, "-f", str(compose), "up", "-d"],
+                   cwd=str(cfg["abs_path"]), check=True)
+    net = f"{proj}_default"
+    r = subprocess.run(["docker", "network", "connect", net, container(name)],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"gent: {name} joined {net} — box reaches the stack by service name")
+
+
+def cmd_stack_up(fleet, a):
+    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
+    if not (gj or {}).get("host_stack"):
+        die(f"{a.repo}: no host_stack declared in gent.json")
+    ensure_host_stack(fleet, a.repo, cfg, gj)
+
+
+def cmd_stack_down(fleet, a):
+    """Stop a repo's host_stack (the compose infra). `gent down <repo>` leaves it
+    running (HA is always-on infra); this is the explicit teardown."""
+    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
+    hs = (gj or {}).get("host_stack") or die(f"{a.repo}: no host_stack in gent.json")
+    compose = cfg["abs_path"] / hs.get("compose", "docker-compose.yml")
+    subprocess.run(["docker", "compose", "-p", compose_project(cfg), "-f", str(compose), "down"],
+                   cwd=str(cfg["abs_path"]), check=False)
+    print(f"gent: {a.repo} host_stack down")
+
+
+def cmd_stack_ps(fleet, a):
+    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
+    hs = (gj or {}).get("host_stack") or die(f"{a.repo}: no host_stack in gent.json")
+    compose = cfg["abs_path"] / hs.get("compose", "docker-compose.yml")
+    subprocess.run(["docker", "compose", "-p", compose_project(cfg), "-f", str(compose), "ps"],
+                   cwd=str(cfg["abs_path"]), check=False)
 
 
 def _wait_session(name, timeout=90):
@@ -916,6 +974,15 @@ def main():
     hik = hsub.add_parser("install-keepalive", help="re-arm the keepalive launchd job (already automatic on `up`)")
     hik.add_argument("--load", action="store_true", help="also load it into launchd now")
 
+    # `gent stack …` — a repo's host-side docker-compose stack (e.g. homer's Home
+    # Assistant). `gent up` brings it up automatically; these are explicit controls.
+    stp = sub.add_parser("stack", help="a repo's host_stack (host docker-compose, e.g. homer's HA infra)")
+    stsub = stp.add_subparsers(dest="stack_cmd", metavar="<command>")
+    for sc, h in (("up",   "bring up the host_stack (+ join the box to its network)"),
+                  ("down", "stop the host_stack (infra; `gent down` leaves it up)"),
+                  ("ps",   "show the host_stack containers")):
+        stsub.add_parser(sc, help=h).add_argument("repo", nargs="?")
+
     # Per-repo box commands — repo defaults to the cwd's repo when omitted.
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
     sub.add_parser("attach",     help="attach to a box's claude session").add_argument("repo", nargs="?")
@@ -945,6 +1012,12 @@ def main():
         if not a.host_cmd:             # bare `gent host` → group usage
             hp.print_help(sys.stderr); sys.exit(1)
         return globals()[f"cmd_host_{a.host_cmd.replace('-', '_')}"](fleet, a)
+    if a.cmd == "stack":
+        if not a.stack_cmd:            # bare `gent stack` → group usage
+            stp.print_help(sys.stderr); sys.exit(1)
+        if not getattr(a, "repo", None):
+            a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
+        return globals()[f"cmd_stack_{a.stack_cmd}"](fleet, a)
     if a.cmd in REPO_CMDS and not getattr(a, "repo", None):
         a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
     globals()[f"cmd_{a.cmd.replace('-', '_')}"](fleet, a)

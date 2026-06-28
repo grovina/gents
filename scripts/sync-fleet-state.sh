@@ -8,7 +8,8 @@
 # For every box in fleet.json (+ the gents control repo) it copies:
 #   - the gent state root (~/.gent/state: secrets + app/<box>, minus reproducible cache/)
 #   - each repo working tree  (git + gitignored state; minus node_modules/.venv/build dirs
-#                              and homer's homeassistant/ data, which is a Track-B/HA concern)
+#                              and homer's 688M HA recorder DB — its config + .storage +
+#                              zigbee.db DO travel, so HA comes up paired on the target)
 #   - each repo's Claude memory + transcripts, RENAMED to the target's abs-path key
 #
 # It does NOT copy: reproducible build dirs, Docker named volumes, or HA data.
@@ -31,7 +32,8 @@ REPOS=( $(python3 -c "import json;d=json.load(open('$FLEET'));r=d['repos'];print
 
 EXC=(--exclude='node_modules/' --exclude='.venv/' --exclude='venv/' --exclude='target/'
      --exclude='.next/' --exclude='dist/' --exclude='build/' --exclude='__pycache__/'
-     --exclude='*.pyc' --exclude='.turbo/' --exclude='.cache/' --exclude='homeassistant/'
+     --exclude='*.pyc' --exclude='.turbo/' --exclude='.cache/'
+     --exclude='home-assistant_v2.db*' --exclude='home-assistant.log*'  # homer: 688M HA recorder DB + logs (history; .storage/zigbee.db DO travel)
      --exclude='.esphome/' --exclude='.mww-work/'  # esphome build cache + wake-word training scratch (homer, ~14G reproducible)
      --exclude='engine/data/')                     # filmograma: ANCINE/Drive download CSVs (~4.7G, "not part of the deployable artifact")
 
