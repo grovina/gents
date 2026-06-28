@@ -56,11 +56,7 @@ cat <<'EOF'
 
 ==> staged. For the FINAL cutover, in THIS order:
     1. `gent fleet down` on the Mac FIRST     (freeze live state — avoids torn DBs / split-brain)
-    2. re-run this script                     (fast delta of the now-frozen state)
-    3. filmograma's telegram state is in the gent-filmograma-home VOLUME, not the repo — move it:
-         docker run --rm -v gent-filmograma-home:/v -v "$PWD":/o alpine \
-           tar czf /o/film-home.tgz -C /v .local/state/filmograma
-       (copy film-home.tgz over, untar into the target's volume after first `gent up`)
-    4. move the Zigbee dongle + bring up Home Assistant on the target (Track B)
-    5. `gent fleet up` on the target
+    2. re-run this script                     (fast delta; ~/.gent/state now carries ALL app state — no volume export)
+    3. move the Zigbee dongle + bring up Home Assistant on the target (Track B)
+    4. `gent fleet up` on the target
 EOF
