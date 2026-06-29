@@ -57,8 +57,9 @@ done
 cat <<'EOF'
 
 ==> staged. For the FINAL cutover, in THIS order:
-    1. `gent fleet down` on the Mac FIRST     (freeze live state — avoids torn DBs / split-brain)
-    2. re-run this script                     (fast delta; ~/.gent/state now carries ALL app state — no volume export)
-    3. move the Zigbee dongle + bring up Home Assistant on the target (Track B)
-    4. `gent fleet up` on the target
+    1. `gent fleet down --stack` on the Mac  (stops boxes + homer's HA; freezes state — no torn DBs / split-brain)
+    2. re-run this script                    (fast delta; ~/.gent/state + repos carry everything, incl. HA config)
+    3. give the target the IP 192.168.1.4    (so homer's ESP satellites keep reaching device-host:8088 — no re-flash)
+    4. on the target: `gent fleet up`        (boxes + homer's HA host_stack come up together; HA reconnects to the
+                                              LAN Zigbee coordinator 192.168.1.60 + satellites — network coordinator, no dongle)
 EOF

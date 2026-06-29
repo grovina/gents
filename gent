@@ -183,7 +183,10 @@ def cmd_ls(fleet, _a):
         res = cfg.get("resources", {})
         cm = f"{res.get('cpus','-')}/{res.get('memory','-')}"
         gate = "" if cfg.get("allow") else " (not approved)"
-        print(f"{name:<16}{container_state(name):<12}{cm:<12}{cfg.get('path','?')}{gate}")
+        cfg["abs_path"] = fleet["projects_root"] / cfg["path"]
+        st = host_stack_state(cfg) if cfg["abs_path"].is_dir() else None
+        stk = f"  +stack:{st}" if st else ""
+        print(f"{name:<16}{container_state(name):<12}{cm:<12}{cfg.get('path','?')}{gate}{stk}")
 
 
 def cmd_fleet_up(fleet, _a):
@@ -212,17 +215,23 @@ def cmd_fleet_up(fleet, _a):
         print("gent: nothing to bring up.")
 
 
-def cmd_fleet_down(fleet, _a):
+def cmd_fleet_down(fleet, a):
     """Stop + remove every box. Home volumes are always KEPT here — wiping every
     box's installs/state in one command is too sharp to put behind a fleet flag;
-    wipe deliberately, per box, with `gent down <repo> --wipe`."""
+    wipe deliberately, per box, with `gent down <repo> --wipe`. With --stack, also
+    tear down each box's host_stack (the always-on infra, e.g. homer's HA) — that's
+    the cutover/maintenance switch (a box re-up leaves the stack up)."""
     did = False
-    for name in fleet.get("repos", {}):
-        if container_state(name) == "—":
-            continue
-        print(f"↓  {name:<16} down")
-        docker("rm", "-f", container(name), check=False)
-        did = True
+    stack = getattr(a, "stack", False)
+    for name, cfg in fleet.get("repos", {}).items():
+        if container_state(name) != "—":
+            print(f"↓  {name:<16} down")
+            docker("rm", "-f", container(name), check=False)
+            did = True
+        if stack:
+            cfg["abs_path"] = fleet["projects_root"] / cfg["path"]
+            if host_stack_down(fleet, name, cfg):
+                did = True
     print("gent: home volumes kept (per box: `gent down <repo> --wipe`)."
           if did else "gent: no boxes to bring down.")
 
@@ -420,30 +429,36 @@ def ensure_host_stack(fleet, name, cfg, gj):
         print(f"gent: {name} joined {net} — box reaches the stack by service name")
 
 
-def cmd_stack_up(fleet, a):
-    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
-    if not (gj or {}).get("host_stack"):
-        die(f"{a.repo}: no host_stack declared in gent.json")
-    ensure_host_stack(fleet, a.repo, cfg, gj)
+def host_stack_of(cfg):
+    """(compose_path, project) for a repo's declared host_stack, else (None, None)."""
+    hs = (read_gent_json(cfg) or {}).get("host_stack")
+    if not hs:
+        return None, None
+    return cfg["abs_path"] / hs.get("compose", "docker-compose.yml"), compose_project(cfg)
 
 
-def cmd_stack_down(fleet, a):
-    """Stop a repo's host_stack (the compose infra). `gent down <repo>` leaves it
-    running (HA is always-on infra); this is the explicit teardown."""
-    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
-    hs = (gj or {}).get("host_stack") or die(f"{a.repo}: no host_stack in gent.json")
-    compose = cfg["abs_path"] / hs.get("compose", "docker-compose.yml")
-    subprocess.run(["docker", "compose", "-p", compose_project(cfg), "-f", str(compose), "down"],
+def host_stack_down(fleet, name, cfg):
+    """Stop a repo's host_stack (the compose infra). Box `down` leaves it UP by
+    default (HA is always-on, so a box re-up doesn't dark the house); callers opt
+    in with --stack (cutover/maintenance). Returns True if a stack was torn down."""
+    compose, proj = host_stack_of(cfg)
+    if not compose:
+        return False
+    print(f"gent: {name} host_stack — docker compose down ({proj})")
+    subprocess.run(["docker", "compose", "-p", proj, "-f", str(compose), "down"],
                    cwd=str(cfg["abs_path"]), check=False)
-    print(f"gent: {a.repo} host_stack down")
+    return True
 
 
-def cmd_stack_ps(fleet, a):
-    cfg = repo_cfg(fleet, a.repo); gj = read_gent_json(cfg)
-    hs = (gj or {}).get("host_stack") or die(f"{a.repo}: no host_stack in gent.json")
-    compose = cfg["abs_path"] / hs.get("compose", "docker-compose.yml")
-    subprocess.run(["docker", "compose", "-p", compose_project(cfg), "-f", str(compose), "ps"],
-                   cwd=str(cfg["abs_path"]), check=False)
+def host_stack_state(cfg):
+    """'up'/'down' if the repo declares a host_stack, else None (one cheap `ps`)."""
+    compose, proj = host_stack_of(cfg)
+    if not compose:
+        return None
+    r = subprocess.run(["docker", "ps", "--filter",
+                        f"label=com.docker.compose.project={proj}", "-q"],
+                       capture_output=True, text=True)
+    return "up" if r.stdout.strip() else "down"
 
 
 def _wait_session(name, timeout=90):
@@ -508,13 +523,15 @@ def cmd_logs(fleet, a):
 
 
 def cmd_down(fleet, a):
-    repo_cfg(fleet, a.repo)
+    cfg = repo_cfg(fleet, a.repo)
     docker("rm", "-f", container(a.repo), check=False)
     if getattr(a, "wipe", False):
         docker("volume", "rm", f"gent-{a.repo}-home", check=False)
         print(f"gent: {a.repo} down + home volume wiped (clean slate)")
     else:
         print(f"gent: {a.repo} down (home volume kept; --wipe to clear installs/state)")
+    if getattr(a, "stack", False):
+        host_stack_down(fleet, a.repo, cfg)
 
 
 def cmd_auth(fleet, _a):
@@ -953,7 +970,8 @@ def main():
     fsub = fp.add_subparsers(dest="fleet_cmd", metavar="<command>")
     fsub.add_parser("ls",     help="list all boxes and their state")
     fsub.add_parser("up",     help="bring up every approved box not already running")
-    fsub.add_parser("down",   help="stop + remove all boxes (home volumes kept)")
+    fsub.add_parser("down",   help="stop + remove all boxes (home volumes kept)").add_argument(
+        "--stack", action="store_true", help="also stop each box's host_stack (HA infra) — for cutover")
     fsub.add_parser("doctor", help="check host setup (docker, image, login)")
     fsub.add_parser("build",  help="build the base image")
     fsub.add_parser("auth",   help="shared-login status")
@@ -974,15 +992,6 @@ def main():
     hik = hsub.add_parser("install-keepalive", help="re-arm the keepalive launchd job (already automatic on `up`)")
     hik.add_argument("--load", action="store_true", help="also load it into launchd now")
 
-    # `gent stack …` — a repo's host-side docker-compose stack (e.g. homer's Home
-    # Assistant). `gent up` brings it up automatically; these are explicit controls.
-    stp = sub.add_parser("stack", help="a repo's host_stack (host docker-compose, e.g. homer's HA infra)")
-    stsub = stp.add_subparsers(dest="stack_cmd", metavar="<command>")
-    for sc, h in (("up",   "bring up the host_stack (+ join the box to its network)"),
-                  ("down", "stop the host_stack (infra; `gent down` leaves it up)"),
-                  ("ps",   "show the host_stack containers")):
-        stsub.add_parser(sc, help=h).add_argument("repo", nargs="?")
-
     # Per-repo box commands — repo defaults to the cwd's repo when omitted.
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
     sub.add_parser("attach",     help="attach to a box's claude session").add_argument("repo", nargs="?")
@@ -992,6 +1001,7 @@ def main():
     sp = sub.add_parser("down", help="stop + remove a box (home volume kept unless --wipe)")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("--wipe", action="store_true", help="also delete the home volume")
+    sp.add_argument("--stack", action="store_true", help="also stop the repo's host_stack (e.g. HA infra)")
     sp = sub.add_parser("shell", help="open a shell in a box (or run a one-off after --)")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("cmd_args", nargs="*", help="optional one-off command after --")
@@ -1012,12 +1022,6 @@ def main():
         if not a.host_cmd:             # bare `gent host` → group usage
             hp.print_help(sys.stderr); sys.exit(1)
         return globals()[f"cmd_host_{a.host_cmd.replace('-', '_')}"](fleet, a)
-    if a.cmd == "stack":
-        if not a.stack_cmd:            # bare `gent stack` → group usage
-            stp.print_help(sys.stderr); sys.exit(1)
-        if not getattr(a, "repo", None):
-            a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
-        return globals()[f"cmd_stack_{a.stack_cmd}"](fleet, a)
     if a.cmd in REPO_CMDS and not getattr(a, "repo", None):
         a.repo = here_match(fleet) or die("specify a repo, or run from inside a configured repo")
     globals()[f"cmd_{a.cmd.replace('-', '_')}"](fleet, a)
