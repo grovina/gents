@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # auth-watch.sh — alert (Telegram) when the fleet's shared Claude login goes bad,
-# and again when it recovers. Runs on a timer (launchd on macOS, systemd on Linux),
+# and on recovery auto-reconnect each box's Remote Control (bounce claude so its RC
+# socket re-establishes). Runs on a timer (launchd on macOS, systemd on Linux),
 # INDEPENDENT of the boxes — they're all degraded when auth is down, so the alert
 # path must not route through them.
 #
@@ -54,9 +55,20 @@ if [ "${status%% *}" = "BAD" ]; then
   fi
 else
   if [ -f "$FLAG" ]; then
-    send "✅ gents auth recovered on ${host}."
+    # Auth just recovered (bad -> good). Boxes that ran through the outage have
+    # stale Remote Control sockets — claude only re-establishes RC when it
+    # RESTARTS. So bounce claude in every running box (staggered; the token is
+    # valid now, so this is race-free); each box's supervisor relaunches it and RC
+    # reconnects on its own. This is the self-heal — no command to run. (-f matches
+    # both `claude` and `claude.exe`; -x would miss the latter.)
+    bounced=0
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep '^gent-'); do
+      docker exec "$c" pkill -f 'claude-code/bin/claude' 2>/dev/null && bounced=$((bounced+1))
+      sleep 2
+    done
+    send "✅ gents auth recovered on ${host} — bounced ${bounced} box(es) to reconnect Remote Control."
     rm -f "$FLAG"
-    echo "auth-watch: recovered, sent all-clear"
+    echo "auth-watch: recovered, bounced $bounced boxes to reconnect RC"
   else
     echo "auth-watch: ok"
   fi
