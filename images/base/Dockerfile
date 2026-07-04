@@ -29,8 +29,15 @@ FROM python:3.13-bookworm
 # DB-touching box reaches Postgres through a tunnel and the repo tooling shells
 # out to `psql` for migrations/grants/queries. No-DB boxes
 # carry it unused — the same trade already accepted for gcloud/ffmpeg.
+#
+# git-lfs is a git extension, so it belongs in the base rather than per-repo: a
+# box carrying an LFS-tracked repo (homer) can't clone/checkout its large files
+# without it — a bare `git checkout` leaves LFS pointer stubs on disk. Installed
+# fleet-wide + `git lfs install --system` below (registers the smudge/clean
+# filters in /etc/gitconfig) so it works for every box's gent user. No-LFS boxes
+# carry it unused — the same trade already accepted for gcloud/ffmpeg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates gnupg git openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim postgresql-client \
+      curl ca-certificates gnupg git git-lfs openssh-client tmux ripgrep jq less build-essential sudo ffmpeg unzip vim postgresql-client \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -43,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       > /etc/apt/sources.list.d/google-cloud-sdk.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs gh google-cloud-cli \
+ && git lfs install --system \
  && rm -rf /var/lib/apt/lists/*
 
 # Trust GitHub's SSH host key once, fleet-wide, so git-over-ssh never stops on
