@@ -695,6 +695,50 @@ HOST_KEEPALIVE_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 '''
 
 
+# RunAtLoad-only twin of the keepalive: on login/boot the tmux server is empty
+# (it doesn't survive a reboot), and the keepalive only POKES an existing session
+# — it never starts one. So without this, a rebooted host has no claude session
+# until someone runs `gent host up` by hand. This job runs that `up` at boot; `up`
+# is idempotent (no-op if the session's already there) and re-arms the keepalive.
+# No StartInterval — booting is a one-shot; the keepalive covers the awake case.
+HOST_BOOT_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@@LABEL@@</string>
+    <!-- System python3 (not the pyenv shim, which needs a PATH launchd lacks). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>@@GENT@@</string>
+        <string>host</string>
+        <string>up</string>
+        <string>--cwd</string>
+        <string>@@CWD@@</string>
+    </array>
+    <!-- launchd starts with a bare PATH, but `up` spawns a tmux session that execs
+         the supervisor, which runs `tmux` (homebrew) and `claude` — the tmux child
+         inherits THIS PATH, so both must resolve here (claude often lives in
+         ~/.local/bin, off the default PATH). Computed at install to include the
+         real claude/tmux dirs on this host. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@@PATH@@</string>
+    </dict>
+    <!-- Fire once at login/boot; the keepalive job handles everything after. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/@@LABEL@@.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/@@LABEL@@.log</string>
+</dict>
+</plist>
+'''
+
+
 def host_name(fleet):
     """Display + tmux session name for the host's own claude. Generic default;
     set "host": {"name": "…"} in fleet.json to personalise (kept out of the repo)."""
@@ -766,6 +810,16 @@ def apply_host_tmux_opts(name):
                        check=False, capture_output=True)
 
 
+def host_session_cwd(name):
+    """The dir the running host session was started in (its tmux -c path), so we
+    can arm the boot job for an already-up session without a --cwd. None if
+    unreadable/gone."""
+    r = subprocess.run(["tmux", "display-message", "-p", "-t", f"{name}:claude",
+                        "#{pane_start_path}"], capture_output=True, text=True)
+    p = r.stdout.strip()
+    return Path(p) if p and Path(p).is_dir() else None
+
+
 def cmd_host_up(fleet, a):
     """Start (or report) this host's supervised claude session in tmux. Resumes
     the newest transcript in the launch dir, so the phone reconnects the SAME
@@ -776,10 +830,12 @@ def cmd_host_up(fleet, a):
             "Install it: `brew install tmux`, then re-run.")
     if tmux_has(name):
         print(f"gent: host session '{name}' already running — `gent host attach` to join.")
+        boot_cwd = expand(a.cwd) if getattr(a, "cwd", None) else host_session_cwd(name)
     else:
         cwd = expand(a.cwd) if getattr(a, "cwd", None) else Path.cwd()
         if not cwd.is_dir():
             die(f"--cwd does not exist: {cwd}")
+        boot_cwd = cwd
         # claude keys per-project state by the working dir, slashes -> dashes.
         proj_dir = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-")
         run = Path.home() / f".gent-{name}-run.sh"
@@ -798,6 +854,10 @@ def cmd_host_up(fleet, a):
     # in-tmux child's frozen sleep clock would miss.
     if install_host_keepalive(fleet, load=True, quiet=True):
         print(f"      keepalive armed (launchd, every 10m — survives sleep).")
+    # Arm the boot job too (idempotent), so the session also comes back after a
+    # reboot — not just a crash (supervisor) or idle expiry (keepalive).
+    if boot_cwd and install_host_boot(fleet, boot_cwd, quiet=True):
+        print(f"      boot autostart armed (launchd — restarts at login after a reboot).")
     print(f"      attach: gent host attach   |   stop: tmux kill-session -t {name}")
 
 
@@ -813,8 +873,9 @@ def cmd_host_down(fleet, a):
     """Stop the host session: kill its tmux session and remove the run script.
     Also reaps any orphaned `claude -n <name>` that outlived the tmux pane (a
     detached Remote Control session claude can keep alive on its own, which
-    nothing would relaunch). Leaves the launchd keepalive — it's a no-op while
-    the session is down and `up` re-arms it; pass --keepalive to remove it too."""
+    nothing would relaunch). Leaves the launchd keepalive + boot jobs — they're
+    no-ops while the session is down and `up` re-arms them; pass --keepalive to
+    remove them too."""
     name = host_name(fleet)
     if tmux_has(name):
         subprocess.run(["tmux", "kill-session", "-t", name])
@@ -838,7 +899,8 @@ def cmd_host_down(fleet, a):
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
                        capture_output=True)
         plist.unlink(missing_ok=True)
-        print(f"gent: keepalive job removed.")
+        remove_host_boot(fleet)
+        print(f"gent: keepalive + boot jobs removed.")
 
 
 def cmd_host_keepalive(fleet, a):
@@ -922,6 +984,59 @@ def install_host_keepalive(fleet, load=True, quiet=False):
     return plist
 
 
+def install_host_boot(fleet, cwd, quiet=False):
+    """Write the RunAtLoad launchd job that runs `gent host up --cwd <cwd>` at
+    login/boot, so the host session comes back after a reboot without a manual
+    `up`. Per-machine (embeds this host's cwd), so it's generated here, never
+    committed. Idempotent; darwin-only (no-op elsewhere).
+
+    Writing the file is all that's needed and all we do: launchd auto-loads every
+    plist in ~/Library/LaunchAgents at login and reads it fresh then, so an updated
+    cwd/gent-path takes effect at the next boot with no bootstrap. We deliberately
+    do NOT bootstrap/bootout it here, for two reasons: (1) bootstrapping a RunAtLoad
+    job fires it immediately, and that `up` would recurse into arming again; (2) the
+    boot job's own `up` calls this function — a bootout here would SIGTERM the very
+    `up` that's mid-run. Only rewrite when the content actually changed, so that
+    self-call is a cheap no-op."""
+    if sys.platform != "darwin":
+        return None
+    name = host_name(fleet)
+    label = f"gent-host-boot-{name}"
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    # launchd's PATH won't find claude (~/.local/bin) or tmux (homebrew); prepend
+    # their real dirs (resolved from the current PATH) to the standard set so the
+    # tmux-hosted supervisor can launch claude at boot.
+    base = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    for tool in ("claude", "tmux"):
+        p = shutil.which(tool)
+        d = str(Path(p).parent) if p else None
+        if d and d not in base:
+            base.insert(0, d)
+    body = (HOST_BOOT_PLIST
+            .replace("@@LABEL@@", label)
+            .replace("@@GENT@@", str(HERE / "gent"))
+            .replace("@@CWD@@", str(cwd))
+            .replace("@@PATH@@", ":".join(base)))
+    if plist.exists() and plist.read_text() == body:
+        return plist            # already armed with this exact command — no-op
+    plist.write_text(body)
+    if not quiet:
+        print(f"gent: wrote {plist} — loads at next login (logs: /tmp/{label}.log).")
+    return plist
+
+
+def remove_host_boot(fleet):
+    """Tear down the boot job (used by `down --keepalive`)."""
+    if sys.platform != "darwin":
+        return
+    label = f"gent-host-boot-{host_name(fleet)}"
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                   capture_output=True)
+    plist.unlink(missing_ok=True)
+
+
 def cmd_host_install_keepalive(fleet, a):
     """Re-install or pre-arm the keepalive launchd job by hand. `gent host up`
     already does this automatically — this stays for re-installing after a gent
@@ -935,10 +1050,11 @@ def cmd_host_status(fleet, a):
     remaining = host_token_remaining()
     tok = "no host login found" if remaining is None else (
         f"~{int(remaining // 60)}m left" if remaining > 0 else "EXPIRED")
-    label = f"gent-host-keepalive-{name}"
-    ka = (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").exists()
+    la = Path.home() / "Library" / "LaunchAgents"
+    ka = (la / f"gent-host-keepalive-{name}.plist").exists()
+    boot = (la / f"gent-host-boot-{name}.plist").exists()
     print(f"gent: host session '{name}': {'up' if up else 'down'}  |  token: {tok}  |  "
-          f"keepalive job: {'installed' if ka else 'not installed'}")
+          f"keepalive: {'on' if ka else 'off'}  |  boot autostart: {'on' if boot else 'off'}")
 
 
 def cmd_deploy_key(fleet, a):
@@ -984,7 +1100,7 @@ def main():
     hup = hsub.add_parser("up", help="start the supervised host session in tmux (resumes newest transcript)")
     hup.add_argument("--cwd", help="working dir for the session (default: current dir)")
     hdn = hsub.add_parser("down", help="stop the host session (kill tmux + remove run script)")
-    hdn.add_argument("--keepalive", action="store_true", help="also remove the launchd keepalive job")
+    hdn.add_argument("--keepalive", action="store_true", help="also remove the launchd keepalive + boot-autostart jobs")
     hsub.add_parser("attach", help="attach to the host session")
     hsub.add_parser("status", help="show session state + token expiry + keepalive job")
     hk = hsub.add_parser("keepalive", help="poke/bounce the host session so idle Remote Control survives (for cron)")

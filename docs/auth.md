@@ -27,26 +27,33 @@ relaunches a crashed claude, and an *active* box re-mints its 8h OAuth token as
 a side effect of its own API calls, so **Remote Control** never lapses. A claude
 you run **on the host** by hand has neither — left idle past token expiry, its
 Remote Control socket drops and doesn't come back until the session restarts.
-`gent host` gives that host session the same two safety nets:
+`gent host` gives that host session the same safety nets — and adds a third so it
+survives a reboot:
 
 ```
-gent host up        # tmux + self-healing supervisor + keepalive, all armed
+gent host up        # tmux + self-healing supervisor + keepalive + boot autostart, all armed
 gent host down      # stop it (kill tmux + reap any orphaned claude)
-gent host status    # session state + token expiry + keepalive job
+gent host status    # session state + token expiry + keepalive & boot-autostart jobs
 gent host attach    # join the session
 ```
 
 - **`up`** runs `claude` in a tmux session under a supervisor that relaunches it
   on exit and resumes the newest transcript, so the phone reconnects the *same*
-  session. Run it from the dir whose conversation you want to resume. It arms the
-  launchd keepalive automatically (idempotent; re-run after a gent update to
-  re-arm). `gent host install-keepalive` arms it by hand.
+  session. Run it from the dir whose conversation you want to resume. It arms both
+  launchd jobs automatically (idempotent; re-run after a gent update to re-arm).
+  `gent host install-keepalive` arms the keepalive by hand.
 - **keepalive** is the host-side twin of `gent fleet refresh-auth`: when the
   token nears expiry it **pokes** an idle session with a one-line, ignore-me
   prompt to force an in-place re-mint (skipped if the session is busy — it's
   re-minting itself); only once the token has actually lapsed (e.g. after the
   laptop slept) does it **bounce** claude so the supervisor relaunches it and
   reconnects Remote Control.
+- **boot autostart** is a `RunAtLoad` launchd job (`gent-host-boot-<name>`) that
+  runs `gent host up` at login/boot — the tmux server doesn't survive a reboot,
+  and keepalive only pokes an *existing* session, so without this a rebooted host
+  has no session until someone runs `up` by hand. It remembers the cwd `up` was
+  last started in, and its PATH is widened to find `claude` (often `~/.local/bin`)
+  and `tmux`. `gent host down --keepalive` removes it along with the keepalive.
 
 Set the session name with `"host": {"name": "…"}` in `fleet.json`. Needs tmux on
 the host (`brew install tmux`); on macOS the token is read from the login
