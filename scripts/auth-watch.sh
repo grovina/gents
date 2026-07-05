@@ -24,8 +24,13 @@ try:
     d = json.load(open(sys.argv[1]))["claudeAiOauth"]
     if not d.get("refreshToken"):
         print("BAD refresh token empty (mass-up race) — needs /login"); raise SystemExit
-    margin_ms = (time.time() + 300) * 1000          # 5-min margin
-    if d.get("expiresAt", 0) < margin_ms:
+    # We're the LAST line of defense, not the first. An active box re-mints the
+    # shared token as a side effect of its own calls, and `gent fleet refresh-auth`
+    # bounces a box at actual expiry — either path fires within a couple of 10-min
+    # ticks. Only alarm once the token has been expired PAST that window (15 min),
+    # so we don't cry wolf during the brief at-expiry gap before a refresh lands.
+    deadline_ms = (time.time() - 900) * 1000        # 15 min past expiry
+    if d.get("expiresAt", 0) < deadline_ms:
         print("BAD access token expired and not refreshing"); raise SystemExit
     print("OK")
 except FileNotFoundError:
