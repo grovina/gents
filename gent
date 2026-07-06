@@ -527,10 +527,22 @@ def cmd_send(fleet, a):
     Why it's a command and not two raw tmux calls: a naive `send-keys "text" Enter`
     lands the text *and* the Enter as one blob, which the TUI reads as a newline in
     the compose box — the message just sits there unsent (learned the hard way). So
-    we paste the body through a tmux buffer with BRACKETED paste (`paste-buffer -p`,
-    so the TUI treats it as pasted text — multi-line and key-like words like 'Enter'
-    stay literal, never interpreted), settle, then send Enter as its own keystroke
-    to submit."""
+    we first CLEAR the composer, then paste the body through a tmux buffer with
+    BRACKETED paste (`paste-buffer -p`, so the TUI treats it as pasted text —
+    multi-line and key-like words like 'Enter' stay literal, never interpreted),
+    settle, then send Enter as its own keystroke to submit.
+
+    The clear matters: an earlier inject into a BUSY pane leaves its text unsent in
+    the composer, so without clearing, this message concatenates onto that stale
+    draft and both go out as one garbled blob (observed: two queued nudges + a
+    heads-up fused together). We clear with a burst of Ctrl+U (kill-to-line-start):
+    one clears a single line, and repeated presses walk up and clear a multi-line
+    draft too (empirically ~2 per line; double-Esc, the documented "clear input",
+    did NOT clear reliably on a bypass-permissions box, so we don't rely on it).
+    Ctrl+U on an already-empty composer is a harmless no-op, so we send a generous
+    fixed count — the box's composer only ever holds prior injects, never a human's
+    live draft, so clearing it is always safe. Killed text stays on the readline
+    kill-ring (C-y), so nothing is truly lost."""
     repo_cfg(fleet, a.repo)
     state = container_state(a.repo)
     if state != "running":
@@ -539,6 +551,8 @@ def cmd_send(fleet, a):
     if not msg:
         die("nothing to send — pass a message or pipe it on stdin")
     c = container(a.repo)
+    docker("exec", c, "tmux", "send-keys", "-t", "gent", "-N", "60", "C-u", check=False)
+    time.sleep(0.2)                    # let the composer clear before we paste
     docker("exec", c, "tmux", "set-buffer", "-b", "gent-send", "--", msg, check=False)
     docker("exec", c, "tmux", "paste-buffer", "-t", "gent", "-b", "gent-send", "-d", "-p", check=False)
     time.sleep(0.4)                    # let the paste settle before the submit keystroke
