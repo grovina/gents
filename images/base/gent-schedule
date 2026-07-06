@@ -20,12 +20,24 @@ Two kinds of timed wake-up, one daemon, fired into the box's unified event strea
   CRON TRIGGERS — "fire at this wall-clock slot" (calendar, NO backfill).
   A hand-edited JSON array at $GENT_CRON_PATH (default $GENT_STATE_DIR/cron.json):
     [{"name":"morning_digest","cron":"32 8 * * *","enabled":true,
-      "event":{"topic":"morning_digest","note":"…"}}]
+      "event":{"topic":"morning_digest","note":"…"}},              # nudge the agent
+     {"name":"nightly_backup","cron":"0 3 * * *","run":"./backup.sh"},   # RUN a command
+     {"name":"health","cron":"*/15 * * * *","run":["python3","hc.py"],"notify":"always"}]
   5-field cron (min hour dom month dow, dow 0=Sun) in $GENT_SCHEDULE_TZ (default
-  UTC). On a matching minute the entry's `event` payload is emitted verbatim (kind
-  defaults to "scheduled", `name` added). No backfill — a daemon that was down
-  doesn't replay missed slots; de-dup is per (name, minute). Edit the file freely;
-  it's re-read every tick.
+  UTC). On a matching minute an entry does one or both of:
+    • `event`: emit the payload verbatim into the stream (kind defaults to
+      "scheduled", `name` added) — a pure nudge the agent reads and acts on.
+    • `run`:   EXECUTE a command in the repo dir. A string runs via the shell
+      (`./backup.sh && ...`); a list runs argv-style (no shell). The command is
+      launched DETACHED so a slow job never stalls the minute-aligned daemon, and
+      its outcome comes back as a `scheduled_run` event (exit code, duration, an
+      output tail, and the path to a full log under $GENT_STATE_DIR/run-logs/).
+      `notify` controls that event: "onfail" (default — surface only a non-zero
+      exit), "always", or "never". A run over $GENT_RUN_TIMEOUT_SECS (default 3600)
+      is killed and reported as exit 124. This is the "no ack, just run it" path;
+      for a reminder you personally handle, use a note above.
+  No backfill — a daemon that was down doesn't replay missed slots; de-dup is per
+  (name, minute). Edit the file freely; it's re-read every tick.
 
 The daemon (`gent-schedule fire-due`, run minute-aligned by the bootstrap) fires
 both. Events land in $GENT_EVENTS_PATH (default $GENT_STATE_DIR/events.jsonl).
@@ -36,6 +48,7 @@ import re
 import json
 import uuid
 import datetime
+import subprocess
 
 try:
     from zoneinfo import ZoneInfo
@@ -335,13 +348,96 @@ def _fire_cron():
         if hit and fired.get(name) != minute_key:
             fired[name] = minute_key
             changed = True
-            event = dict(ent.get("event") or {})
-            event.setdefault("kind", "scheduled")
-            event["name"] = name
-            emit_event(event)
+            # A `run` command executes; an `event` payload nudges the agent. An
+            # entry may have either or both (run, then nudge).
+            run = ent.get("run")
+            if run is not None:
+                _launch_run(name, run, ent.get("notify", "onfail"))
+            if ent.get("event") is not None:
+                event = dict(ent["event"])
+                event.setdefault("kind", "scheduled")
+                event["name"] = name
+                emit_event(event)
+            if run is None and ent.get("event") is None:
+                emit_event({"kind": "schedule_error",
+                            "msg": "gent-schedule: cron %r has neither `run` nor `event`" % name})
     if changed:
         with open(sp, "w", encoding="utf-8") as f:
             json.dump(fired, f)
+
+
+def _launch_run(name, run, notify):
+    """Launch a cron `run` command DETACHED (its own session) so a slow job never
+    stalls the minute-aligned daemon. The child (`_exec`) runs the command, logs
+    its full output, and emits a `scheduled_run` event with the outcome."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_exec",
+             name, json.dumps(run), notify or "onfail"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception as e:
+        emit_event({"kind": "schedule_error",
+                    "msg": "gent-schedule: could not launch run %r: %r" % (name, e)})
+
+
+def cmd_exec(argv):
+    """Internal (spawned by the cron path): run a scheduled command, log its full
+    output, and emit a `scheduled_run` result event. Detached from the daemon, so
+    it's free to take as long as it needs (up to $GENT_RUN_TIMEOUT_SECS)."""
+    if len(argv) < 2:
+        sys.exit("usage: gent-schedule _exec <name> <run-json> [notify]")
+    name = argv[0]
+    try:
+        run = json.loads(argv[1])           # str → shell; list → argv (no shell)
+    except Exception:
+        run = argv[1]
+    notify = argv[2] if len(argv) > 2 else "onfail"
+    try:
+        timeout = int(os.environ.get("GENT_RUN_TIMEOUT_SECS", "3600"))
+    except ValueError:
+        timeout = 3600
+    start = now()
+    shell = isinstance(run, str)
+    killed = False
+    try:
+        p = subprocess.run(run, shell=shell, capture_output=True, text=True, timeout=timeout)
+        rc, out, err = p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired as e:
+        rc, killed = 124, True
+        out = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+        err = (e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+    except Exception as e:
+        rc, out, err = 127, "", "gent-schedule: exec failed: %r" % e
+    dur = (now() - start).total_seconds()
+    combined = (out + ("\n" if out and err else "") + err).strip()
+
+    logpath = ""
+    try:
+        logdir = os.path.join(state_dir(), "run-logs")
+        os.makedirs(logdir, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "run"
+        logpath = os.path.join(logdir, "%s-%s.log" % (safe, start.strftime("%Y%m%dT%H%M%S")))
+        with open(logpath, "w", encoding="utf-8") as f:
+            f.write("# %s\n# run: %s\n# %s  exit %s%s  %.1fs\n\n%s\n" % (
+                name, run, iso(start), rc, " TIMEOUT" if killed else "", dur, combined))
+    except OSError:
+        logpath = ""
+
+    tail = "\n".join(combined.splitlines()[-6:])
+    if len(tail) > 600:
+        tail = "…" + tail[-600:]
+    ok = (rc == 0)
+    visible = (notify == "always") or (notify != "never" and not ok)
+    ev = {"kind": "scheduled_run" if visible else "self_scheduled_run",
+          "name": name, "exit": rc, "ok": ok, "secs": round(dur, 1)}
+    if killed:
+        ev["timeout"] = True
+    if tail:
+        ev["tail"] = tail
+    if logpath:
+        ev["log"] = logpath
+    emit_event(ev)
 
 
 def cmd_fire_due(_argv):
@@ -372,6 +468,7 @@ def main():
     return {
         "add": cmd_add, "list": cmd_list, "due": cmd_due,
         "done": cmd_done, "rm": cmd_rm, "fire-due": cmd_fire_due,
+        "_exec": cmd_exec,
     }.get(cmd, lambda _a: sys.exit("gent-schedule: unknown subcommand %r" % cmd))(rest)
 
 

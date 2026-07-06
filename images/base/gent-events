@@ -55,6 +55,17 @@ def _fmt(ev):
         return ev.get("line") or ev.get("text") or json.dumps(ev, ensure_ascii=False)
     if k == "schedule_error":
         return "⚠️ schedule: %s" % ev.get("msg", "")
+    if k == "scheduled_run":
+        name, secs = ev.get("name", "?"), ev.get("secs")
+        if ev.get("ok"):
+            return "✅ scheduled run %s ok (%ss)" % (name, secs)
+        to = " TIMEOUT" if ev.get("timeout") else ""
+        head = "❌ scheduled run %s failed%s (exit %s, %ss)" % (name, to, ev.get("exit"), secs)
+        if ev.get("tail"):
+            head += ":\n%s" % ev["tail"]
+        if ev.get("log"):
+            head += "\n  full log: %s" % ev["log"]
+        return head
     extra = " ".join("%s=%s" % (kk, vv) for kk, vv in ev.items() if kk not in ("kind", "ts"))
     return "• %s %s" % (k, extra)
 
