@@ -9,8 +9,13 @@ Two kinds of timed wake-up, one daemon, fired into the box's unified event strea
     gent-schedule list | due | done <id> | rm <id>
   Stored append-only in $GENT_STATE_DIR/schedule.jsonl (add/fire/done, fold-on-read).
   A fired reminder stays in `due` until you `done` it, so one missed while the
-  (flaky) Monitor was down is caught at the next reconcile. Recurring (`--every`)
-  reschedules from NOW (no catch-up burst). A note is a nudge — you pick the moment.
+  (flaky) Monitor was down is caught at the next reconcile. A recurring (`--every`)
+  reminder has exactly ONE live instance: it fires once and nags in `due` until
+  you handle it, then `done` schedules the next occurrence from NOW (done time)
+  and `rm` ends the series. So `done` ALWAYS advances the cadence and `rm` ALWAYS
+  stops it — neither depends on whether the daemon fired the instance first. A
+  note is a nudge — you pick the moment (for a strict wall-clock cadence that
+  fires whether or not you ack it, use a CRON TRIGGER instead).
 
   CRON TRIGGERS — "fire at this wall-clock slot" (calendar, NO backfill).
   A hand-edited JSON array at $GENT_CRON_PATH (default $GENT_STATE_DIR/cron.json):
@@ -213,18 +218,40 @@ def cmd_due(_argv):
         print("  %s  %s  (run `gent-schedule done %s` once handled)" % (a["id"], a["note"], a["id"]))
 
 
-def cmd_done(argv):
-    if not argv:
-        sys.exit("usage: gent-schedule done <id>")
-    rid = argv[0]
+def _resolve(rid, reschedule):
+    """Mark reminder `rid` done. If it recurs and `reschedule`, spawn the next
+    occurrence (from now) so `done` deterministically advances the cadence;
+    `rm` passes reschedule=False to end the series."""
     items = fold()
     if rid not in items:
         sys.exit("no reminder %s" % rid)
     if items[rid]["done"]:
         print("%s already done" % rid)
         return
-    append_sched({"op": "done", "id": rid, "at": iso(now())})
-    print("done %s" % rid)
+    n = now()
+    append_sched({"op": "done", "id": rid, "at": iso(n)})
+    recur = items[rid]["add"].get("recur_ms")
+    if reschedule and recur:
+        nid = uuid.uuid4().hex[:8]
+        nxt = n + datetime.timedelta(seconds=recur // 1000)
+        append_sched({"op": "add", "id": nid, "fire_at": iso(nxt),
+                      "note": items[rid]["add"]["note"], "created_at": iso(n),
+                      "recur_ms": recur})
+        print("done %s — next occurrence %s at %s" % (rid, nid, iso(nxt)))
+    else:
+        print(("done %s" if reschedule else "removed %s") % rid)
+
+
+def cmd_done(argv):
+    if not argv:
+        sys.exit("usage: gent-schedule done <id>")
+    _resolve(argv[0], reschedule=True)
+
+
+def cmd_rm(argv):
+    if not argv:
+        sys.exit("usage: gent-schedule rm <id>")
+    _resolve(argv[0], reschedule=False)
 
 
 # ── cron triggers (calendar slots; no backfill) ───────────────────────────────
@@ -331,10 +358,9 @@ def cmd_fire_due(_argv):
         a = it["add"]
         append_sched({"op": "fire", "id": rid, "at": iso(n)})
         emit_event({"kind": "reminder", "id": rid, "note": a["note"]})
-        if a.get("recur_ms"):
-            nxt = n + datetime.timedelta(seconds=a["recur_ms"] // 1000)
-            append_sched({"op": "add", "id": uuid.uuid4().hex[:8], "fire_at": iso(nxt),
-                          "note": a["note"], "created_at": iso(n), "recur_ms": a["recur_ms"]})
+        # A recurring reminder does NOT self-advance on fire; it nags in `due`
+        # until acknowledged, and `done` schedules the next occurrence. This
+        # keeps recurrence deterministic (only `done` advances, only `rm` ends).
     # Cron triggers.
     _fire_cron()
 
@@ -345,7 +371,7 @@ def main():
     cmd, rest = sys.argv[1], sys.argv[2:]
     return {
         "add": cmd_add, "list": cmd_list, "due": cmd_due,
-        "done": cmd_done, "rm": cmd_done, "fire-due": cmd_fire_due,
+        "done": cmd_done, "rm": cmd_rm, "fire-due": cmd_fire_due,
     }.get(cmd, lambda _a: sys.exit("gent-schedule: unknown subcommand %r" % cmd))(rest)
 
 
