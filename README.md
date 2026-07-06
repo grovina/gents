@@ -71,6 +71,7 @@ gent up     myapp   # create + start a repo's agent (persistent, detached)
 gent attach myapp   # drop into its live claude session (tmux)
 gent shell  myapp   # a separate shell in the box (or `-- cmd` for a one-off)
 gent peek   myapp   # snapshot the session without attaching
+gent send   myapp "do X"   # prompt the box's session from the host (or pipe on stdin)
 gent logs   myapp   # container/bootstrap logs
 gent down   myapp   # stop + remove (home volume kept; --wipe to clear it)
 ```

@@ -517,6 +517,35 @@ def cmd_peek(fleet, a):
     docker("exec", container(a.repo), "tmux", "capture-pane", "-p", "-t", "gent", check=False)
 
 
+def cmd_send(fleet, a):
+    """Type a message into a box's claude session and submit it — the ergonomic
+    way to prompt a box from the host (or from another box).
+
+        gent send homer "reconcile your tree, I just pushed a fix"
+        some_long_thing | gent send homer          # body from stdin
+
+    Why it's a command and not two raw tmux calls: a naive `send-keys "text" Enter`
+    lands the text *and* the Enter as one blob, which the TUI reads as a newline in
+    the compose box — the message just sits there unsent (learned the hard way). So
+    we paste the body through a tmux buffer with BRACKETED paste (`paste-buffer -p`,
+    so the TUI treats it as pasted text — multi-line and key-like words like 'Enter'
+    stay literal, never interpreted), settle, then send Enter as its own keystroke
+    to submit."""
+    repo_cfg(fleet, a.repo)
+    state = container_state(a.repo)
+    if state != "running":
+        die(f"'{a.repo}' box is not running (state: {state}) — `gent up {a.repo}` first")
+    msg = " ".join(a.message).strip() if a.message else sys.stdin.read().strip()
+    if not msg:
+        die("nothing to send — pass a message or pipe it on stdin")
+    c = container(a.repo)
+    docker("exec", c, "tmux", "set-buffer", "-b", "gent-send", "--", msg, check=False)
+    docker("exec", c, "tmux", "paste-buffer", "-t", "gent", "-b", "gent-send", "-d", "-p", check=False)
+    time.sleep(0.4)                    # let the paste settle before the submit keystroke
+    docker("exec", c, "tmux", "send-keys", "-t", "gent", "Enter", check=False)
+    print(f"gent: sent to {a.repo} ({len(msg)} chars). `gent peek {a.repo}` to watch.")
+
+
 def cmd_logs(fleet, a):
     repo_cfg(fleet, a.repo)
     docker("logs", "-n", "100", container(a.repo), check=False)
@@ -1112,6 +1141,9 @@ def main():
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
     sub.add_parser("attach",     help="attach to a box's claude session").add_argument("repo", nargs="?")
     sub.add_parser("peek",       help="print a box's claude pane without attaching").add_argument("repo", nargs="?")
+    sp = sub.add_parser("send", help="type a message into a box's claude session and submit it")
+    sp.add_argument("repo", help="target box (required — no cwd inference, so it works from the host)")
+    sp.add_argument("message", nargs="*", help="the message; omit to read it from stdin")
     sub.add_parser("logs",       help="show a box's recent container logs").add_argument("repo", nargs="?")
     sub.add_parser("deploy-key", help="mint + register this repo's GitHub deploy key").add_argument("repo", nargs="?")
     sp = sub.add_parser("down", help="stop + remove a box (home volume kept unless --wipe)")
