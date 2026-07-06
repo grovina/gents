@@ -293,7 +293,26 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
         sleep "$CLEAR_EVERY_SEC"
         tmux has-session -t gent 2>/dev/null || exit 0
         [ "$(fp)" = "$base" ] && continue   # nothing happened since last baseline (incl. an idle post-clear session) — skip
-        tmux send-keys -t gent:claude "$NUDGE_TEXT" Enter 2>/dev/null || true
+        # Deliver only at an actual stopping point. A bare `send-keys "$text" Enter`
+        # into a BUSY pane leaves the text unsent in the composer, where the next
+        # nudge (and any `gent send`) stacks onto it — observed as fused nudges. And
+        # nudging mid-task is pointless anyway ("Mid-task? Ignore this"). So wait
+        # briefly for the pane to settle idle (stable + not "esc to interrupt"); if
+        # it won't, skip this tick — the next cadence retries. When idle, deliver
+        # like the watchdog re-arm below: bracketed paste + a SEPARATE Enter.
+        prev=""; stable=0; ready=0
+        for _ in $(seq 1 90); do
+          tmux has-session -t gent 2>/dev/null || exit 0
+          cur="$(tmux capture-pane -p -t gent:claude 2>/dev/null || true)"
+          if [ -n "$cur" ] && [ "$cur" = "$prev" ] && ! printf '%s' "$cur" | grep -q 'esc to interrupt'; then
+            stable=$((stable + 1)); [ "$stable" -ge 3 ] && { ready=1; break; }
+          else stable=0; fi
+          prev="$cur"; sleep 1
+        done
+        [ "$ready" = 1 ] || continue   # never idle within ~90s — skip; next cadence retries
+        printf '%s' "$NUDGE_TEXT" | tmux load-buffer -b gent-nudge -
+        tmux paste-buffer -b gent-nudge -t gent:claude -p -d
+        tmux send-keys -t gent:claude Enter 2>/dev/null || true
         # Re-baseline AFTER the nudge is fully handled — wait for the session to go
         # quiescent (incl. any gent-clear: new transcript + re-greet), capped — so
         # the nudge's OWN churn isn't misread as fresh activity on the next tick.
