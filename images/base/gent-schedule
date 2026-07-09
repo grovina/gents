@@ -23,8 +23,10 @@ Two kinds of timed wake-up, one daemon, fired into the box's unified event strea
       "event":{"topic":"morning_digest","note":"…"}},              # nudge the agent
      {"name":"nightly_backup","cron":"0 3 * * *","run":"./backup.sh"},   # RUN a command
      {"name":"health","cron":"*/15 * * * *","run":["python3","hc.py"],"notify":"always"}]
-  5-field cron (min hour dom month dow, dow 0=Sun) in $GENT_SCHEDULE_TZ (default
-  UTC). On a matching minute an entry does one or both of:
+  5-field cron (min hour dom month dow, dow 0=Sun) in $GENT_SCHEDULE_TZ — which
+  defaults to the box's $TZ, then UTC (set TZ once; the scheduler follows it, and
+  ZoneInfo makes the slot DST-correct). On a matching minute an entry does one or
+  both of:
     • `event`: emit the payload verbatim into the stream (kind defaults to
       "scheduled", `name` added) — a pure nudge the agent reads and acts on.
     • `run`:   EXECUTE a command in the repo dir. A string runs via the shell
@@ -302,13 +304,38 @@ def _cron_matches(expr, dt):
     )
 
 
+def _warn_bad_tz(name):
+    """Surface an unknown-TZ name ONCE (not every minute — the daemon reinvokes
+    fresh each tick, so dedup on disk keyed by the bad name). Beats silently
+    firing every cron slot in UTC, hours off from what was intended."""
+    marker = os.path.join(state_dir(), "tz-warned")
+    try:
+        prev = open(marker, encoding="utf-8").read().strip() if os.path.exists(marker) else ""
+    except OSError:
+        prev = ""
+    if prev == name:
+        return
+    emit_event({"kind": "schedule_error",
+                "msg": "gent-schedule: unknown TZ %r (GENT_SCHEDULE_TZ/TZ) → firing cron in UTC" % name})
+    try:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(name)
+    except OSError:
+        pass
+
+
 def _local_tz():
-    name = os.environ.get("GENT_SCHEDULE_TZ", "UTC")
+    """Zone for cron wall-clock slots. Prefer GENT_SCHEDULE_TZ, else fall back to
+    the box's OS TZ, else UTC — so setting TZ once makes the OS and the scheduler
+    agree, and GENT_SCHEDULE_TZ stays an explicit override for the rare case where
+    they should differ. Absolute reminders (--at/--in/--every) don't touch this;
+    they're stored/compared in UTC and are TZ-agnostic by construction."""
+    name = os.environ.get("GENT_SCHEDULE_TZ") or os.environ.get("TZ") or "UTC"
     if ZoneInfo is not None:
         try:
             return ZoneInfo(name)
         except Exception:
-            pass
+            _warn_bad_tz(name)
     return datetime.UTC
 
 
