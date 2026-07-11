@@ -107,6 +107,26 @@ pane, then replay the box's hello to re-orient the fresh session. Mid-task? It
 ignores the nudge and gets poked again next interval. `every` takes
 `s`/`m`/`h`/`d` suffixes (bare number = seconds); no `clear` key → no nudge.
 
+### Handing work across the clear
+
+A clear is amnesia: the fresh session has the hello, so it knows *who it is* —
+but not what you were in the middle of. Anything that should survive goes in the
+optional **note**, an instruction the agent writes to its post-clear self:
+
+```bash
+gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+```
+
+The note is delivered with the hello as the fresh session's first prompt (brief
+above, note below), so the box wakes up oriented **and** pointed. Write it for a
+reader who remembers nothing: name the task, the branch, the next step — not
+"continue where I left off". Truly finished, nothing carrying over? Omit it and
+`gent-clear` behaves exactly as before.
+
+Anything durable still belongs in a commit or memory — the note is a pointer to
+the work, not the record of it. It's dropped if the clear never lands (the old
+context is intact, so there's nothing to hand off).
+
 ## A custom "hi" per box — `.gent/hello.md`
 
 Drop a `.gent/hello.md` in the repo and gents replays it into the claude pane as
@@ -116,9 +136,11 @@ its work lives. It fires at two moments:
 - **on box startup** (`gent up`) — once claude's TUI has settled, so a fresh box
   is oriented without you attaching, and
 - **after `gent-clear`** — a `/clear` wipes the conversation, including whatever
-  the agent was watching, so the hello re-orients the empty session.
+  the agent was watching, so the hello re-orients the empty session (alongside
+  the clear's optional [handoff note](#handing-work-across-the-clear), if any).
 
 It's versioned with the repo like `.gent/setup.sh`; multi-line is fine (it's
 pasted as one prompt). No `.gent/hello.md` → nothing is replayed (claude still
 reloads the repo's `CLAUDE.md` either way). The same primitive is exposed as the
-in-box command `gent-hello` to re-send it by hand.
+in-box command `gent-hello` to re-send it by hand — `gent-hello "<note>"`
+appends a note below the brief, exactly as the post-clear greet does.

@@ -1,26 +1,48 @@
 #!/usr/bin/env bash
-# gent-hello — paste this box's .gent/hello.md into the claude pane as the next
-# prompt. The shared "(re-)greet" primitive: the bootstrap calls it once the box
-# comes up, and gent-clear calls it right after a /clear. A box's hello is its
+# gent-hello [note] — paste this box's .gent/hello.md into the claude pane as the
+# next prompt. The shared "(re-)greet" primitive: the bootstrap calls it once the
+# box comes up, and gent-clear calls it right after a /clear. A box's hello is its
 # standing brief — who it is, what to resume watching, where its work lives — so
 # a freshly-started OR freshly-cleared session is oriented the same way.
 #
-# No-op (silent, exit 0) if the repo ships no hello — most boxes don't, and
-# that's the default. Uses tmux bracketed paste (-p) so a multi-line hello goes
-# in as ONE prompt instead of each newline submitting a fragment.
+# The optional [note] is a HANDOFF appended below the brief: what the fresh
+# session should pick up (`gent-clear` passes the model's own note through here).
+# The brief says who you are; the note says what to do next. Either may be absent
+# — with no hello and no note there is nothing to say, so we no-op (silent, exit
+# 0); most boxes ship no hello, and that's the default.
+#
+# Both halves go in as ONE prompt via tmux bracketed paste (-p), so a multi-line
+# hello or note lands whole instead of each newline submitting a fragment.
 set -u
 
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 PANE="gent:claude"
 HELLO="$REPO/.gent/hello.md"
+NOTE="${1:-}"
 
-[ -s "$HELLO" ] || exit 0
+# $(...) drops trailing newlines — deliberate: a paste ending in \n leaves the
+# cursor on a fresh blank line, so the Enter below would submit THAT empty line
+# and strand the message in the input box. Interior newlines are preserved.
+brief=""
+[ -s "$HELLO" ] && brief="$(cat "$HELLO")"
+NOTE="$(printf '%s' "$NOTE")"
+
+if [ -n "$brief" ] && [ -n "$NOTE" ]; then
+  prompt="$brief
+
+---
+
+$NOTE"
+elif [ -n "$brief" ]; then
+  prompt="$brief"
+elif [ -n "$NOTE" ]; then
+  prompt="$NOTE"
+else
+  exit 0
+fi
+
 tmux has-session -t gent 2>/dev/null || exit 0
 
-# Strip any trailing newline before loading the buffer: a paste that ends in \n
-# leaves the cursor on a fresh blank line, so the Enter below submits THAT empty
-# line and the message just sits in the input box. $(...) drops trailing newlines;
-# interior newlines (a multi-line hello) are preserved.
-printf '%s' "$(cat "$HELLO")" | tmux load-buffer -b gent-hello -
+printf '%s' "$prompt" | tmux load-buffer -b gent-hello -
 tmux paste-buffer -b gent-hello -t "$PANE" -p -d
 tmux send-keys -t "$PANE" Enter

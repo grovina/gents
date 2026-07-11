@@ -284,7 +284,7 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
     *)    CLEAR_EVERY_SEC=0 ;;
   esac
   if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ]; then
-    NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then run \`gent-clear\` as your final action to reset your context. Mid-task? Ignore this; you'll be nudged again later."
+    NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then run \`gent-clear\` as your final action to reset your context. If anything carries over, hand it to your fresh self: \`gent-clear \"<what to pick up next>\"\` — it remembers nothing, so name the task and the next step. Mid-task? Ignore this; you'll be nudged again later."
     echo "gents: periodic clear nudge every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)" >&2
     ( trap : INT
       fp() { local n; n="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true)"; [ -n "$n" ] && printf '%s:%s' "$n" "$(wc -c < "$n" 2>/dev/null || echo 0)"; }

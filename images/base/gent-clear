@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# gent-clear — do exactly what typing /clear does in THIS box's claude session,
-# then re-greet the fresh session with the box's hello — but ONLY once the clear
-# is observed to have actually landed.
+# gent-clear [note] — do exactly what typing /clear does in THIS box's claude
+# session, then re-greet the fresh session with the box's hello — but ONLY once
+# the clear is observed to have actually landed.
+#
+# The optional [note] is a HANDOFF to your post-clear self, delivered with the
+# hello as the fresh session's first prompt:
+#
+#   gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+#
+# Write it as an instruction TO a fresh session that remembers nothing: name the
+# task, the branch, the file, the next step. Without one, a cleared box wakes up
+# oriented (it has the hello) but idle — it knows who it is, not what you were in
+# the middle of. Skip it only when you're truly finished and nothing carries over.
 #
 # The MODEL runs this as its FINAL action. gent-clear runs via the Bash tool, so
 # the pane is busy and the "/clear" keystroke QUEUES behind the current turn; it
@@ -10,10 +20,13 @@
 #
 # `/clear` does not edit the current transcript: it FREEZES it and starts a brand-
 # new <id>.jsonl. We use that new file as PROOF the clear happened — only once it
-# appears do we replay the hello. If it never appears (e.g. the turn never ended,
-# so the queued keystroke never fired), we greet NOTHING: pasting a hello into a
-# still-uncleared session is the exact bug this replaces. A missed greet is
-# recoverable (`gent-hello`); a false greet into stale context just looks broken.
+# appears do we replay the hello (and the note). If it never appears (e.g. the
+# turn never ended, so the queued keystroke never fired), we greet NOTHING:
+# pasting a hello into a still-uncleared session is the exact bug this replaces.
+# Dropping the note there is right, not a loss — the clear didn't happen, so the
+# context it was handing off to never existed and the old session still has
+# everything. A missed greet is recoverable (`gent-hello "<note>"`); a false greet
+# into stale context just looks broken.
 #
 # The supervisor (~/.gent-run.sh) independently resumes the NEWEST transcript, so
 # the new post-clear session is what survives the next restart — no bookkeeping
@@ -23,6 +36,9 @@ set -u
 PANE="gent:claude"
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 PROJ="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
+# "$*" so the note survives either shape: one quoted arg (the normal form — keeps
+# its newlines, so a multi-line handoff lands whole) or several bare words.
+NOTE="$*"
 
 if ! tmux has-session -t gent 2>/dev/null; then
   echo "gent-clear: no 'gent' tmux session — nothing to clear" >&2
@@ -39,7 +55,7 @@ tmux send-keys -t "$PANE" "/clear" Enter
 # Detached watcher (setsid + closed stdio) so it OUTLIVES both this Bash tool call
 # and the model turn that ends right after: wait for the clear to land, then — once
 # the fresh TUI settles — replay the hello.
-export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before"
+export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before" GENT_NOTE="$NOTE"
 setsid bash -c '
   cleared=0
   for _ in $(seq 1 300); do
@@ -60,7 +76,11 @@ setsid bash -c '
     else stable=0; fi
     prev="$cur"; sleep 1
   done
-  [ "$ready" = 1 ] && gent-hello || echo "gent-clear: fresh session never went idle — greet skipped (run gent-hello)" >&2
+  [ "$ready" = 1 ] && gent-hello "$GENT_NOTE" || echo "gent-clear: fresh session never went idle — greet skipped (run gent-hello)" >&2
 ' </dev/null >/dev/null 2>&1 &
 
-echo "gent-clear: /clear queued; the fresh session will be re-greeted once it lands" >&2
+if [ -n "$NOTE" ]; then
+  echo "gent-clear: /clear queued; once it lands the fresh session gets the hello + your note" >&2
+else
+  echo "gent-clear: /clear queued; the fresh session will be re-greeted once it lands" >&2
+fi
