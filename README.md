@@ -80,7 +80,7 @@ Fleet/host admin lives under `gent fleet` (run rarely), with `gent ls` as the
 daily glance:
 
 ```bash
-gent ls             # fleet overview (= `gent fleet ls`)
+gent ls             # fleet overview (= `gent fleet ls`) — boxes + the host session
 gent fleet up       # bring up every approved box not already running
 gent fleet down     # stop + remove all boxes (home volumes kept)
 gent fleet doctor   # check docker, base image, shared login, secret dirs
@@ -93,6 +93,10 @@ aborts the batch on one repo's failure — it's mainly for a fresh checkout or
 after a `fleet down` (`--restart unless-stopped` already revives boxes when
 Docker starts). `fleet down` keeps every home volume on purpose; wipe
 deliberately, per box, with `gent down <repo> --wipe`.
+
+`gent ls` lists this machine's own supervised claude ([`gent host`](docs/auth.md))
+as a last row, and `gent attach host` joins it — the host is a member of the
+fleet you can glance at and drop into like any box.
 
 ## Configuring a repo — `gent.json`
 

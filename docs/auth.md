@@ -34,8 +34,11 @@ survives a reboot:
 gent host up        # tmux + self-healing supervisor + keepalive + boot autostart, all armed
 gent host down      # stop it (kill tmux + reap any orphaned claude)
 gent host status    # session state + token expiry + keepalive & boot-autostart jobs
-gent host attach    # join the session
+gent host attach    # join the session (`gent attach host` is the same thing)
 ```
+
+The session also shows as a row in `gent ls`, next to the boxes — it's part of the
+fleet, not a thing off to the side.
 
 - **`up`** runs `claude` in a tmux session under a supervisor that relaunches it
   on exit and resumes the newest transcript, so the phone reconnects the *same*

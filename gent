@@ -178,7 +178,7 @@ def cmd_doctor(fleet, _a):
 
 
 def cmd_ls(fleet, _a):
-    print(f"{'REPO':<16}{'STATE':<12}{'CPU/MEM':<12}PATH")
+    print(f"{'NAME':<16}{'STATE':<12}{'CPU/MEM':<12}PATH")
     for name, cfg in fleet.get("repos", {}).items():
         res = cfg.get("resources", {})
         cm = f"{res.get('cpus','-')}/{res.get('memory','-')}"
@@ -187,6 +187,27 @@ def cmd_ls(fleet, _a):
         st = host_stack_state(cfg) if cfg["abs_path"].is_dir() else None
         stk = f"  +stack:{st}" if st else ""
         print(f"{name:<16}{container_state(name):<12}{cm:<12}{cfg.get('path','?')}{gate}{stk}")
+    # The host's own supervised session is a member of the fleet too — it's a
+    # claude you talk to from the same phone, and forgetting it's down is exactly
+    # the failure this line prevents. Last row, same columns: it's uncapped (it IS
+    # the machine, hence -/-), and its "path" is the dir it was launched in.
+    hname = host_name(fleet)
+    up = tmux_has(hname)
+    cwd = host_session_cwd(hname) if up else None
+    note = "  (host session)" if up else "  (host session — `gent host up` to start)"
+    print(f"{hname:<16}{'running' if up else '—':<12}{'-/-':<12}"
+          f"{host_rel_path(fleet, cwd)}{note}")
+
+
+def host_rel_path(fleet, cwd):
+    """A host session's launch dir, shown like a repo's path (relative to
+    projects_root when it lives there)."""
+    if not cwd:
+        return "—"
+    try:
+        return str(cwd.relative_to(fleet["projects_root"]))
+    except ValueError:
+        return str(cwd)
 
 
 def cmd_fleet_up(fleet, _a):
@@ -487,7 +508,19 @@ def _attach(name):
                          "tmux", "select-window", "-t", "gent:claude", ";", "attach", "-t", "gent"])
 
 
+def is_host(fleet, name):
+    """True if `name` addresses the host's own session rather than a box: its
+    configured name, or the literal 'host' (which works whatever it's called, so
+    the muscle memory is the same on every machine). A repo of that name in
+    fleet.json wins — an actual box is never shadowed."""
+    return name not in fleet.get("repos", {}) and name in (host_name(fleet), "host")
+
+
 def cmd_attach(fleet, a):
+    # The host session lists in `gent ls` next to the boxes, so it's reachable the
+    # same way: `gent attach host` == `gent host attach`.
+    if is_host(fleet, a.repo):
+        return cmd_host_attach(fleet, a)
     repo_cfg(fleet, a.repo)
     _attach(a.repo)
 
@@ -1153,7 +1186,7 @@ def main():
 
     # Per-repo box commands — repo defaults to the cwd's repo when omitted.
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
-    sub.add_parser("attach",     help="attach to a box's claude session").add_argument("repo", nargs="?")
+    sub.add_parser("attach",     help="attach to a box's claude session (or `host` for this machine's)").add_argument("repo", nargs="?")
     sub.add_parser("peek",       help="print a box's claude pane without attaching").add_argument("repo", nargs="?")
     sp = sub.add_parser("send", help="type a message into a box's claude session and submit it")
     sp.add_argument("repo", help="target box (required — no cwd inference, so it works from the host)")
