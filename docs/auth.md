@@ -59,24 +59,34 @@ fleet, not a thing off to the side.
   and `tmux`. `gent host down --keepalive` removes it along with the keepalive.
 
 Set the session name with `"host": {"name": "…"}` in `fleet.json`. Needs tmux on
-the host (`brew install tmux`); on macOS the token is read from the login
-Keychain, elsewhere from `~/.claude/.credentials.json`.
+the host (`brew install tmux` / `apt install tmux`); on macOS the token is read
+from the login Keychain, elsewhere from `~/.claude/.credentials.json`.
 
 ## Per-repo memory & history — one brain per repo, shared with your host
 
-A box mounts its repo at the **real host absolute path** (e.g.
-`/Users/you/Projects/acme/api`), not a fixed `/repo`, and works from there. That
-makes the box a path-faithful subset of your machine: Claude keys per-project
-state (memory, transcripts) by the working directory, so the box and your host
-sessions for that repo compute the **same** key. gent then binds your host's
-`~/.claude/projects/<that-key>/` straight into the box, so the two share **one**
-per-repo memory and one transcript history — what the autonomous box learns,
-your host sessions see, and vice versa.
+Per-repo memory lives **in the repo**, at `<repo>/.claude/memory` — not under
+`~/.claude/projects/<abs-path-key>/`. A box mounts its repo at a stable, host-agnostic
+`/repos/<owner>/<repo>` and works from there, and both the box and your own host
+sessions in that repo are pointed at the repo's memory dir. They reach it by different
+absolute paths, so each needs its own pointer: the host's is written into the repo's
+`.claude/settings.local.json` (`autoMemoryDirectory`), while the box **cannot** use that
+file — it holds a host path that doesn't exist in the container — so `bootstrap`
+re-asserts the container path at the **managed settings** tier, which outranks any
+project file. Both name the same directory on disk. One brain per repo: what the
+autonomous box learns, your host sessions see, and vice versa.
 
-This is also what keeps memory **un-scrambled**. The shared `claude-home` login
-is one dir across the whole fleet; if every box worked from the same `/repo`
-path they'd all collapse into a single `projects/-repo/` namespace and stomp on
-each other's memory. The real-path mount gives every repo a distinct key, and
-the host bind keeps each repo's brain in exactly one place. `claude-home` still
-supplies the fleet login/creds/settings; only each repo's own project subtree is
-host-backed.
+Putting memory in the repo is what makes it **portable**. It used to be addressed by the
+repo's absolute path, which made it a hostage of the machine — moving the fleet meant
+rewriting `/Users/...` keys to `/home/...` on the way over. Now the path isn't part of the
+address, and memory simply travels with the tree.
+
+The container path still has to be **distinct per repo**: the shared `claude-home` login
+is one dir across the whole fleet, and a fixed `/repo` would collapse every box into a
+single `projects/-repo/` namespace where they stomp on each other. `/repos/<owner>/<repo>`
+is distinct *and* host-independent — which the old real-path mount was not.
+
+Memory is **gitignored**, and `gent fleet doctor` asserts it. It's agent-written,
+unreviewed prose recording whatever the agent learned about your machines; one
+`git add -A` would publish it irreversibly. Transcripts are *not* shared between host and
+box, and are not copied when the fleet moves — they're raw session logs, and re-ups start
+fresh sessions anyway.

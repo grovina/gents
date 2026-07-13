@@ -201,19 +201,24 @@ def cmd_doctor(fleet, _a):
         print("✗ docker not found on PATH"); ok = False
     else:
         running = subprocess.run(["docker", "info"], capture_output=True).returncode == 0
-        print(f"{'✓' if running else '✗'} docker daemon {'up' if running else 'NOT running (start Docker Desktop)'}")
+        hint = "start Docker Desktop" if IS_MAC else "sudo systemctl start docker"
+        print(f"{'✓' if running else '✗'} docker daemon {'up' if running else f'NOT running ({hint})'}")
         ok = ok and running
-        # VM memory: boxes share ONE Docker Desktop VM. A small VM (the default can
-        # be ~4G) OOM-kills heavy work — a node `pnpm install` peaks past it — even
-        # though the per-box --memory caps look generous (they overcommit the VM).
-        # Soft floor; raise via Docker Desktop → Settings → Resources → Memory.
+        # Memory floor. On macOS the boxes share ONE Docker Desktop VM whose default can
+        # be ~4G — small enough that a node `pnpm install` OOMs even though the per-box
+        # --memory caps look generous (they overcommit the VM). On Linux Docker Engine
+        # there IS no VM: containers run on the host kernel and MemTotal is simply the
+        # machine's RAM, so the number means something completely different and the
+        # "raise the VM" advice is nonsense. Same floor, honest label.
         if running:
             mt = docker("info", "--format", "{{.MemTotal}}", capture=True)
             gib = int(mt) / 1073741824 if mt.isdigit() else 0
             floor = 8
-            print(f"{'✓' if gib >= floor else '!'} docker VM memory {gib:.1f} GiB"
-                  + ('' if gib >= floor else f" — low (< {floor}); a heavy `pnpm install` can OOM. "
-                     "Raise it in Docker Desktop → Settings → Resources."))
+            what = "docker VM memory" if IS_MAC else "host memory (no VM — Docker Engine)"
+            fix = ("Raise it in Docker Desktop → Settings → Resources."
+                   if IS_MAC else "This is the machine's RAM; the boxes' --memory caps overcommit it.")
+            print(f"{'✓' if gib >= floor else '!'} {what} {gib:.1f} GiB"
+                  + ('' if gib >= floor else f" — low (< {floor}); a heavy `pnpm install` can OOM. " + fix))
     img = fleet["image"]
     have = docker("images", "-q", img, capture=True)
     print(f"{'✓' if have else '✗'} base image {img} {'present' if have else 'missing — run: gent fleet build'}")
@@ -224,6 +229,16 @@ def cmd_doctor(fleet, _a):
     # NB: per-repo catalog slices (github/<owner>.env, vercel/<team>.env, SA keys,
     # …) aren't pre-flighted here — they're owner/team-specific, and `gent up`
     # already fails fast on a box whose fleet entry lists a missing catalog entry.
+
+    # The two recurring auth jobs. Without them an idle fleet sails past the shared 8h
+    # token expiry and EVERY box loses Remote Control at once, with nothing to re-mint
+    # it — the exact failure you don't want to discover from another country.
+    for label, _, _, _ in host_jobs(fleet):
+        st = timer_status(label)
+        good = st in ("loaded", "active")
+        print(f"{'✓' if good else '✗'} {label} {st}"
+              + ("" if good else " — run: gent fleet timers install"))
+        ok = ok and good
 
     # Per-repo claude memory MUST be gitignored, in every repo, always. It is
     # agent-written and records whatever the agent learned about your machines and
@@ -1120,6 +1135,153 @@ def cmd_host_keepalive(fleet, a):
         say("host token expired but couldn't find the session's claude to bounce.")
 
 
+# ── recurring host jobs ───────────────────────────────────────────────────────
+# The fleet needs two jobs running on the HOST, forever, whether or not anyone is
+# logged in: `gent fleet refresh-auth` (re-mints the shared 8h token when the whole
+# fleet idles past expiry — otherwise every box loses Remote Control at once) and
+# scripts/auth-watch.sh (alerts + reconnects when auth breaks anyway). On the Mac
+# these were hand-written plists in ~/Library/LaunchAgents that were never in the
+# repo — so they would simply not have existed on a new machine, and the first thing
+# an unattended fleet does without them is quietly go dark.
+#
+# launchd on macOS, systemd --user on Linux. They are equivalent EXCEPT for one
+# trap: a systemd user manager is torn down when your last session ends, so without
+# `loginctl enable-linger` the units silently stop existing the moment you log out of
+# the box you are never going to log into. That is the entire point of the machine,
+# so we hard-fail rather than install units that will never fire.
+IS_MAC = sys.platform == "darwin"
+SYSTEMD_USER = Path.home() / ".config" / "systemd" / "user"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+
+
+def host_jobs(fleet):
+    """The (label, argv, every_seconds, description) of each recurring host job."""
+    return [
+        (f"gent-refresh-auth",
+         [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "refresh-auth"],
+         600, "gent: re-mint the fleet's shared claude login when it idles past expiry"),
+        (f"gent-auth-watch",
+         ["/bin/bash", str(HERE / "scripts" / "auth-watch.sh")],
+         600, "gent: watch the shared login; alert + reconnect boxes on auth failure"),
+    ]
+
+
+def _systemd_linger_ok():
+    """systemd --user units only survive logout if lingering is on. Returns True/False."""
+    user = os.environ.get("USER") or str(Path.home().name)
+    q = ["loginctl", "show-user", user, "--property=Linger", "--value"]
+    if subprocess.run(q, capture_output=True, text=True).stdout.strip() == "yes":
+        return True
+    subprocess.run(["loginctl", "enable-linger", user], capture_output=True)
+    return subprocess.run(q, capture_output=True, text=True).stdout.strip() == "yes"
+
+
+def timer_install(label, argv, every, desc):
+    """Install a recurring host job. Idempotent."""
+    exec_line = " ".join(shlex.quote(a) for a in argv)
+    if IS_MAC:
+        LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+        p = LAUNCH_AGENTS / f"com.grovina.{label}.plist"
+        args_xml = "".join(f"    <string>{a}</string>\n" for a in argv)
+        p.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.grovina.{label}</string>
+  <key>ProgramArguments</key><array>
+{args_xml}  </array>
+  <key>StartInterval</key><integer>{every}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardErrorPath</key><string>/tmp/{label}.log</string>
+</dict></plist>
+''')
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.grovina.{label}"],
+                       capture_output=True)
+        subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(p)], check=False)
+        return p
+    # Linux / systemd --user
+    if not _systemd_linger_ok():
+        die(f"systemd user units will NOT survive logout without lingering, and this box is "
+            f"meant to run unattended.\n       Enable it, then re-run:\n"
+            f"         sudo loginctl enable-linger {os.environ.get('USER', 'you')}")
+    SYSTEMD_USER.mkdir(parents=True, exist_ok=True)
+    (SYSTEMD_USER / f"{label}.service").write_text(
+        f"[Unit]\nDescription={desc}\n\n"
+        f"[Service]\nType=oneshot\n"
+        # docker lives in /usr/bin on Engine; keep PATH explicit so a bare systemd
+        # environment (no shell profile) still finds it.
+        f"Environment=PATH=/usr/local/bin:/usr/bin:/bin\n"
+        f"ExecStart={exec_line}\n")
+    (SYSTEMD_USER / f"{label}.timer").write_text(
+        f"[Unit]\nDescription={desc} (timer)\n\n"
+        f"[Timer]\n"
+        # OnBootSec so a reboot re-arms it without a login; OnUnitActiveSec (not
+        # OnCalendar) to match launchd's StartInterval semantics — every N seconds
+        # after the last run, not at wall-clock marks. Persistent catches up a run
+        # missed while the box was off.
+        f"OnBootSec=2min\nOnUnitActiveSec={every}s\nAccuracySec=30s\nPersistent=true\n\n"
+        f"[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", f"{label}.timer"],
+                   capture_output=True)
+    return SYSTEMD_USER / f"{label}.timer"
+
+
+def timer_status(label):
+    if IS_MAC:
+        p = LAUNCH_AGENTS / f"com.grovina.{label}.plist"
+        loaded = subprocess.run(["launchctl", "list", f"com.grovina.{label}"],
+                                capture_output=True).returncode == 0
+        return ("loaded" if loaded else "not loaded") if p.exists() else "absent"
+    if not (SYSTEMD_USER / f"{label}.timer").exists():
+        return "absent"
+    r = subprocess.run(["systemctl", "--user", "is-active", f"{label}.timer"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "inactive"
+
+
+def timer_uninstall(label):
+    if IS_MAC:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/com.grovina.{label}"],
+                       capture_output=True)
+        (LAUNCH_AGENTS / f"com.grovina.{label}.plist").unlink(missing_ok=True)
+        return
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{label}.timer"],
+                   capture_output=True)
+    (SYSTEMD_USER / f"{label}.service").unlink(missing_ok=True)
+    (SYSTEMD_USER / f"{label}.timer").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
+
+def cmd_fleet_timers(fleet, a):
+    """Install/inspect/remove the host's recurring auth jobs.
+
+    These used to be two plists hand-written on the Mac and never committed — which
+    meant the fleet's auth survival depended on a file that existed on exactly one
+    machine and travelled nowhere. Now gent owns them, on either platform.
+    """
+    jobs = host_jobs(fleet)
+    action = getattr(a, "action", "status") or "status"
+    if action == "install":
+        for label, argv, every, desc in jobs:
+            p = timer_install(label, argv, every, desc)
+            print(f"✓ {label:<18} every {every}s  ({p})")
+        print(f"gent: {'launchd' if IS_MAC else 'systemd --user (lingering on)'} — "
+              f"they run whether or not you are logged in.")
+    elif action == "uninstall":
+        for label, _, _, _ in jobs:
+            timer_uninstall(label)
+            print(f"· {label} removed")
+    else:
+        for label, _, every, _ in jobs:
+            st = timer_status(label)
+            mark = "✓" if st in ("loaded", "active") else "✗"
+            print(f"{mark} {label:<18} {st:<12} (every {every}s)")
+
+
 def install_host_keepalive(fleet, load=True, quiet=False):
     """Write (and optionally load) the launchd job that runs `gent host keepalive`
     every 10 min — the host-side twin of the fleet's refresh-auth job. The plist
@@ -1257,6 +1419,8 @@ def main():
     fsub.add_parser("build",  help="build the base image")
     fsub.add_parser("auth",   help="shared-login status")
     fsub.add_parser("refresh-auth", help="re-mint the shared login if it expired while the fleet idled (for cron)")
+    ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
+    ft.add_argument("action", nargs="?", choices=["install", "status", "uninstall"], default="status")
 
     # `gent host …` — THIS machine's own claude session (run on the host, not in a
     # box): give it a box's idle-survival (supervisor + keepalive) for Remote Control.

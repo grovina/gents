@@ -8,9 +8,11 @@ You run **this** repo by hand: it's the one node that can grant another box
 CPU, memory, or secrets, so it is never itself a YOLO agent. Everything else
 runs unattended inside a box.
 
-> **Scope.** A single-operator tool for running Claude Code in Docker on macOS.
-> All boxes share one Claude login; the host is assumed to be your Mac (Docker
-> Desktop). Network egress is **not** yet sandboxed — see [Not yet](#not-yet).
+> **Scope.** A single-operator tool for running Claude Code in Docker, on **macOS
+> (Docker Desktop) or Linux (Docker Engine)** — the same fleet moves between them.
+> All boxes share one Claude login. The host's recurring auth jobs are installed with
+> `gent fleet timers install` (launchd or systemd, whichever this machine has).
+> Network egress is **not** yet sandboxed — see [Not yet](#not-yet).
 
 ## The contract
 
