@@ -49,6 +49,59 @@ or in the cloud; the box is the *agent* — the claude session plus a thin daemo
 that feeds it. Anything LAN- or device-bound stays on the host, reachable from
 the box at `host.docker.internal`.
 
+## The event bus — one Monitor, many sources
+
+A box's async wake-ups — an inbound Telegram message, a due reminder, a cron slot
+— all land in **one** append-only stream (`events.jsonl`), and the agent watches
+it with **one** Monitor (`gent-events watch`). The sources that feed the stream
+are **box-supervised**, so they keep running across `/clear`, compaction, and a
+dropped Monitor; only the thin final hop is session-bound, and a watchdog re-arms
+it when it drops. Turn the bus on with `"events": true` (or any `.events` object):
+
+```json
+"events": { "cron": "cron.json", "path": "var/events.jsonl", "tz": "Europe/Zurich" }
+```
+
+- **`cron`** — the [cron file](#cron-slots-put-the-file-in-the-repo) (default:
+  the box's state dir).
+- **`path`** — the stream (default: the box's state dir).
+- **`tz`** — the zone cron slots fire in (default: the box's `$TZ`, then UTC).
+
+A **relative path is resolved against the repo**, an absolute one is taken as-is.
+That single fact is the whole game — see below.
+
+A box whose inbound arrives over Telegram gets the bus automatically if it runs a
+`tg poll` service. Any other tooling opts in explicitly, so the watchdog knows what
+to keep alive and what to tell the agent to run on re-arm:
+
+```json
+"telegram": { "watch": "./m telegram watch", "reconcile": "./m telegram pending" }
+```
+
+Use `"monitor": { "watch": …, "reconcile": …, "live": … }` for a box that watches
+its own raw stream rather than `gent-events watch` (`live` is the pgrep pattern
+that proves it's up).
+
+### Cron slots: put the file in the repo
+
+`gent-schedule` fires wall-clock slots from a JSON array — a nudge into the
+stream, a command to run, or both:
+
+```json
+[{"name": "checklist", "cron": "45 9 * * 2-5", "run": ["tools/checklist", "open"]},
+ {"name": "digest",    "cron": "32 8 * * *",   "event": {"topic": "morning_digest"}}]
+```
+
+**Point `events.cron` at a file inside the repo and commit it.** Left at its
+default the file lives in the box's state dir, which is *not* the repo and is *not
+versioned* — so a reprovisioned box comes back with **no slots at all, silently**.
+Nothing errors; the nightly job simply never runs again, and you find out on the
+evening nothing goes out. A schedule is operational truth: it belongs in git next
+to the script it runs. (Only the per-minute de-dup state stays box-local, which is
+right — it's ephemeral.) `run` executes in the repo dir, so keep the command
+**relative** (`tools/checklist`) — a host-absolute path breaks the moment the fleet
+moves to another machine.
+
 ## Derived build outputs — the box builds its own, the host keeps its own
 
 A repo's files are either **source** (what git tracks — OS-neutral text) or

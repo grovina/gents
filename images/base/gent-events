@@ -12,11 +12,21 @@ Monitor is down (a gap is recovered by `tg pending` / `gent-schedule due` on re-
 
   gent-events emit <kind> [key=value ...]   append an event (ts added automatically)
   gent-events watch                         tail + format the stream (the Monitor command)
+
+`watch` is a NEWEST-WINS SINGLETON (pidfile, like the tg poller): arming a second
+one stands the older one down. Duplicate watchers are otherwise invisible — the
+watchdog's liveness check is a `pgrep -f "gent-events watch"`, which any number of
+them satisfy — and each extra tail delivers every event again, so an agent that
+ACTS on events acts twice (replies twice, sends the same poll twice). Newest-wins
+because the newest watcher is the one the harness actually holds the Monitor on.
 """
 import sys
 import os
 import json
+import time
+import signal
 import datetime
+import threading
 import subprocess
 
 
@@ -29,6 +39,12 @@ def events_path():
     d = state_dir()
     os.makedirs(d, exist_ok=True)
     return os.environ.get("GENT_EVENTS_PATH") or os.path.join(d, "events.jsonl")
+
+
+def watch_pid_path():
+    d = state_dir()
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "watch.pid")
 
 
 def cmd_emit(argv):
@@ -70,10 +86,58 @@ def _fmt(ev):
     return "• %s %s" % (k, extra)
 
 
+def _claim_watch(child):
+    """Become THE watcher: take the pidfile, then stand down the moment someone
+    newer takes it. Without this, a watchdog poke that lands while the Monitor is
+    actually alive leaves two tails on the stream and the agent sees — and acts on
+    — every event twice; nothing downstream can tell the copies apart. The guard
+    polls rather than waiting on a signal so an IDLE watcher (blocked on readline,
+    no events flowing) still stands down promptly."""
+    path = watch_pid_path()
+    mypid = os.getpid()
+
+    def owner():
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(mypid))
+
+    def guard():
+        while True:
+            time.sleep(2)
+            if owner() != str(mypid):
+                print("[gent-events] superseded by a newer watch (pid %s) — standing down"
+                      % (owner() or "?"), flush=True)
+                child.terminate()
+                os._exit(0)
+
+    threading.Thread(target=guard, daemon=True).start()
+
+
+def _release_watch():
+    """Drop the pidfile if it's still ours (a newer watcher's claim is left alone)."""
+    path = watch_pid_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read().strip() != str(os.getpid()):
+                return
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def cmd_watch(_argv):
     path = events_path()
     open(path, "a").close()  # ensure it exists so `tail -F` has a target immediately
+    # SIGTERM (how the harness retires a Monitor) must unwind, not abort — else we
+    # leave a pidfile pointing at a dead process for the next debugger to puzzle over.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     p = subprocess.Popen(["tail", "-n", "0", "-F", path], stdout=subprocess.PIPE, text=True)
+    _claim_watch(p)          # newest-wins: any older watcher stands down now
     try:
         for line in p.stdout:
             line = line.strip()
@@ -90,6 +154,7 @@ def cmd_watch(_argv):
         pass
     finally:
         p.terminate()
+        _release_watch()
 
 
 def main():

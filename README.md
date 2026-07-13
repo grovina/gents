@@ -107,7 +107,13 @@ A repo opts into gents features through its own versioned `gent.json`:
 | `needs` | the secrets/egress/tools the repo requires — see [Secrets](docs/secrets.md) |
 | `services` | long-running daemons run next to claude (a poller, an event bridge) |
 | `derived` | build outputs the box builds on its own volume (`node_modules`, `target/`) |
+| `events` | the event bus: one Monitor over one stream, plus cron slots — e.g. `{"cron": "cron.json"}` |
+| `telegram` / `monitor` | what the watchdog keeps armed, for a box with its own watch tooling |
 | `clear` | periodic context-refresh nudge, e.g. `{"every": "6h"}` |
+
+> Point `events.cron` at a file **in the repo** and commit it — a relative path is
+> repo-anchored. At its default the schedule lives in the box's state dir, so a
+> reprovisioned box comes back with no slots and says nothing.
 
 `.gent/setup.sh` (first-run install hook) and `.gent/hello.md` (a standing brief
 replayed into the pane on startup and after a clear) round it out. Full
