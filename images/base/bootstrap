@@ -84,10 +84,26 @@ fi
 # project file can override it) so the grant always wins. Only the credential
 # PATH is pinned; every other setting still merges normally. Repo-agnostic: any
 # box whose fleet entry sets GOOGLE_APPLICATION_CREDENTIALS is protected.
+#
+# The SAME hazard applies to per-repo claude memory, for the same reason. Memory
+# lives in the repo (<repo>/.claude/memory) so it's portable, and the repo's
+# settings.local.json points at it — but with the HOST's absolute path, which does
+# not exist in here. Left alone, the box would honour that path and quietly write its
+# memory into a freshly-created directory nobody reads. So pin the CONTAINER's path
+# (gent passes it as GENT_MEMORY_DIR) at the managed tier too; it names the same
+# directory on disk, reached through the repo bind mount.
+_managed='{}'
+if [ -n "${GENT_MEMORY_DIR:-}" ]; then
+  mkdir -p "$GENT_MEMORY_DIR"
+  _managed=$(jq -n --arg d "$GENT_MEMORY_DIR" '{autoMemoryDirectory: $d}')
+fi
 if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+  _managed=$(printf '%s' "$_managed" \
+    | jq --arg p "$GOOGLE_APPLICATION_CREDENTIALS" '.env.GOOGLE_APPLICATION_CREDENTIALS = $p')
+fi
+if [ "$_managed" != '{}' ]; then
   sudo install -d -m 755 /etc/claude-code
-  printf '{"env":{"GOOGLE_APPLICATION_CREDENTIALS":"%s"}}\n' "$GOOGLE_APPLICATION_CREDENTIALS" \
-    | sudo tee /etc/claude-code/managed-settings.json >/dev/null
+  printf '%s\n' "$_managed" | sudo tee /etc/claude-code/managed-settings.json >/dev/null
 fi
 
 # Auth: ~/.claude is a SHARED bind-mount across all boxes (gents mounts it), so

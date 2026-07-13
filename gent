@@ -63,6 +63,56 @@ def read_gent_json(cfg):
     return None
 
 
+# Per-repo claude memory, relative to the repo root. Claude's own convention dir:
+# it is claude's data, not gent's — a bare `claude` session you run yourself in the
+# repo uses it too, and it sits next to the settings file that points at it.
+MEMORY_REL = ".claude/memory"
+POINTER_REL = ".claude/settings.local.json"
+
+
+def git_ignored(repo, rel):
+    """Is `rel` ignored by the repo's git? False for a non-git dir."""
+    return subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", rel],
+                          capture_output=True).returncode == 0
+
+
+def ensure_memory_dir(cfg):
+    """Make <repo>/.claude/memory exist, be gitignored, and be what claude uses.
+
+    The pointer (autoMemoryDirectory) has to be an ABSOLUTE path, and host and box
+    see the repo at different absolute paths — so this writes only the HOST's answer,
+    into the repo's settings.local.json. The box's answer is asserted by bootstrap at
+    the managed-settings tier, which outranks this file. Both name the same directory.
+
+    Gitignoring it is load-bearing, not tidiness: memory is agent-written and records
+    whatever it learned about your machines and fleet, and some of these repos are
+    public. `gent doctor` asserts the ignore holds, so a stray `git add -A` can never
+    quietly publish it.
+    """
+    repo = cfg["abs_path"]
+    mem = repo / MEMORY_REL
+    mem.mkdir(parents=True, exist_ok=True)
+
+    missing = [f"/{p}" for p in (MEMORY_REL, POINTER_REL) if not git_ignored(repo, p)]
+    if missing and (repo / ".git").exists():
+        with (repo / ".gitignore").open("a") as f:
+            f.write("\n# gents: per-repo claude memory, and the local pointer to it.\n"
+                    "# Agent-written and machine-specific — must never ride a commit.\n")
+            f.write("".join(p + "\n" for p in missing))
+
+    ptr = repo / POINTER_REL
+    data = {}
+    if ptr.exists() and ptr.read_text().strip():
+        try:
+            data = json.loads(ptr.read_text())
+        except json.JSONDecodeError as e:
+            die(f"{repo.name}: {POINTER_REL} is not valid JSON ({e}). Fix or delete it "
+                f"— gent won't clobber a file it can't read.")
+    if data.get("autoMemoryDirectory") != str(mem):
+        data["autoMemoryDirectory"] = str(mem)
+        ptr.write_text(json.dumps(data, indent=2) + "\n")
+
+
 def container(name):
     return f"gent-{name}"
 
@@ -174,6 +224,25 @@ def cmd_doctor(fleet, _a):
     # NB: per-repo catalog slices (github/<owner>.env, vercel/<team>.env, SA keys,
     # …) aren't pre-flighted here — they're owner/team-specific, and `gent up`
     # already fails fast on a box whose fleet entry lists a missing catalog entry.
+
+    # Per-repo claude memory MUST be gitignored, in every repo, always. It is
+    # agent-written and records whatever the agent learned about your machines and
+    # your fleet; several of these repos are public. One `git add -A` would publish it
+    # irreversibly. So this is an assertion, not a note in a doc nobody reads.
+    # Every fleet repo, PLUS gents itself — gents is not a fleet entry (it's where the
+    # host session usually runs), so a repos-only loop silently skips it. It is also the
+    # one repo that is going public, which makes it the worst possible thing to skip.
+    checked = {name: fleet["projects_root"] / cfg["path"]
+               for name, cfg in fleet.get("repos", {}).items()}
+    checked.setdefault("gents", HERE)
+    leaks = [n for n, p in checked.items()
+             if (p / ".git").exists() and not git_ignored(p, MEMORY_REL)]
+    if leaks:
+        print(f"✗ claude memory NOT gitignored: {', '.join(leaks)} — a `git add -A` there "
+              f"would COMMIT it. Add /{MEMORY_REL}/ to each .gitignore (or `gent up` once).")
+        ok = False
+    else:
+        print(f"✓ claude memory ({MEMORY_REL}) gitignored in every repo")
     sys.exit(0 if ok else 1)
 
 
@@ -278,19 +347,27 @@ def cmd_up(fleet, a):
     # history and in-box claude state survive reboot, `down`, and rebuilds.
     # (System `apt` installs live in / — for those, use the repo's .gent/setup.sh
     # so the box stays reproducible.) Wipe with `gent down <repo> --wipe`.
-    # Mount the repo at its REAL host absolute path (not a fixed /repo), and cd
-    # there. This makes the box a path-faithful subset of your machine: claude's
-    # per-project key (the cwd, slashes→dashes) is IDENTICAL host-side and in the
-    # box, so the two share one per-repo namespace (see the project-dir bind
-    # below). It also means each repo encodes DISTINCTLY — the old fixed /repo
-    # collapsed every box into one `-repo` namespace, scrambling memory fleetwide.
-    repo_dir = str(cfg["abs_path"])
+    # The box's interior is STABLE and HOST-AGNOSTIC: /repos/<owner>/<repo>, derived
+    # from the fleet entry rather than from wherever this machine happens to keep the
+    # checkout. Two properties have to hold at once, and missing either one bites:
+    #   - DISTINCT per repo. A fixed /repo (what this used to be) collapses every box
+    #     into ONE `-repo` claude namespace and scrambles memory fleetwide.
+    #   - INDEPENDENT of the host. This later became the host's own absolute path,
+    #     which fixed the collapse but stamped the operator's homedir into the
+    #     container and into every claude key — so moving the fleet to another machine
+    #     became a rename exercise over ~/.claude/projects.
+    # /repos/<owner>/<repo> satisfies both. It's safe to do so now only because per-repo
+    # claude MEMORY no longer rides the cwd key: it lives IN the repo and is found via
+    # autoMemoryDirectory (see ensure_memory_dir), so host and box share one memory no
+    # matter how their paths differ.
+    host_repo = str(cfg["abs_path"])
+    box_repo = "/repos/" + cfg["path"].strip("/")
     args = ["run", "-d", "--name", cname, "--hostname", cname,
             "--restart", "unless-stopped",
-            "-v", f"{repo_dir}:{repo_dir}",
+            "-v", f"{host_repo}:{box_repo}",
             "-v", f"gent-{name}-home:/home/gent",
-            "-w", repo_dir,
-            "-e", f"GENT_REPO_DIR={repo_dir}",
+            "-w", box_repo,
+            "-e", f"GENT_REPO_DIR={box_repo}",
             # Suppress claude.ai account MCP connectors (Gmail/Calendar/Drive/…) in
             # every box BY DEFAULT. The fleet shares ONE login, so those connectors
             # ride the account into all boxes; this env var makes claude drop the
@@ -316,17 +393,23 @@ def cmd_up(fleet, a):
     shared_claude.mkdir(parents=True, exist_ok=True)
     args += ["-v", f"{shared_claude}:/home/gent/.claude"]
 
-    # Per-repo Claude project state (memory + transcripts) lives in the HOST's
-    # ~/.claude, keyed by the repo's absolute path — the SAME key the box uses now
-    # that it works from that real path (above). Bind that one dir in, MASKING the
-    # shared claude-home's projects/<key>, so your host sessions and this box read
-    # and write ONE shared per-repo memory + transcript history. claude-home still
-    # supplies the fleet login/creds/settings; only this repo's project subtree is
-    # host-backed. (mkdir so a never-run-on-host repo still gets a clean dir.)
-    encoded = repo_dir.replace("/", "-")
-    host_proj = Path.home() / ".claude" / "projects" / encoded
-    host_proj.mkdir(parents=True, exist_ok=True)
-    args += ["-v", f"{host_proj}:/home/gent/.claude/projects/{encoded}"]
+    # Per-repo claude MEMORY lives IN THE REPO (<repo>/.claude/memory), not under
+    # ~/.claude/projects/<abs-path-key>. That one move is what makes memory portable:
+    # it travels with the repo tree instead of being stranded in a host-keyed directory
+    # that a machine change orphans (which is why moving the fleet used to require
+    # rewriting /Users/... keys to /home/... on the way over).
+    #
+    # Host sessions in this repo find it via <repo>/.claude/settings.local.json, written
+    # by ensure_memory_dir. The BOX must NOT use that file's value — it holds a HOST
+    # path that doesn't exist in the container — so bootstrap re-asserts the container
+    # path at the MANAGED settings tier, which outranks any project file. Both point at
+    # the same directory on disk, so host and box share ONE memory.
+    #
+    # Transcripts are deliberately NOT shared: they stay per-agent, the box's landing in
+    # the shared claude-home under its (now stable) /repos/... key. They're raw session
+    # logs — ephemera. Memory is the distilled part, and that's what we make portable.
+    ensure_memory_dir(cfg)
+    args += ["-e", f"GENT_MEMORY_DIR={box_repo}/.claude/memory"]
 
     # Shared fleet caches (npm/pip/uv) so boxes reuse one warm cache instead of
     # each re-downloading. Safe (content-addressable); a dedicated dir, not host's.
@@ -356,7 +439,7 @@ def cmd_up(fleet, a):
     # build command (e.g. `pnpm install`) owns all tool-specific detail.
     for path in ((gj or {}).get("derived") or {}):
         slug = path.strip("/").replace("/", "-")
-        args += ["-v", f"gent-{name}-{slug}:{repo_dir}/{path}"]
+        args += ["-v", f"gent-{name}-{slug}:{box_repo}/{path}"]
     # Curated git identity so in-box commits are attributed to you, not `gent`.
     gitcfg = fleet["secrets_root"] / "gitconfig"
     if gitcfg.exists():
@@ -912,6 +995,12 @@ def cmd_host_up(fleet, a):
         if not cwd.is_dir():
             die(f"--cwd does not exist: {cwd}")
         boot_cwd = cwd
+        # A host session is a claude session like any other, so give its repo the same
+        # in-repo memory + gitignore the boxes get. Easy to forget precisely because the
+        # host repo isn't a fleet entry — and the host repo is usually gents itself,
+        # which is public. Forgetting once publishes the memory.
+        if (cwd / ".git").exists():
+            ensure_memory_dir({"abs_path": cwd})
         # claude keys per-project state by the working dir, slashes -> dashes.
         proj_dir = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-")
         run = Path.home() / f".gent-{name}-run.sh"

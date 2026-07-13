@@ -17,3 +17,7 @@ fleet.json
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# gents: per-repo claude memory, and the local pointer to it.
+# Agent-written and machine-specific — must never ride a commit.
+/.claude/memory

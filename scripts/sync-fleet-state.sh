@@ -17,15 +17,19 @@
 set -euo pipefail
 
 TARGET="${1:-grovina@grovitec.local}"
-REMOTE_USER="${TARGET%@*}"
 SSH="ssh -o BatchMode=yes"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLEET="$HERE/fleet.json"
 
-# Claude keys per-repo memory by the repo's ABSOLUTE path (slashes -> dashes).
-# Moving Mac (/Users/you) -> Linux (/home/you) changes the key, so we rename on copy.
-LKEY="$(printf '%s' "$HOME/Projects" | sed 's#/#-#g')"
-RKEY="$(printf '%s' "/home/$REMOTE_USER/Projects" | sed 's#/#-#g')"
+# Per-repo claude memory needs NOTHING special here any more. It lives in the repo
+# (<repo>/.claude/memory) and rides the tree rsync below like any other file. This used
+# to be the ugliest part of the move: memory was keyed by the repo's ABSOLUTE path under
+# ~/.claude/projects, so Mac (/Users/you) -> Linux (/home/you) changed the key and the
+# copy had to rewrite it on the way over. Now the path is not part of the address.
+#
+# Transcripts are deliberately NOT copied: they're raw session logs, they're keyed per
+# host, and re-ups start fresh sessions anyway. Memory is the distilled part, and that's
+# what travels.
 
 # Box repos straight from fleet.json, plus the control repo itself. (Paths have no spaces.)
 REPOS=( $(python3 -c "import json;d=json.load(open('$FLEET'));r=d['repos'];print(chr(10).join(v['path'] for v in (r.values() if isinstance(r,dict) else r)))") "grovina/gents" )
@@ -37,8 +41,8 @@ EXC=(--exclude='node_modules/' --exclude='.venv/' --exclude='venv/' --exclude='t
      --exclude='.esphome/' --exclude='.mww-work/'  # esphome build cache + wake-word training scratch (homer, ~14G reproducible)
      --exclude='engine/data/')                     # filmograma: ANCINE/Drive download CSVs (~4.7G, "not part of the deployable artifact")
 
-echo "==> target $TARGET   (memory key ${LKEY}-*  ->  ${RKEY}-*)"
-$SSH "$TARGET" 'mkdir -p ~/.gent/state ~/.claude/projects ~/Projects'
+echo "==> target $TARGET"
+$SSH "$TARGET" 'mkdir -p ~/.gent/state ~/Projects'
 
 echo "==> gent state root (secrets + app/<box>, minus reproducible cache)"
 rsync -az --exclude 'secrets/cache/' -e "$SSH" "$HOME/.gent/state/" "$TARGET:.gent/state/"
@@ -46,20 +50,26 @@ rsync -az --exclude 'secrets/cache/' -e "$SSH" "$HOME/.gent/state/" "$TARGET:.ge
 for p in "${REPOS[@]}"; do
   src="$HOME/Projects/$p"
   [ -d "$src" ] || { echo "  -- $p (absent, skip)"; continue; }
-  enc="$(printf '%s' "$p" | sed 's#/#-#g')"
   $SSH "$TARGET" "mkdir -p ~/Projects/${p%/*}"
-  rsync -az "${EXC[@]}" -e "$SSH" "$src/" "$TARGET:Projects/$p/"
-  mdir="$HOME/.claude/projects/${LKEY}-${enc}"
-  [ -d "$mdir" ] && rsync -az -e "$SSH" "$mdir/" "$TARGET:.claude/projects/${RKEY}-${enc}/"
+  rsync -az "${EXC[@]}" -e "$SSH" "$src/" "$TARGET:Projects/$p/"   # incl. .claude/memory
   echo "  ok $p"
 done
 
 cat <<'EOF'
 
 ==> staged. For the FINAL cutover, in THIS order:
-    1. `gent fleet down --stack` on the Mac  (stops boxes + homer's HA; freezes state — no torn DBs / split-brain)
-    2. re-run this script                    (fast delta; ~/.gent/state + repos carry everything, incl. HA config)
-    3. give the target the IP 192.168.1.4    (so homer's ESP satellites keep reaching device-host:8088 — no re-flash)
-    4. on the target: `gent fleet up`        (boxes + homer's HA host_stack come up together; HA reconnects to the
-                                              LAN Zigbee coordinator 192.168.1.60 + satellites — network coordinator, no dongle)
+    1. `gent fleet down --stack` on the Mac  (FIRST — stops boxes + homer's HA so the agents stop
+                                              WRITING. Syncing a live fleet copies torn state.)
+    2. re-run this script                    (fast delta; ~/.gent/state + repos carry everything —
+                                              HA config + .storage, and each repo's .claude/memory)
+    3. on the target: `gent fleet up`        (boxes + homer's HA host_stack come up together; HA
+                                              reconnects to the LAN Zigbee coordinator at
+                                              192.168.1.60 — network coordinator, no dongle to move)
+    4. OTA the two ESP satellites            (docker exec esphome esphome run /config/paper.yaml
+                                              and /config/atom-echos3r.yaml — they address the host
+                                              by NAME now, so this is the one thing that still has to
+                                              be pushed to them. Do the Echo first as a canary.)
+
+    NB: the target does NOT need any particular IP. The satellites resolve the host by name
+    via the router's DNS, so a new lease — or a whole new machine — costs nothing.
 EOF
