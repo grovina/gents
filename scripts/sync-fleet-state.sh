@@ -93,9 +93,11 @@ for p in "${PATHS[@]}" "grovina/gents"; do
   [ -d "$src" ] || { echo "  -- $p (absent here, skip)"; continue; }
   # NEVER clobber the target's fleet.json — it is the target's own manifest, and it is
   # deliberately a different (smaller) file than this machine's.
+  # NB `${extra[@]+"${extra[@]}"}`, not `"${extra[@]}"`: macOS ships bash 3.2, where
+  # expanding an EMPTY array under `set -u` is an "unbound variable" error.
   extra=(); [ "$p" = "grovina/gents" ] && extra=(--exclude='/fleet.json')
   $SSH "$TARGET" "mkdir -p ~/Projects/${p%/*}"
-  rsync -az "${EXC[@]}" "${extra[@]}" -e "$SSH" "$src/" "$TARGET:Projects/$p/"
+  rsync -az "${EXC[@]}" ${extra[@]+"${extra[@]}"} -e "$SSH" "$src/" "$TARGET:Projects/$p/"
   echo "  ok $p"
 done
 
