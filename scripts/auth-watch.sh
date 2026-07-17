@@ -64,11 +64,18 @@ else
     # stale Remote Control sockets — claude only re-establishes RC when it
     # RESTARTS. So bounce claude in every running box (staggered; the token is
     # valid now, so this is race-free); each box's supervisor relaunches it and RC
-    # reconnects on its own. This is the self-heal — no command to run. (-f matches
-    # both `claude` and `claude.exe`; -x would miss the latter.)
+    # reconnects on its own. This is the self-heal — no command to run.
+    #
+    # Match on -x (process NAME), like `gent fleet refresh-auth` does. The package
+    # now ships a compiled bin/claude.exe, but the running process still reports
+    # comm=claude and argv[0]=claude, so -x claude is what actually matches. A -f
+    # pattern of 'claude-code/bin/claude' matches NOTHING: -f tests the cmdline
+    # ("claude --dangerously-skip-permissions -n <box> --resume <id>"), which never
+    # contains the install path. That silently made this self-heal a no-op — it
+    # bounced 0 boxes and still reported success.
     bounced=0
     for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep '^gent-'); do
-      docker exec "$c" pkill -f 'claude-code/bin/claude' 2>/dev/null && bounced=$((bounced+1))
+      docker exec "$c" pkill -x claude 2>/dev/null && bounced=$((bounced+1))
       sleep 2
     done
     send "✅ gents auth recovered on ${host} — bounced ${bounced} box(es) to reconnect Remote Control."
