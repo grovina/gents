@@ -341,7 +341,56 @@ def cmd_fleet_down(fleet, a):
           if did else "gent: no boxes to bring down.")
 
 
-def cmd_build(fleet, _a):
+def pull_control_repo():
+    """Fast-forward THIS checkout before building, so the image is never built from
+    stale code.
+
+    The fleet host is the machine that needs this most, and the one least likely
+    to get it: it runs every box but authors nothing, and nothing updates its
+    checkout for it — no box mounts this repo, so no box's deploy key touches it,
+    and sync-fleet-state.sh only pushes FROM whatever machine you ran it on (which
+    is the stale one once the fleet has moved). Left alone the host quietly builds
+    yesterday's image. `build` is the natural hook: it's the moment the host acts
+    on this repo's contents. (The host needs its own read-only deploy key for the
+    pull to work at all — docs/secrets.md.)
+
+    Advisory, never destructive: a dirty tree, no upstream, a diverged branch or no
+    network each just warn and build what's on disk. Only a clean fast-forward is
+    ever taken, so this can't eat local work."""
+    if not (HERE / ".git").exists():
+        return
+    def git(*a):
+        return subprocess.run(["git", "-C", str(HERE), *a], capture_output=True, text=True)
+    if git("status", "--porcelain").stdout.strip():
+        print("gent: control repo has local changes — skipping the pull, building the working tree.")
+        return
+    if git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").returncode != 0:
+        print("gent: control repo has no upstream — skipping the pull.")
+        return
+    before = git("rev-parse", "HEAD").stdout.strip()
+    r = git("pull", "--ff-only")
+    if r.returncode != 0:
+        tail = (r.stderr.strip().splitlines() or ["(no detail)"])[-1]
+        print(f"gent: WARNING — control-repo pull failed; building this checkout as-is. {tail}",
+              file=sys.stderr)
+        return
+    after = git("rev-parse", "HEAD").stdout.strip()
+    if before == after:
+        print("gent: control repo already current.")
+        return
+    print(f"gent: control repo pulled {before[:7]} -> {after[:7]}")
+    # If `gent` ITSELF moved, this process is still the old code — python read the
+    # script at startup. The image is built from the new images/base regardless, so
+    # the build is correct; but say so, because the next invocation may differ.
+    if "gent" in git("diff", "--name-only", before, after).stdout.split():
+        print("gent: NOTE — `gent` itself changed in that pull; this run is still the old "
+              "CLI. The image builds from the new images/base; re-run further commands "
+              "to pick up the new gent.")
+
+
+def cmd_build(fleet, a):
+    if not getattr(a, "no_pull", False):
+        pull_control_repo()
     ctx = HERE / "images" / "base"
     print(f"gent: building {fleet['image']} from {ctx}")
     docker("build", "-t", fleet["image"], str(ctx))
@@ -1416,7 +1465,8 @@ def main():
     fsub.add_parser("down",   help="stop + remove all boxes (home volumes kept)").add_argument(
         "--stack", action="store_true", help="also stop each box's host_stack (HA infra) — for cutover")
     fsub.add_parser("doctor", help="check host setup (docker, image, login)")
-    fsub.add_parser("build",  help="build the base image")
+    fsub.add_parser("build",  help="build the base image (fast-forwards this checkout first)").add_argument(
+        "--no-pull", action="store_true", help="build this checkout as-is; don't fast-forward first")
     fsub.add_parser("auth",   help="shared-login status")
     fsub.add_parser("refresh-auth", help="re-mint the shared login if it expired while the fleet idled (for cron)")
     ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
