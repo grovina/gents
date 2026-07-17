@@ -62,6 +62,30 @@ A deploy key attaches to exactly one repo, and each box is one repo — a clean
 1:1. Registration needs admin on the repo; if you only have write access, the
 mint is non-fatal (warns) and you'd fall back to a fine-grained PAT.
 
+### The fleet host needs one too — for THIS repo
+
+Those keys cover the boxes. The machine *running* the fleet is a different actor,
+and it's easy to miss: it holds this control repo (the one `gent` lives in), and
+nothing updates that checkout for it. No box mounts it, so no box's deploy key
+helps, and `sync-fleet-state.sh` only pushes one way — from the machine you ran
+it on, which goes stale the moment the fleet moves. A headless fleet host is
+therefore stranded on whatever commit it was seeded with, with `git pull` failing
+on "correct access rights", which is a confusing way to learn this.
+
+Same philosophy, one actor out: give the host its own **read-only** deploy key on
+the control repo, never your personal `~/.ssh` key.
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "gents-host-$(hostname)" -f ~/.ssh/id_ed25519_gents
+gh repo deploy-key add ~/.ssh/id_ed25519_gents.pub -R <owner>/gents -t "gents-host-$(hostname)"
+# then point ssh at it (IdentitiesOnly, so it can't fall back to another key):
+printf 'Host github.com\n  User git\n  IdentityFile ~/.ssh/id_ed25519_gents\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+```
+
+Read-only is deliberate: the host *receives* the fleet's code, it doesn't author
+it — you develop on your workstation, push, and the host follows. Pass `-w` to
+`deploy-key add` only if you actually want to commit from the host.
+
 ## GitHub API — `gh` + a per-owner **read-only** token
 
 The deploy key covers `git push`, but **not** the GitHub API: *reading* a PR's
