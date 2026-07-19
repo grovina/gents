@@ -972,11 +972,22 @@ def have_tmux():
     return shutil.which("tmux") is not None
 
 
+def tmux_env():
+    """Env for tmux calls that don't draw on this terminal (has-session,
+    new-session -d, set-option, display-message). tmux still refuses to run when
+    TERM names a terminfo entry it can't find — "missing or unsuitable terminal:
+    xterm-ghostty" — which is exactly what happens when you ssh from a modern
+    terminal into a box whose terminfo db predates it. None of these calls care
+    about the outer terminal (the session's own TERM comes from tmux's
+    default-terminal), so pin a universally-present one and stop caring."""
+    return {**os.environ, "TERM": "xterm-256color"}
+
+
 def tmux_has(session):
     if not have_tmux():
         return False
     return subprocess.run(["tmux", "has-session", "-t", session],
-                          capture_output=True).returncode == 0
+                          capture_output=True, env=tmux_env()).returncode == 0
 
 
 def host_creds():
@@ -1030,7 +1041,7 @@ def apply_host_tmux_opts(name):
         return
     for opt, val in HOST_TMUX_OPTS:
         subprocess.run(["tmux", "set-option", "-t", name, opt, val],
-                       check=False, capture_output=True)
+                       check=False, capture_output=True, env=tmux_env())
 
 
 def host_session_cwd(name):
@@ -1038,7 +1049,8 @@ def host_session_cwd(name):
     can arm the boot job for an already-up session without a --cwd. None if
     unreadable/gone."""
     r = subprocess.run(["tmux", "display-message", "-p", "-t", f"{name}:claude",
-                        "#{pane_start_path}"], capture_output=True, text=True)
+                        "#{pane_start_path}"], capture_output=True, text=True,
+                       env=tmux_env())
     p = r.stdout.strip()
     return Path(p) if p and Path(p).is_dir() else None
 
@@ -1074,7 +1086,8 @@ def cmd_host_up(fleet, a):
                        .replace("@@GENT@@", str(HERE / "gent")))
         run.chmod(0o755)
         subprocess.run(["tmux", "new-session", "-d", "-s", name, "-n", "claude",
-                        "-c", str(cwd), f"exec bash {shlex.quote(str(run))}"], check=True)
+                        "-c", str(cwd), f"exec bash {shlex.quote(str(run))}"],
+                       check=True, env=tmux_env())
         apply_host_tmux_opts(name)
         print(f"gent: host session '{name}' up in tmux (cwd {cwd}).")
     # Arm the launchd keepalive every time (idempotent), so a single `up` is all it
@@ -1107,7 +1120,7 @@ def cmd_host_down(fleet, a):
     remove them too."""
     name = host_name(fleet)
     if tmux_has(name):
-        subprocess.run(["tmux", "kill-session", "-t", name])
+        subprocess.run(["tmux", "kill-session", "-t", name], env=tmux_env())
         print(f"gent: host session '{name}' stopped.")
     else:
         print(f"gent: host session '{name}' not running.")
