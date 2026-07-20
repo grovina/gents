@@ -658,7 +658,11 @@ def _attach(name):
             f"(slow .gent/setup.sh?). Retry `gent attach {name}` shortly, or see `gent logs {name}`.")
     # Always land on the window named 'claude', never a service window (by name,
     # not index — order is unreliable once service windows exist).
-    os.execvp("docker", ["docker", "exec", "-it", container(name),
+    # -e TERM: docker propagates the caller's TERM into the exec, so an exotic one
+    # ("xterm-ghostty") reaches a box image whose terminfo db has never heard of it
+    # and tmux refuses to attach. Resolve it against THIS machine's db first.
+    term = attach_term(["docker", "exec", container(name)], f"in {name}")
+    os.execvp("docker", ["docker", "exec", "-it", "-e", f"TERM={term}", container(name),
                          "tmux", "select-window", "-t", "gent:claude", ";", "attach", "-t", "gent"])
 
 
@@ -971,6 +975,30 @@ HOST_BOOT_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 '''
 
+# The Linux twin of HOST_BOOT_PLIST. RemainAfterExit is the load-bearing line: `up`
+# is a oneshot that returns as soon as tmux is detached, and systemd tears down a
+# finished unit's whole cgroup — which would kill the tmux server (and the session)
+# seconds after starting it. Staying "active" leaves the cgroup alone.
+HOST_BOOT_UNIT = '''[Unit]
+Description=gent: this host's supervised claude session
+# The supervisor is useless without a network to reach the API.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# systemd starts with a bare PATH, but `up` spawns a tmux session that execs the
+# supervisor, which runs tmux and claude — the tmux child inherits THIS PATH, so
+# both must resolve here (claude usually lives in ~/.local/bin, off the default
+# PATH). Computed at install from the real dirs on this host.
+Environment=PATH=@@PATH@@
+ExecStart=@@PY@@ @@GENT@@ host up --cwd @@CWD@@
+
+[Install]
+WantedBy=default.target
+'''
+
 
 def host_name(fleet):
     """Display + tmux session name for the host's own claude. Generic default;
@@ -1018,6 +1046,27 @@ def tmux_env():
     about the outer terminal (the session's own TERM comes from tmux's
     default-terminal), so pin a universally-present one and stop caring."""
     return {**os.environ, "TERM": "xterm-256color"}
+
+
+def attach_term(probe=(), where="here"):
+    """TERM to use for a call that DOES draw on this terminal (attach).
+
+    The tmux_env() trick — pin xterm-256color always — is wrong here: attach is the
+    one call that should honour the caller's real terminal. But it's also where an
+    unknown TERM is fatal rather than cosmetic ("missing or unsuitable terminal:
+    xterm-ghostty"), because tmux refuses to start on a TERM it can't look up.
+
+    So ask the FAR side, which is the one that has to render: `probe` is the command
+    prefix that runs there (empty for this machine, `docker exec <box>` for a box).
+    Probing locally instead would be a different question with a plausible wrong
+    answer — a Mac running ghostty has the terminfo, its boxes don't."""
+    term = os.environ.get("TERM", "")
+    if not term or subprocess.run([*probe, "infocmp", term], capture_output=True).returncode:
+        if term:
+            print(f"gent: no terminfo for '{term}' {where} — attaching as xterm-256color. "
+                  f"To keep it: infocmp -x | <far side> tic -x -", file=sys.stderr)
+        return "xterm-256color"
+    return term
 
 
 def tmux_has(session):
@@ -1133,16 +1182,18 @@ def cmd_host_up(fleet, a):
                        check=True, env=tmux_env())
         apply_host_tmux_opts(name)
         print(f"gent: host session '{name}' up in tmux (cwd {cwd}).")
-    # Arm the launchd keepalive every time (idempotent), so a single `up` is all it
-    # takes — no separate install step, and a re-run re-arms it after a gent update.
-    # launchd survives laptop sleep (fires on wake) to bounce a dropped socket the
-    # in-tmux child's frozen sleep clock would miss.
+    # Arm the keepalive every time (idempotent), so a single `up` is all it takes —
+    # no separate install step, and a re-run re-arms it after a gent update. Out of
+    # process on purpose: on a laptop launchd fires on wake, catching a dropped
+    # socket the in-tmux child's frozen sleep clock would miss; on an always-on box
+    # the systemd timer outlives a session that died with the machine.
+    sup = "launchd, survives sleep" if IS_MAC else "systemd timer"
     if install_host_keepalive(fleet, load=True, quiet=True):
-        print(f"      keepalive armed (launchd, every 10m — survives sleep).")
+        print(f"      keepalive armed ({sup}, every 10m).")
     # Arm the boot job too (idempotent), so the session also comes back after a
     # reboot — not just a crash (supervisor) or idle expiry (keepalive).
     if boot_cwd and install_host_boot(fleet, boot_cwd, quiet=True):
-        print(f"      boot autostart armed (launchd — restarts at login after a reboot).")
+        print(f"      boot autostart armed ({'launchd — at login' if IS_MAC else 'systemd — at boot'}).")
     print(f"      attach: gent host attach   |   stop: tmux kill-session -t {name}")
 
 
@@ -1151,7 +1202,8 @@ def cmd_host_attach(fleet, a):
     if not tmux_has(name):
         die(f"host session '{name}' not running — `gent host up` first.")
     apply_host_tmux_opts(name)  # also fixes an already-running session in place
-    subprocess.run(["tmux", "attach", "-t", name])
+    subprocess.run(["tmux", "attach", "-t", name],
+                   env={**os.environ, "TERM": attach_term()})
 
 
 def cmd_host_down(fleet, a):
@@ -1178,12 +1230,8 @@ def cmd_host_down(fleet, a):
     run = Path.home() / f".gent-{name}-run.sh"
     if run.exists():
         run.unlink()
-    if getattr(a, "keepalive", False) and sys.platform == "darwin":
-        label = f"gent-host-keepalive-{name}"
-        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-                       capture_output=True)
-        plist.unlink(missing_ok=True)
+    if getattr(a, "keepalive", False):
+        remove_host_job(f"gent-host-keepalive-{name}")
         remove_host_boot(fleet)
         print(f"gent: keepalive + boot jobs removed.")
 
@@ -1387,15 +1435,83 @@ def cmd_fleet_timers(fleet, a):
             print(f"{mark} {label:<18} {st:<12} (every {every}s)")
 
 
+def host_job_path():
+    """PATH for the host's boot/keepalive jobs. Neither launchd nor systemd gets a
+    shell profile, so neither would find claude (~/.local/bin, added only by a login
+    shell) or tmux (homebrew on macOS) — the two binaries the supervisor needs. Both
+    resolved from the current PATH, which DOES have them, since jobs are armed from
+    an interactive `gent host up`."""
+    base = (["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] if IS_MAC
+            else ["/usr/local/bin", "/usr/bin", "/bin"])
+    for p in (host_claude_bin(), shutil.which("tmux")):
+        d = str(Path(p).parent) if p else None
+        if d and d not in base:
+            base.insert(0, d)
+    return ":".join(base)
+
+
+def host_job_unit(label):
+    """Path of the host job `label`'s launchd plist / systemd unit."""
+    return (LAUNCH_AGENTS / f"{label}.plist") if IS_MAC else (SYSTEMD_USER / f"{label}.service")
+
+
+def host_job_armed(label):
+    """Is this host job installed? File presence on launchd (which auto-loads
+    ~/Library/LaunchAgents at login); file AND enabled on systemd, where an
+    un-enabled unit is inert — a file-only check would report a job that never
+    fires as 'on', the same flavour of comfortable lie as the crash-loop."""
+    if not host_job_unit(label).exists():
+        return False
+    if IS_MAC:
+        return True
+    return subprocess.run(["systemctl", "--user", "is-enabled", f"{label}.service"],
+                          capture_output=True, text=True).stdout.strip() in ("enabled", "static")
+
+
+def remove_host_job(label):
+    """Tear down a host job on either platform. Idempotent."""
+    if IS_MAC:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                       capture_output=True)
+        (LAUNCH_AGENTS / f"{label}.plist").unlink(missing_ok=True)
+        return
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{label}.service"],
+                   capture_output=True)
+    (SYSTEMD_USER / f"{label}.service").unlink(missing_ok=True)
+    # The keepalive is a .timer on systemd; the boot job is a bare .service. Clearing
+    # both here keeps one teardown path for two shapes.
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{label}.timer"],
+                   capture_output=True)
+    (SYSTEMD_USER / f"{label}.timer").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
+
 def install_host_keepalive(fleet, load=True, quiet=False):
-    """Write (and optionally load) the launchd job that runs `gent host keepalive`
-    every 10 min — the host-side twin of the fleet's refresh-auth job. The plist
-    is per-machine, so it's generated here, never committed. Idempotent; launchd
-    is darwin-only, so this is a no-op (returns None) elsewhere — the supervisor's
-    own in-tmux keepalive child still covers the awake-and-running case there."""
-    if sys.platform != "darwin":
-        return None
+    """Arm the recurring `gent host keepalive` job (every 10 min) — the host-side
+    twin of the fleet's refresh-auth job. Per-machine, so it's generated here, never
+    committed. Idempotent.
+
+    launchd on macOS (where it also has to survive laptop sleep, firing on wake);
+    a systemd --user timer on Linux, via the same timer_install the fleet's auth
+    jobs use. The supervisor's own in-tmux keepalive child covers the
+    awake-and-running case on both, but not a session that died with the box."""
     name = host_name(fleet)
+    if not IS_MAC:
+        label = f"gent-host-keepalive-{name}"
+        # Non-fatal, unlike `fleet timers install`: this runs inside every `gent host
+        # up`, and a linger problem is no reason to refuse to start the session. Say
+        # it plainly instead — a keepalive that dies at logout is exactly the kind of
+        # job you must not believe in.
+        if not _systemd_linger_ok():
+            print(f"gent: WARNING — no systemd lingering, so the host keepalive would die at "
+                  f"logout.\n      Fix: sudo loginctl enable-linger {os.environ.get('USER', 'you')}",
+                  file=sys.stderr)
+            return None
+        argv = [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "host", "keepalive", "--quiet"]
+        unit = timer_install(label, argv, 600, "gent: keep the host claude session's login alive")
+        if not quiet:
+            print(f"gent: armed {unit} — keepalive runs every 10m.")
+        return unit
     label = f"gent-host-keepalive-{name}"
     plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -1420,52 +1536,57 @@ def install_host_boot(fleet, cwd, quiet=False):
     """Write the RunAtLoad launchd job that runs `gent host up --cwd <cwd>` at
     login/boot, so the host session comes back after a reboot without a manual
     `up`. Per-machine (embeds this host's cwd), so it's generated here, never
-    committed. Idempotent; darwin-only (no-op elsewhere).
+    committed. Idempotent.
 
-    Writing the file is all that's needed and all we do: launchd auto-loads every
-    plist in ~/Library/LaunchAgents at login and reads it fresh then, so an updated
-    cwd/gent-path takes effect at the next boot with no bootstrap. We deliberately
-    do NOT bootstrap/bootout it here, for two reasons: (1) bootstrapping a RunAtLoad
-    job fires it immediately, and that `up` would recurse into arming again; (2) the
-    boot job's own `up` calls this function — a bootout here would SIGTERM the very
-    `up` that's mid-run. Only rewrite when the content actually changed, so that
-    self-call is a cheap no-op."""
-    if sys.platform != "darwin":
-        return None
+    On BOTH platforms we deliberately arm without firing: (1) a RunAtLoad bootstrap
+    (or `enable --now`) would run that `up` immediately, and it would recurse into
+    arming again; (2) the boot job's own `up` calls this function — a bootout here
+    would SIGTERM the very `up` that's mid-run. launchd needs nothing more, since it
+    reads every plist in ~/Library/LaunchAgents fresh at login; systemd needs an
+    `enable` (no --now) to link the unit into default.target. Only rewrite when the
+    content actually changed, so that self-call stays a cheap no-op."""
     name = host_name(fleet)
     label = f"gent-host-boot-{name}"
-    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    # launchd's PATH won't find claude (~/.local/bin) or tmux (homebrew); prepend
-    # their real dirs (resolved from the current PATH) to the standard set so the
-    # tmux-hosted supervisor can launch claude at boot.
-    base = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-    for p in (host_claude_bin(), shutil.which("tmux")):
-        d = str(Path(p).parent) if p else None
-        if d and d not in base:
-            base.insert(0, d)
-    body = (HOST_BOOT_PLIST
-            .replace("@@LABEL@@", label)
+    unit = host_job_unit(label)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    if IS_MAC:
+        body = (HOST_BOOT_PLIST
+                .replace("@@LABEL@@", label)
+                .replace("@@GENT@@", str(HERE / "gent"))
+                .replace("@@CWD@@", str(cwd))
+                .replace("@@PATH@@", host_job_path()))
+        if unit.exists() and unit.read_text() == body:
+            return unit         # already armed with this exact command — no-op
+        unit.write_text(body)
+        if not quiet:
+            print(f"gent: wrote {unit} — loads at next login (logs: /tmp/{label}.log).")
+        return unit
+    # Linux / systemd --user. Same lingering caveat as the keepalive, and the same
+    # reason not to die over it: refusing to start a session because a boot job
+    # can't be armed is worse than starting it and saying so.
+    if not _systemd_linger_ok():
+        print(f"gent: WARNING — no systemd lingering, so the host session will NOT come back "
+              f"after a reboot.\n      Fix: sudo loginctl enable-linger "
+              f"{os.environ.get('USER', 'you')}", file=sys.stderr)
+        return None
+    body = (HOST_BOOT_UNIT
             .replace("@@GENT@@", str(HERE / "gent"))
+            .replace("@@PY@@", sys.executable or "/usr/bin/python3")
             .replace("@@CWD@@", str(cwd))
-            .replace("@@PATH@@", ":".join(base)))
-    if plist.exists() and plist.read_text() == body:
-        return plist            # already armed with this exact command — no-op
-    plist.write_text(body)
+            .replace("@@PATH@@", host_job_path()))
+    if unit.exists() and unit.read_text() == body and host_job_armed(label):
+        return unit             # already armed with this exact command — no-op
+    unit.write_text(body)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", f"{label}.service"], capture_output=True)
     if not quiet:
-        print(f"gent: wrote {plist} — loads at next login (logs: /tmp/{label}.log).")
-    return plist
+        print(f"gent: wrote {unit} — starts at boot (logs: journalctl --user -u {label}).")
+    return unit
 
 
 def remove_host_boot(fleet):
     """Tear down the boot job (used by `down --keepalive`)."""
-    if sys.platform != "darwin":
-        return
-    label = f"gent-host-boot-{host_name(fleet)}"
-    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-                   capture_output=True)
-    plist.unlink(missing_ok=True)
+    remove_host_job(f"gent-host-boot-{host_name(fleet)}")
 
 
 def cmd_host_install_keepalive(fleet, a):
@@ -1481,9 +1602,8 @@ def cmd_host_status(fleet, a):
     remaining = host_token_remaining()
     tok = "no host login found" if remaining is None else (
         f"~{int(remaining // 60)}m left" if remaining > 0 else "EXPIRED")
-    la = Path.home() / "Library" / "LaunchAgents"
-    ka = (la / f"gent-host-keepalive-{name}.plist").exists()
-    boot = (la / f"gent-host-boot-{name}.plist").exists()
+    ka = host_job_armed(f"gent-host-keepalive-{name}")
+    boot = host_job_armed(f"gent-host-boot-{name}")
     print(f"gent: host session '{name}': {'up' if up else 'down'}  |  token: {tok}  |  "
           f"keepalive: {'on' if ka else 'off'}  |  boot autostart: {'on' if boot else 'off'}")
 
