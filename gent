@@ -233,6 +233,13 @@ def cmd_doctor(fleet, _a):
     # The two recurring auth jobs. Without them an idle fleet sails past the shared 8h
     # token expiry and EVERY box loses Remote Control at once, with nothing to re-mint
     # it — the exact failure you don't want to discover from another country.
+    # A host's own claude. NOT fatal: a box-only host (docker + gent, no node) is a
+    # legitimate, fully-working fleet host — every box's claude comes from the image.
+    # It's reported because `gent host` needs it and fails invisibly without it: the
+    # supervisor's job is to swallow exits, so a missing binary is a silent crash-loop.
+    cb = host_claude_bin()
+    print(f"{'✓' if cb else '·'} host claude {cb if cb else 'absent — fine unless you run `gent host` on this machine'}")
+
     for label, _, _, _ in host_jobs(fleet):
         st = timer_status(label)
         good = st in ("loaded", "active")
@@ -873,7 +880,10 @@ while :; do
   # phone keeps ONE Remote Control session. None yet (true first run) -> plain start.
   newest="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1)"
   if [ -n "$newest" ]; then set -- --resume "$(basename "$newest" .jsonl)"; else set --; fi
-  claude -n "@@NAME@@" "$@"
+  # Absolute path, baked at `host up` time: this loop inherits the PATH of whatever
+  # started tmux, and a bare `claude` from ~/.local/bin resolves only under a login
+  # shell. Bare + non-login = "command not found" every 5s, forever, silently.
+  "@@CLAUDE@@" -n "@@NAME@@" "$@"
   echo
   echo "[claude exited — relaunching in 5s; 'tmux attach -t @@NAME@@' to watch, 'tmux kill-session -t @@NAME@@' to stop]"
   sleep 5
@@ -972,6 +982,33 @@ def have_tmux():
     return shutil.which("tmux") is not None
 
 
+def host_claude_bin():
+    """Absolute path to THIS host's claude, or None.
+
+    The fleet host doesn't need claude to run boxes — every box's claude lives
+    inside the image — so a host can be perfectly healthy and have none. `gent
+    host` is the one thing that needs it, and the supervisor swallows exits by
+    design, so a missing binary shows up as a silent 5s crash-loop rather than an
+    error. Hence: resolve it up front, absolutely.
+
+    Absolute, not bare `claude`, because the supervisor inherits whatever PATH
+    started tmux. The native install lands in ~/.local/bin, which only a LOGIN
+    shell adds — so a supervisor started from cron/systemd/a non-login shell would
+    not find a claude that is plainly there interactively. Check that dir directly
+    for the same reason.
+
+    Deliberately NOT resolve()d: the native install's ~/.local/bin/claude is a
+    symlink into versions/<n.n.n>, and the launcher repoints it on every auto-update.
+    Resolving would bake today's version into the supervisor and boot job, so the
+    first update would leave them pointing at a deleted binary — the same silent
+    crash-loop this function exists to prevent, only harder to see."""
+    p = shutil.which("claude")
+    if p:
+        return Path(p)
+    local = Path.home() / ".local" / "bin" / "claude"
+    return local if local.exists() else None
+
+
 def tmux_env():
     """Env for tmux calls that don't draw on this terminal (has-session,
     new-session -d, set-option, display-message). tmux still refuses to run when
@@ -1063,6 +1100,11 @@ def cmd_host_up(fleet, a):
     if not have_tmux():
         die("host sessions need tmux (the poke channel that keeps idle Remote Control alive). "
             "Install it: `brew install tmux`, then re-run.")
+    claude_bin = host_claude_bin()
+    if not claude_bin:
+        die("no claude on this host's PATH — a fleet host only needs docker + gent, so this "
+            "is a normal state for a box-only machine. `gent host` is what needs it.\n"
+            "      Install it: curl -fsSL https://claude.ai/install.sh | bash")
     if tmux_has(name):
         print(f"gent: host session '{name}' already running — `gent host attach` to join.")
         boot_cwd = expand(a.cwd) if getattr(a, "cwd", None) else host_session_cwd(name)
@@ -1083,6 +1125,7 @@ def cmd_host_up(fleet, a):
         run.write_text(HOST_SUPERVISOR
                        .replace("@@NAME@@", name)
                        .replace("@@PROJ@@", str(proj_dir))
+                       .replace("@@CLAUDE@@", str(claude_bin))
                        .replace("@@GENT@@", str(HERE / "gent")))
         run.chmod(0o755)
         subprocess.run(["tmux", "new-session", "-d", "-s", name, "-n", "claude",
@@ -1397,8 +1440,7 @@ def install_host_boot(fleet, cwd, quiet=False):
     # their real dirs (resolved from the current PATH) to the standard set so the
     # tmux-hosted supervisor can launch claude at boot.
     base = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-    for tool in ("claude", "tmux"):
-        p = shutil.which(tool)
+    for p in (host_claude_bin(), shutil.which("tmux")):
         d = str(Path(p).parent) if p else None
         if d and d not in base:
             base.insert(0, d)
