@@ -43,7 +43,9 @@ fleet, not a thing off to the side.
 - **`up`** runs `claude` in a tmux session under a supervisor that relaunches it
   on exit and resumes the newest transcript, so the phone reconnects the *same*
   session. Run it from the dir whose conversation you want to resume. It arms both
-  launchd jobs automatically (idempotent; re-run after a gent update to re-arm).
+  background jobs automatically (idempotent; re-run after a gent update to re-arm),
+  and refuses to start if this host has no `claude` — a fleet host doesn't otherwise
+  need one, and the supervisor would hide the mistake as a silent relaunch loop.
   `gent host install-keepalive` arms the keepalive by hand.
 - **keepalive** is the host-side twin of `gent fleet refresh-auth`: when the
   token nears expiry it **pokes** an idle session with a one-line, ignore-me
@@ -51,12 +53,15 @@ fleet, not a thing off to the side.
   re-minting itself); only once the token has actually lapsed (e.g. after the
   laptop slept) does it **bounce** claude so the supervisor relaunches it and
   reconnects Remote Control.
-- **boot autostart** is a `RunAtLoad` launchd job (`gent-host-boot-<name>`) that
-  runs `gent host up` at login/boot — the tmux server doesn't survive a reboot,
+- **boot autostart** (`gent-host-boot-<name>`: a `RunAtLoad` launchd job on macOS,
+  a systemd `--user` unit on Linux) runs `gent host up` at login/boot — the tmux
+  server doesn't survive a reboot,
   and keepalive only pokes an *existing* session, so without this a rebooted host
   has no session until someone runs `up` by hand. It remembers the cwd `up` was
   last started in, and its PATH is widened to find `claude` (often `~/.local/bin`)
   and `tmux`. `gent host down --keepalive` removes it along with the keepalive.
+  Both jobs need systemd lingering on Linux (`gent` enables it, or tells you to);
+  without it they'd die at logout, which on an unattended box means never firing.
 
 Set the session name with `"host": {"name": "…"}` in `fleet.json`. Needs tmux on
 the host (`brew install tmux` / `apt install tmux`); on macOS the token is read
