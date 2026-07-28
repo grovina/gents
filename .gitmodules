@@ -1,0 +1,3 @@
+[submodule "images/base/tg"]
+	path = images/base/tg
+	url = git@github.com:grovina/tg.git

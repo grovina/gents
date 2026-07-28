@@ -126,11 +126,21 @@ COPY gent-clear /usr/local/bin/gent-clear
 # fire from a box-supervised daemon (no at/cron/systemd on the box).
 COPY gent-events /usr/local/bin/gent-events
 COPY gent-schedule /usr/local/bin/gent-schedule
+# tg: the fleet's Telegram CLI (grovina/tg), pinned here as a submodule at
+# images/base/tg. It belongs IN the image for the same reason the gent-* tools do
+# — it is a box capability, not repo content. It was previously hand-copied into
+# running containers with `docker cp`, which meant the image did not contain it at
+# all: recreating a Telegram-facing box would have silently left it with no `tg`,
+# i.e. no way to read or answer anyone, with nothing failing loudly to say so.
+# A submodule keeps one source of truth (the tg repo) and pins which commit the
+# fleet runs; `gent fleet build` syncs it. If the submodule is missing, this COPY
+# fails the build — the right kind of loud.
+COPY tg/tg /usr/local/bin/tg
 # Non-root by default (keeps bind-mount file ownership sane, shrinks the
 # default blast radius) but with passwordless sudo so the agent can install
 # anything it needs inside — "generous inside the box".
 RUN chmod +x /usr/local/bin/bootstrap /usr/local/bin/gent-hello /usr/local/bin/gent-clear \
- && chmod +x /usr/local/bin/gent-events /usr/local/bin/gent-schedule \
+ && chmod +x /usr/local/bin/gent-events /usr/local/bin/gent-schedule /usr/local/bin/tg \
  && useradd -m -s /bin/bash -u 1000 gent \
  && echo 'gent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/gent \
  && chown -R gent:gent /opt/npm-global \

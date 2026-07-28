@@ -395,9 +395,31 @@ def pull_control_repo():
               "to pick up the new gent.")
 
 
+def sync_submodules():
+    """Check out the pinned submodule commits before building.
+
+    images/base/tg is the fleet's Telegram CLI, and the build COPYs it straight
+    into the image. A checkout that was cloned without --recursive (or pulled
+    across a submodule bump) leaves that directory empty or stale, and neither is
+    something to paper over: the empty case fails the COPY loudly, and the stale
+    case would ship yesterday's tg to every box. So sync it here, at the same
+    moment the host acts on this repo's contents."""
+    if not (HERE / ".git").exists():
+        return
+    r = subprocess.run(["git", "-C", str(HERE), "submodule", "update", "--init", "--recursive"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = (r.stderr.strip().splitlines() or ["(no detail)"])[-1]
+        print(f"gent: WARNING — submodule sync failed; the build may COPY a stale or "
+              f"missing tg. {tail}", file=sys.stderr)
+    elif r.stdout.strip():
+        print(f"gent: submodules synced — {r.stdout.strip().splitlines()[-1]}")
+
+
 def cmd_build(fleet, a):
     if not getattr(a, "no_pull", False):
         pull_control_repo()
+    sync_submodules()
     ctx = HERE / "images" / "base"
     print(f"gent: building {fleet['image']} from {ctx}")
     docker("build", "-t", fleet["image"], str(ctx))
