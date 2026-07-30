@@ -37,6 +37,13 @@ def load_fleet():
     sr = f.get("secrets_root")
     f["secrets_root"] = expand(sr) if sr else f["state_root"] / "secrets"
     f["projects_root"] = expand(f.get("projects_root", "~/Projects"))
+    # Box DNS is PINNED rather than inherited from the host's resolver state at
+    # container-start (see the --dns block in `up` for the failure that forced
+    # this). Defaults to Docker's own public fallbacks; a host that needs a
+    # different resolver — a LAN-internal one, a filtered upstream — overrides with
+    # a fleet-level "dns" (a list, or a single string).
+    dns = f.get("dns") or ["8.8.8.8", "8.8.4.4"]
+    f["dns"] = [dns] if isinstance(dns, str) else list(dns)
     return f
 
 
@@ -473,6 +480,32 @@ def cmd_up(fleet, a):
             # (`"ENABLE_CLAUDEAI_MCP_SERVERS": "1"`) — applied below, after this, so
             # the later -e wins (e.g. a box that uses them for home automation).
             "-e", "ENABLE_CLAUDEAI_MCP_SERVERS=0"]
+
+    # DNS is PINNED to explicit servers, not inherited from whatever the host's
+    # resolver happened to know at start time. A container's /etc/resolv.conf is
+    # generated ONCE, when it starts, and never revisited — so that instant is
+    # frozen into the box for its whole life.
+    #
+    # That froze a box solid: on one boot Docker started the containers ~17s in and
+    # the DHCP lease carrying the LAN nameserver landed 1.2s LATER, so the host knew
+    # no DNS at all in the deciding instant. A box on the default bridge survives
+    # that — Docker finds nothing usable and substitutes its own public defaults.
+    # But a box joined to a repo's host_stack network (see ensure_host_stack) sits on
+    # a USER-DEFINED network, so it gets Docker's embedded resolver (127.0.0.11)
+    # with the host's upstreams as its forwarders — and with no upstreams to copy,
+    # Docker baked a resolv.conf whose embedded server had NO EXTERNAL FORWARDERS.
+    # Container names still resolved; every public name came back SERVFAIL. The
+    # symptom surfaces far from the cause: claude wakes to `OAuth error: getaddrinfo
+    # ESERVFAIL platform.claude.com` and never registers Remote Control, long after
+    # the host itself has recovered its own DNS. Nothing self-heals it — only
+    # recreating the container regenerates the file.
+    #
+    # Pinning removes the race outright: the box's resolver no longer depends on when
+    # its host learned DNS. Service-name resolution is untouched — on a user-defined
+    # network these become the embedded resolver's FORWARDERS, so `homeassistant:8123`
+    # keeps resolving and only external lookups change hands.
+    for server in fleet["dns"]:
+        args += ["--dns", server]
 
     res = cfg.get("resources", {})
     if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]

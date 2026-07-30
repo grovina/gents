@@ -3,6 +3,8 @@
   "projects_root": "~/Projects",
   "image": "gents-base:latest",
 
+  "_dns_note": "OPTIONAL, and you almost certainly want the default. Boxes get PINNED DNS servers (default 8.8.8.8 + 8.8.4.4, Docker's own public fallbacks) instead of inheriting the host's resolver state. Reason: a container's /etc/resolv.conf is written ONCE at start and never revisited, so a host that doesn't know its nameservers yet in that instant cripples the box permanently — and a box joined to a repo's host_stack network gets Docker's embedded resolver with the host's upstreams as forwarders, which with no upstreams to copy means NO forwarders at all: container names resolve, every public name SERVFAILs, and claude reports `OAuth error: getaddrinfo ESERVFAIL platform.claude.com` with no Remote Control until the container is recreated. Set \"dns\" (a list, or one string) only if these servers are wrong for your network — an internal resolver, a filtered upstream. Service-name resolution inside a host_stack network is unaffected either way.",
+
   "host": {
     "name": "host",
     "_note": "OPTIONAL. Only for `gent host …` — a claude you run ON this machine (not in a box) and reach from your phone. Boxes don't need this. `name` is the tmux session + display name (pick anything). `gent host up` runs it under a self-healing supervisor AND arms a launchd keepalive job (one command) so an IDLE session re-mints its token before expiry and never drops Remote Control. Requires tmux on the host (`brew install tmux`)."
