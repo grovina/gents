@@ -45,9 +45,14 @@ if ! tmux has-session -t gent 2>/dev/null; then
   exit 1
 fi
 
-# The current session's transcript. /clear migrates claude to a NEW newest file;
-# the watcher waits for that filename to change.
-before="$(ls -t "$PROJ"/*.jsonl 2>/dev/null | head -1 || true)"
+# The session transcripts that exist RIGHT NOW. /clear starts a brand-new one, so
+# the watcher waits for a filename to APPEAR — the whole (name-sorted) listing is
+# the fingerprint. Do NOT narrow this to `ls -t | head -1`: claude writes a last
+# line to the OLD transcript ~100ms AFTER creating the new one, so "newest" stays
+# the old file until something happens to touch the new one — which, in a freshly
+# cleared and therefore idle session, may be minutes away or never. That race ate
+# the greet silently; a set comparison can't lose it.
+before="$(ls "$PROJ"/*.jsonl 2>/dev/null || true)"
 
 # Type /clear. Busy pane -> queues behind the turn -> fires when the turn ends.
 tmux send-keys -t "$PANE" "/clear" Enter
@@ -60,7 +65,7 @@ setsid bash -c '
   cleared=0
   for _ in $(seq 1 300); do
     tmux has-session -t gent 2>/dev/null || exit 0
-    now="$(ls -t "$GENT_PROJ"/*.jsonl 2>/dev/null | head -1 || true)"
+    now="$(ls "$GENT_PROJ"/*.jsonl 2>/dev/null || true)"
     [ -n "$now" ] && [ "$now" != "$GENT_BEFORE" ] && { cleared=1; break; }
     sleep 1
   done
