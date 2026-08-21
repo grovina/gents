@@ -33,6 +33,30 @@
 # here; the clear sticks on its own.
 set -u
 
+case "${1-}" in
+  -h|--help)
+    cat <<'USAGE'
+gent-clear [note] — do what typing /clear does in this box's claude session,
+then re-greet the fresh session with the box's hello, once the clear lands.
+
+  gent-clear
+  gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+
+The optional note is a HANDOFF to your post-clear self, delivered with the hello
+as the fresh session's first prompt. Write it as an instruction TO a session that
+remembers nothing: name the task, the branch, the file, the next step. Without
+one, a cleared box wakes up oriented but idle. Skip it only when you're truly
+finished and nothing carries over.
+
+Run it as your FINAL action and output nothing after: the /clear keystroke queues
+behind the current turn and only fires once the turn ends. The greet is replayed
+only after a brand-new transcript proves the clear actually happened; if it never
+lands, nothing is greeted (recover with `gent-hello "<note>"`).
+USAGE
+    exit 0
+    ;;
+esac
+
 PANE="gent:claude"
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 PROJ="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
