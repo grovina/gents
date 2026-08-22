@@ -153,32 +153,52 @@ Opt a box in via its `gent.json`:
 ```
 
 On that cadence the box's pane gets a one-line nudge — *"good stopping point?
-wrap up, commit, save memory, then run `gent-clear`."* Nothing is cleared by the
-timer. The agent, when **it** judges it's ready, runs the in-box command
-**`gent-clear`**, which does the mechanical part: send `/clear` into its own
-pane, then replay the box's hello to re-orient the fresh session. Mid-task? It
-ignores the nudge and gets poked again next interval. `every` takes
-`s`/`m`/`h`/`d` suffixes (bare number = seconds); no `clear` key → no nudge.
+wrap up, commit, save memory, then run `gent-clear -m "<what's next>"`."*
+Nothing is cleared by the timer. The agent, when **it** judges it's ready, runs
+the in-box command **`gent-clear`**, which does the mechanical part: send
+`/clear` into its own pane, then replay the box's hello to re-orient the fresh
+session. Mid-task? It ignores the nudge and gets poked again next interval.
+`every` takes `s`/`m`/`h`/`d` suffixes (bare number = seconds); no `clear` key →
+no nudge.
 
 ### Handing work across the clear
 
 A clear is amnesia: the fresh session has the hello, so it knows *who it is* —
 but not what you were in the middle of. Anything that should survive goes in the
-optional **note**, an instruction the agent writes to its post-clear self:
+**handoff**, an instruction the agent writes to its post-clear self:
 
 ```bash
-gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+gent-clear -m "PR #42 is green but unmerged — merge it, then resume the backlog"
 ```
 
-The note is delivered with the hello as the fresh session's first prompt (brief
-above, note below), so the box wakes up oriented **and** pointed. Write it for a
+It's delivered with the hello as the fresh session's first prompt (brief above,
+handoff below), so the box wakes up oriented **and** pointed. Write it for a
 reader who remembers nothing: name the task, the branch, the next step — not
-"continue where I left off". Truly finished, nothing carrying over? Omit it and
-`gent-clear` behaves exactly as before.
+"continue where I left off".
 
-Anything durable still belongs in a commit or memory — the note is a pointer to
-the work, not the record of it. It's dropped if the clear never lands (the old
+Anything durable still belongs in a commit or memory — the handoff is a pointer
+to the work, not the record of it. It's dropped if the clear never lands (the old
 context is intact, so there's nothing to hand off).
+
+**`gent-clear` parses like `git commit`.** The handoff arrives only via `-m`;
+anything else is a usage error that clears nothing. That's deliberate: the note
+used to be a bare positional, so *every* argument was a note — an agent running
+`gent-clear --help` to read the manual wiped its own context instead. A command
+whose job is destroying context can't have a swallow-anything argument.
+
+Bare `gent-clear` therefore clears nothing either. Like `git commit` with no
+`-m`, it opens a draft — `~/.local/state/gent/handoff.md`, pre-filled with
+commented instructions — and stops. Write the handoff into it and run
+`gent-clear --file` to spend it; the draft is consumed (moved aside to
+`.sent`) so it can never be re-handed to a later session. Leave it untouched and
+`--file` still clears, just with nothing handed over — that's the dismissal, and
+`gent-clear --none` is the same answer in one step. So "no handoff" stays
+reachable, but only as something you said, never as something you fell into.
+
+Whichever clearing form it uses (`-m`, `--file`, `--none`), it must be the
+agent's **final action** with no output after: `gent-clear` runs through the Bash
+tool, so the pane is busy and the `/clear` keystroke queues behind the current
+turn. Staging the draft is the exception — that one is mid-turn by design.
 
 ## A custom "hi" per box — `.gent/hello.md`
 

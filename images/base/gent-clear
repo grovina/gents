@@ -1,22 +1,38 @@
 #!/usr/bin/env bash
-# gent-clear [note] — do exactly what typing /clear does in THIS box's claude
-# session, then re-greet the fresh session with the box's hello — but ONLY once
-# the clear is observed to have actually landed.
+# gent-clear — do exactly what typing /clear does in THIS box's claude session,
+# then re-greet the fresh session with the box's hello — but ONLY once the clear
+# is observed to have actually landed.
 #
-# The optional [note] is a HANDOFF to your post-clear self, delivered with the
-# hello as the fresh session's first prompt:
+#   gent-clear -m "PR #42 is green but unmerged — merge it, then resume backlog"
+#   gent-clear              # no note yet → stages a DRAFT and clears NOTHING
+#   gent-clear --file       # clear, taking the handoff from that draft
+#   gent-clear --none       # clear with no handoff at all
 #
-#   gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+# WHY THIS PARSES LIKE `git commit`. It used to take a bare positional note, so
+# every argument was a note — including `--help`. An agent reaching for the
+# manual wiped its own context instead. Twice. A command whose whole job is to
+# destroy context cannot have a "swallow anything" argument, so now:
 #
-# Write it as an instruction TO a fresh session that remembers nothing: name the
-# task, the branch, the file, the next step. Without one, a cleared box wakes up
-# oriented (it has the hello) but idle — it knows who it is, not what you were in
-# the middle of. Skip it only when you're truly finished and nothing carries over.
+#   * the note arrives ONLY via -m / --file — never from a stray argument;
+#   * any unknown or malformed argument is a usage error, and clears nothing;
+#   * a bare `gent-clear` clears nothing either — it opens a draft to write the
+#     handoff into, the way `git commit` with no -m opens an editor.
 #
-# The MODEL runs this as its FINAL action. gent-clear runs via the Bash tool, so
-# the pane is busy and the "/clear" keystroke QUEUES behind the current turn; it
-# fires once the turn ends. So output nothing after calling gent-clear — anything
-# you say keeps the turn alive and delays (or strands) the clear.
+# Nothing you can typo at this command costs you a session.
+#
+# THE HANDOFF is an instruction TO your post-clear self, delivered with the hello
+# as the fresh session's first prompt. Write it for a reader that remembers
+# nothing: name the task, the branch, the file, the next step. Without one a
+# cleared box wakes up oriented (it has the hello) but idle — it knows who it is,
+# not what you were in the middle of. Which is why "no note" is a thing you say
+# on purpose (`--none`, or an untouched draft), not a thing you get by default.
+#
+# RUN IT AS YOUR FINAL ACTION — that means the -m / --file / --none forms, the
+# ones that actually clear. gent-clear runs via the Bash tool, so the pane is
+# busy and the "/clear" keystroke QUEUES behind the current turn; it fires once
+# the turn ends. So output nothing after calling those — anything you say keeps
+# the turn alive and delays (or strands) the clear. The bare staging form is the
+# opposite: it's a mid-turn step, and you're expected to keep working after it.
 #
 # `/clear` does not edit the current transcript: it FREEZES it and starts a brand-
 # new <id>.jsonl. We use that new file as PROOF the clear happened — only once it
@@ -33,41 +49,119 @@
 # here; the clear sticks on its own.
 set -u
 
-case "${1-}" in
-  -h|--help)
-    cat <<'USAGE'
-gent-clear [note] — do what typing /clear does in this box's claude session,
-then re-greet the fresh session with the box's hello, once the clear lands.
+STATE="${GENT_STATE_DIR:-$HOME/.local/state/gent}"
+DRAFT="${GENT_HANDOFF_PATH:-$STATE/handoff.md}"
 
-  gent-clear
-  gent-clear "PR #42 is green but unmerged — merge it, then resume the backlog"
+synopsis() {
+  cat <<USAGE
+gent-clear — /clear this box's claude session, then re-greet it.
 
-The optional note is a HANDOFF to your post-clear self, delivered with the hello
+  gent-clear -m "<handoff>"   clear, handing that note to the fresh session
+  gent-clear                  stage a handoff draft — CLEARS NOTHING
+  gent-clear --file [path]    clear, taking the handoff from the draft
+                              (default: $DRAFT)
+  gent-clear --none           clear with no handoff at all
+  gent-clear --help           this, in full
+USAGE
+}
+
+usage() {
+  synopsis
+  cat <<'USAGE'
+
+The handoff is a HANDOFF to your post-clear self, delivered with the box's hello
 as the fresh session's first prompt. Write it as an instruction TO a session that
 remembers nothing: name the task, the branch, the file, the next step. Without
-one, a cleared box wakes up oriented but idle. Skip it only when you're truly
-finished and nothing carries over.
+one, a cleared box wakes up oriented but idle — so "no handoff" is something you
+say deliberately (--none, or an untouched draft), not something you fall into.
 
-Run it as your FINAL action and output nothing after: the /clear keystroke queues
-behind the current turn and only fires once the turn ends. The greet is replayed
-only after a brand-new transcript proves the clear actually happened; if it never
-lands, nothing is greeted (recover with `gent-hello "<note>"`).
+Bare `gent-clear` never clears: it writes a draft file, tells you where, and
+waits. Write the handoff into it, then `gent-clear --file`. Leave it untouched
+and `--file` still clears — just with nothing handed over.
+
+The clearing forms (-m / --file / --none) must be your FINAL action, with no
+output after: the /clear keystroke queues behind the current turn and only fires
+once the turn ends. The greet is replayed only after a brand-new transcript
+proves the clear actually happened; if it never lands, nothing is greeted
+(recover with `gent-hello "<note>"`).
 USAGE
+}
+
+# Everything below the comment lines, with leading blank lines trimmed ($(...)
+# eats the trailing ones). All-comments or absent ⇒ empty ⇒ "no handoff".
+draft_note() { [ -f "$DRAFT" ] && sed -e '/^[[:space:]]*#/d' -e '/./,$!d' "$DRAFT"; }
+
+MODE=stage NOTE=""
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -m|--message)
+      [ "$#" -ge 2 ] || { echo "gent-clear: -m needs a note (nothing cleared)" >&2; synopsis >&2; exit 2; }
+      MODE=clear NOTE="$2"; shift 2 ;;
+    -f|--file)
+      MODE=from-draft
+      if [ "$#" -ge 2 ]; then DRAFT="$2"; shift 2; else shift; fi ;;
+    -n|--none|--no-note) MODE=clear NOTE=""; shift ;;
+    -*) echo "gent-clear: unknown option: $1 (nothing cleared)" >&2; synopsis >&2; exit 2 ;;
+    # The old shape. Loud rather than helpful-by-guessing: a bare argument is
+    # exactly what used to turn `--help` into a wiped session.
+    *) echo "gent-clear: a bare argument is not a handoff any more — use -m (nothing cleared)" >&2
+       echo "gent-clear: did you mean:  gent-clear -m \"$1\"" >&2
+       synopsis >&2; exit 2 ;;
+  esac
+  [ "$#" -eq 0 ] || { echo "gent-clear: unexpected extra argument: $1 (nothing cleared)" >&2; synopsis >&2; exit 2; }
+fi
+
+# --- stage: write the draft, clear nothing -----------------------------------
+if [ "$MODE" = stage ]; then
+  pending="$(draft_note || true)"
+  if [ -n "$pending" ]; then
+    # A draft with real content is someone's unfinished handoff — never clobber
+    # it, just show it back and point at the command that spends it.
+    echo "gent-clear: NOTHING CLEARED — a handoff draft is already waiting at $DRAFT:" >&2
+    printf '%s\n' "$pending" | sed 's/^/  | /' >&2
+    echo "gent-clear: clear with it -> gent-clear --file   |   rewrite it first, or gent-clear --none" >&2
     exit 0
-    ;;
-esac
+  fi
+  mkdir -p "$(dirname "$DRAFT")" 2>/dev/null || true
+  cat > "$DRAFT" <<'TEMPLATE'
+# Handoff to your post-clear self. Everything below the '#' lines is sent to the
+# fresh session together with the box's hello, as its very first prompt.
+#
+# It remembers NOTHING. Name the task, the branch, the file, the next step —
+# instructions TO it, not notes about it. Multi-line is fine.
+#
+# Then run:  gent-clear --file
+# Nothing carries over? Leave this untouched and run `gent-clear --file` anyway
+# (or `gent-clear --none`) — the session still clears, just with no handoff.
+TEMPLATE
+  echo "gent-clear: NOTHING CLEARED YET — write your handoff into $DRAFT, then run: gent-clear --file" >&2
+  echo "gent-clear: truly finished and nothing carries over? gent-clear --none" >&2
+  exit 0
+fi
+
+# --- from-draft: spend the draft ---------------------------------------------
+if [ "$MODE" = from-draft ]; then
+  [ -f "$DRAFT" ] || { echo "gent-clear: no handoff draft at $DRAFT (nothing cleared) — run bare \`gent-clear\` to start one, or \`gent-clear --none\`" >&2; exit 2; }
+  NOTE="$(draft_note)"
+  # Untouched draft = the dismissal. Clearing with no handoff is a legitimate
+  # answer; it just has to be one you gave.
+  [ -n "$NOTE" ] || echo "gent-clear: draft left empty — clearing with no handoff" >&2
+fi
 
 PANE="gent:claude"
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 PROJ="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
-# "$*" so the note survives either shape: one quoted arg (the normal form — keeps
-# its newlines, so a multi-line handoff lands whole) or several bare words.
-NOTE="$*"
 
 if ! tmux has-session -t gent 2>/dev/null; then
   echo "gent-clear: no 'gent' tmux session — nothing to clear" >&2
   exit 1
 fi
+
+# The draft is spent the moment we commit to the clear: keep it as .sent for
+# forensics, but out of the way, so a later bare `gent-clear` starts fresh
+# instead of re-handing an old note to an unrelated session.
+[ "$MODE" = from-draft ] && mv -f "$DRAFT" "$DRAFT.sent" 2>/dev/null
 
 # The session transcripts that exist RIGHT NOW. /clear starts a brand-new one, so
 # the watcher waits for a filename to APPEAR — the whole (name-sorted) listing is
@@ -109,7 +203,7 @@ setsid bash -c '
 ' </dev/null >/dev/null 2>&1 &
 
 if [ -n "$NOTE" ]; then
-  echo "gent-clear: /clear queued; once it lands the fresh session gets the hello + your note" >&2
+  echo "gent-clear: /clear queued; once it lands the fresh session gets the hello + your handoff" >&2
 else
-  echo "gent-clear: /clear queued; the fresh session will be re-greeted once it lands" >&2
+  echo "gent-clear: /clear queued; the fresh session will be re-greeted (no handoff) once it lands" >&2
 fi
