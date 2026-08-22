@@ -200,6 +200,24 @@ agent's **final action** with no output after: `gent-clear` runs through the Bas
 tool, so the pane is busy and the `/clear` keystroke queues behind the current
 turn. Staging the draft is the exception — that one is mid-turn by design.
 
+### The host session clears the same way
+
+`gent-clear` lives in the image, so for a long time it reached every box and not
+the one session running on the host itself — even though `gent host up` treats
+that session as a claude session like any other, in-repo memory and all. It
+accreted context forever with nowhere to hand off.
+
+```bash
+gent host clear -m "PR #42 is green but unmerged — merge it, then resume"
+```
+
+`gent host clear` runs **the same script the boxes run**, pointed at the host's
+tmux session via `GENT_TMUX_SESSION` (unset → `gent`, so boxes are unchanged).
+The flags are identical: `-m`, `--file`, `--none`, and bare stages a draft. It
+delegates rather than reimplements — the queued keystroke, the
+prove-it-by-a-new-transcript check and the idle-gated greet are subtle enough
+that a second copy would drift from the first the moment either changed.
+
 ## A custom "hi" per box — `.gent/hello.md`
 
 Drop a `.gent/hello.md` in the repo and gents replays it into the claude pane as
