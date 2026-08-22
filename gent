@@ -1252,6 +1252,46 @@ def cmd_host_up(fleet, a):
     print(f"      attach: gent host attach   |   stop: tmux kill-session -t {name}")
 
 
+def cmd_host_clear(fleet, a):
+    """`/clear` the host's own claude session, then re-greet it — the box command,
+    pointed at the host's tmux session.
+
+    ⚠ THE HOST SESSION HAD NO WAY TO DO THIS, which is the gap this closes. Boxes get a periodic
+    clear-nudge and `gent-clear` baked into the image; the host session gets neither, even though
+    `cmd_host_up` calls it "a claude session like any other" and gives its repo the same in-repo
+    memory a box gets. So it accreted context forever with no way to hand off across a reset.
+
+    ★ DELEGATES to images/base/gent-clear rather than reimplementing it. That script carries a lot
+    of hard-won care — the /clear keystroke QUEUES behind the running turn, the clear is only
+    believed once a brand-new transcript appears, the greet waits for the fresh TUI to go idle —
+    and a second copy here would drift from it the first time either changed. The only thing that
+    differs between a box and the host is the tmux session name, so that is the only thing passed.
+    """
+    name = host_name(fleet)
+    if not have_tmux():
+        die("host sessions need tmux.")
+    if not tmux_has(name):
+        die(f"host session '{name}' not running — `gent host up` first.")
+    script = HERE / "images" / "base" / "gent-clear"
+    if not script.is_file():
+        die(f"{script} is missing — it is the one implementation, shared with the boxes.")
+    cwd = host_session_cwd(name) or Path.cwd()
+    env = {**os.environ,
+           "GENT_TMUX_SESSION": name,
+           # the transcript dir gent-clear watches is keyed on the session's working dir
+           "GENT_REPO_DIR": str(cwd),
+           # gent-hello sits beside it and is what actually delivers the handoff note
+           "PATH": f"{script.parent}{os.pathsep}{os.environ.get('PATH', '')}"}
+    argv = [str(script)]
+    if getattr(a, "message", None):
+        argv += ["-m", a.message]
+    elif getattr(a, "none", False):
+        argv += ["--none"]
+    elif getattr(a, "file", False):
+        argv += ["--file"]
+    raise SystemExit(subprocess.run(argv, env=env).returncode)
+
+
 def cmd_host_attach(fleet, a):
     name = host_name(fleet)
     if not tmux_has(name):
@@ -1710,6 +1750,10 @@ def main():
     hup.add_argument("--cwd", help="working dir for the session (default: current dir)")
     hdn = hsub.add_parser("down", help="stop the host session (kill tmux + remove run script)")
     hdn.add_argument("--keepalive", action="store_true", help="also remove the launchd keepalive + boot-autostart jobs")
+    hc = hsub.add_parser("clear", help="/clear the host's own session, then re-greet it (same command the boxes run)")
+    hc.add_argument("-m", "--message", help="handoff note for your post-clear self")
+    hc.add_argument("--none", action="store_true", help="clear with no handoff at all")
+    hc.add_argument("--file", action="store_true", help="clear, taking the handoff from the staged draft")
     hsub.add_parser("attach", help="attach to the host session")
     hsub.add_parser("status", help="show session state + token expiry + keepalive job")
     hk = hsub.add_parser("keepalive", help="poke/bounce the host session so idle Remote Control survives (for cron)")

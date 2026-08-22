@@ -149,12 +149,18 @@ if [ "$MODE" = from-draft ]; then
   [ -n "$NOTE" ] || echo "gent-clear: draft left empty — clearing with no handoff" >&2
 fi
 
-PANE="gent:claude"
+# WHICH SESSION. Boxes run their claude in tmux session `gent`; the HOST runs its own in a session
+# named by fleet.json (`host` by default), and that session is a claude session like any other —
+# `gent host up` even gives its repo the same in-repo memory a box gets. It just had no way to
+# clear itself, because this script named `gent` in four places. So the session is a parameter with
+# the box default baked in: unset -> `gent`, and every box behaves exactly as before.
+SESSION="${GENT_TMUX_SESSION:-gent}"
+PANE="$SESSION:claude"
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 PROJ="$HOME/.claude/projects/$(printf '%s' "$REPO" | sed 's#/#-#g')"
 
-if ! tmux has-session -t gent 2>/dev/null; then
-  echo "gent-clear: no 'gent' tmux session — nothing to clear" >&2
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "gent-clear: no '$SESSION' tmux session — nothing to clear" >&2
   exit 1
 fi
 
@@ -178,11 +184,11 @@ tmux send-keys -t "$PANE" "/clear" Enter
 # Detached watcher (setsid + closed stdio) so it OUTLIVES both this Bash tool call
 # and the model turn that ends right after: wait for the clear to land, then — once
 # the fresh TUI settles — replay the hello.
-export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before" GENT_NOTE="$NOTE"
+export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before" GENT_NOTE="$NOTE" GENT_SESSION="$SESSION"
 setsid bash -c '
   cleared=0
   for _ in $(seq 1 300); do
-    tmux has-session -t gent 2>/dev/null || exit 0
+    tmux has-session -t "$GENT_SESSION" 2>/dev/null || exit 0
     now="$(ls "$GENT_PROJ"/*.jsonl 2>/dev/null || true)"
     [ -n "$now" ] && [ "$now" != "$GENT_BEFORE" ] && { cleared=1; break; }
     sleep 1
@@ -192,7 +198,7 @@ setsid bash -c '
   # unchanged for a few seconds and not showing "esc to interrupt" — then greet.
   prev=""; stable=0; ready=0
   for _ in $(seq 1 300); do
-    tmux has-session -t gent 2>/dev/null || exit 0
+    tmux has-session -t "$GENT_SESSION" 2>/dev/null || exit 0
     cur="$(tmux capture-pane -p -t "$GENT_PANE" 2>/dev/null || true)"
     if [ -n "$cur" ] && [ "$cur" = "$prev" ] && ! printf "%s" "$cur" | grep -q "esc to interrupt"; then
       stable=$((stable + 1)); [ "$stable" -ge 3 ] && { ready=1; break; }
