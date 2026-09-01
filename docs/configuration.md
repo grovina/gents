@@ -49,6 +49,70 @@ or in the cloud; the box is the *agent* — the claude session plus a thin daemo
 that feeds it. Anything LAN- or device-bound stays on the host, reachable from
 the box at `host.docker.internal`.
 
+## ⚠ Running a one-off command in the image — always `--entrypoint`
+
+The consequence of the section above: the image's `ENTRYPOINT` is `bootstrap`,
+which runs the repo's `.gent/setup.sh` and then **starts every service the repo
+declares**. That is what you want from `gent up`. It is emphatically not what you
+want when you just need a shell, a test run, or a one-off build in the same
+environment — because with the repo mounted, a plain
+
+```bash
+docker run --rm -v "$PWD":/repo <image> ...          # ✗ boots a whole box
+```
+
+starts a **second copy of every sidecar**, against whatever real state you
+mounted: the repo's live data directory, and any `--network` you attached. A
+duplicated poller or event bridge writing alongside the real one is the kind of
+fault that looks like a haunted daemon for a week.
+
+Two things make it worse than a stray container usually is:
+
+- **A host-side `timeout` kills the `docker run` *client*, not the container**,
+  so `--rm` never fires and the services keep running after your command
+  "ended". After any run that timed out, check with
+  `docker ps --filter ancestor=<image>`.
+- The container is unnamed, so it is easy to miss in `docker ps` among the boxes.
+
+**The safe form is one flag:**
+
+```bash
+docker run --rm --entrypoint bash -u 1000 \
+  -v "$PWD":/repo -w /repo <image> -lc '<command>'
+```
+
+`--entrypoint bash` skips `bootstrap` entirely: no `setup.sh`, no services.
+
+ⓘ The trade-off is real and worth knowing before it confuses you: `setup.sh` is
+also what installs the repo's own dependencies, so with the entrypoint overridden
+they are absent. A tool that worked inside the box fails here with a missing
+module. Install what that one command needs and no more.
+
+### Running a counterfactual — "was this failing before my change?"
+
+The reason to reach for the image at all is usually to answer that question. The
+approach that does *not* work is a `git worktree` of the old commit: a worktree
+holds only tracked files, and anything gitignored — a data directory, a `.env`, a
+built payload — is missing, so the command fails for a reason that has nothing to
+do with the change you are testing.
+
+What works is the inverse. Mount the **real** tree, then bind-mount a copy of
+just the files you want to differ, read-only, over their own paths:
+
+```bash
+git show HEAD:path/to/file.ts > /tmp/file.head.ts
+docker run --rm --entrypoint bash -u 1000 \
+  -v "$PWD":/repo \
+  -v /tmp/file.head.ts:/repo/path/to/file.ts:ro \
+  -w /repo <image> -lc '<the failing command>'
+```
+
+The container sees a complete tree with one file swapped, and the working tree is
+never touched. That last part matters whenever something else may be writing the
+repo — another session, a running daemon, a scheduled job: it is also how to run
+a **sabotage control** (break the thing on purpose, confirm the check goes red)
+without a broken file ever existing on disk where something else could commit it.
+
 ## The event bus — one Monitor, many sources
 
 A box's async wake-ups — an inbound Telegram message, a due reminder, a cron slot
