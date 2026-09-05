@@ -396,8 +396,13 @@ fi
 # box-supervised processes, NOT as harness Monitors; only the thin final Monitor
 # hop is session-bound/harness-droppable, and the watchdog re-arms it (poking the
 # pane, since only the MODEL can arm a harness Monitor) + has the model reconcile
-# from the durable spines. (It survives /clear — verified — so gent-clear leaves it
-# alone.) Config in gent.json:
+# from the durable spines. (The DURABLE HALF survives /clear — the sources keep
+# writing the stream, so gent-clear leaves them alone. ⚠ THE MONITOR ITSELF DOES
+# NOT, and reading this line as if it did is what cost 49 minutes on 2026-09-05:
+# homer cleared at 09:20:20Z and the watchdog logged the Monitor DOWN at 09:21:24Z,
+# 64 s later. Re-arming is the fresh session's job, which is what the poke below is
+# for — a clear ALWAYS leaves the box deaf until the model re-arms.) Config in
+# gent.json:
 #   .telegram {watch,reconcile}  → telegram box: bridge + Monitor `gent-events watch`
 #   .events {path,cron,tz}       → stream / cron-file paths (relative = repo-anchored)
 #                                  + cron TZ; defaults $GENT_STATE_DIR/{events.jsonl,
@@ -516,6 +521,15 @@ if [ "$EVENT_BUS" = 1 ]; then
         else stable=0; fi
         prev="$cur"; sleep 1
       done
+      # ⚠⚠ THE KNOWN HOLE, MEASURED 2026-09-05: a busy pane starves the poke, and a
+      # busy pane is exactly when wakes are piling up. homer cleared at 09:20:20Z and
+      # ran five-minute suite calls back to back; the watchdog logged 24 DOWNs and 24
+      # deferrals between 09:21 and 10:10 and re-armed ZERO times, while eight family
+      # messages sat unread for up to 50 minutes. The mechanism is not broken — the
+      # same log holds 68 lifetime re-arms against 42 deferrals — it just cannot win
+      # against a session that never breathes. The deferral is DELIBERATE (a bare
+      # send-keys into a busy pane leaves the text sitting in the composer), but the
+      # cost of never escalating is a deaf box, and nothing but this log says so.
       [ "$ready" = 1 ] || { _wlog "pane never idle within ~2min; deferring poke"; continue; }
       printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
