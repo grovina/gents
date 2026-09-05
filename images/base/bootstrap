@@ -396,13 +396,15 @@ fi
 # box-supervised processes, NOT as harness Monitors; only the thin final Monitor
 # hop is session-bound/harness-droppable, and the watchdog re-arms it (poking the
 # pane, since only the MODEL can arm a harness Monitor) + has the model reconcile
-# from the durable spines. (The DURABLE HALF survives /clear — the sources keep
-# writing the stream, so gent-clear leaves them alone. ⚠ THE MONITOR ITSELF DOES
-# NOT, and reading this line as if it did is what cost 49 minutes on 2026-09-05:
-# homer cleared at 09:20:20Z and the watchdog logged the Monitor DOWN at 09:21:24Z,
-# 64 s later. Re-arming is the fresh session's job, which is what the poke below is
-# for — a clear ALWAYS leaves the box deaf until the model re-arms.) Config in
-# gent.json:
+# from the durable spines. (It survives /clear — verified, and re-verified on
+# 2026-09-05: homer cleared at 10:22:03Z and the `tail` kept running, same pid,
+# 18 min later — so gent-clear leaves it alone. ⚠ WHAT DOES KILL IT IS THE CLAUDE
+# PROCESS RESTARTING, which drops every harness Monitor, and a restart can follow a
+# clear closely enough to look like one: at 09:20:20Z that morning homer cleared,
+# ~9 s later the process exited, and the supervisor respawned it at 09:20:29Z with
+# `--resume 8f0ec086`. The watchdog logged the Monitor DOWN at 09:21:24Z. Two of us
+# read that as "the clear killed it" and it was the RESPAWN — the tell is a new
+# claude pid, not a new transcript.) Config in gent.json:
 #   .telegram {watch,reconcile}  → telegram box: bridge + Monitor `gent-events watch`
 #   .events {path,cron,tz}       → stream / cron-file paths (relative = repo-anchored)
 #                                  + cron TZ; defaults $GENT_STATE_DIR/{events.jsonl,
@@ -522,7 +524,7 @@ if [ "$EVENT_BUS" = 1 ]; then
         prev="$cur"; sleep 1
       done
       # ⚠⚠ THE KNOWN HOLE, MEASURED 2026-09-05: a busy pane starves the poke, and a
-      # busy pane is exactly when wakes are piling up. homer cleared at 09:20:20Z and
+      # busy pane is exactly when wakes are piling up. homer's claude respawned at 09:20:29Z and
       # ran five-minute suite calls back to back; the watchdog logged 24 DOWNs and 24
       # deferrals between 09:21 and 10:10 and re-armed ZERO times, while eight family
       # messages sat unread for up to 50 minutes. The mechanism is not broken — the
