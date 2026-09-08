@@ -6,6 +6,7 @@
 #   gent-clear -m "PR #42 is green but unmerged — merge it, then resume backlog"
 #   gent-clear              # no note yet → stages a DRAFT and clears NOTHING
 #   gent-clear --file       # clear, taking the handoff from that draft
+#   gent-clear -f NOTE.md   # ...or from any file you name
 #   gent-clear --none       # clear with no handoff at all
 #
 # WHY THIS PARSES LIKE `git commit`. It used to take a bare positional note, so
