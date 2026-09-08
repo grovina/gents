@@ -210,20 +210,39 @@ nuke a box mid-task, before it's written down what mattered. So gents splits it:
 a timer only **nudges**, and the **model** decides when it's safe to clear and
 pulls the trigger itself.
 
-Opt a box in via its `gent.json`:
+Opt a box in via its `gent.json` — on a cadence, on **context size**, or both:
 
 ```json
-"clear": { "every": "6h" }
+"clear": { "every": "6h", "atTokens": 300000 }
 ```
 
-On that cadence the box's pane gets a one-line nudge — *"good stopping point?
-wrap up, commit, save memory, then run `gent-clear -m "<what's next>"`."*
-Nothing is cleared by the timer. The agent, when **it** judges it's ready, runs
-the in-box command **`gent-clear`**, which does the mechanical part: send
-`/clear` into its own pane, then replay the box's hello to re-orient the fresh
-session. Mid-task? It ignores the nudge and gets poked again next interval.
-`every` takes `s`/`m`/`h`/`d` suffixes (bare number = seconds); no `clear` key →
-no nudge.
+The box's pane gets a one-line nudge — *"good stopping point? wrap up, commit,
+save memory, then run `gent-clear -m "<what's next>"`."* Nothing is cleared by
+the nudge. The agent, when **it** judges it's ready, runs the in-box command
+**`gent-clear`**, which does the mechanical part: send `/clear` into its own
+pane, then replay the box's hello to re-orient the fresh session. Mid-task? It
+ignores the nudge and gets poked again later. No `clear` key → no nudge.
+
+- **`every`** — a plain cadence. Takes `s`/`m`/`h`/`d` suffixes (bare number =
+  seconds).
+- **`atTokens`** — nudge when the session's context passes this many tokens.
+
+**Prefer `atTokens`.** A cadence fires whether or not the session is actually
+full, so a box that worked hard for twenty minutes is nudged at the same moment
+as one that idled for six hours — which is how a nudge teaches its reader to
+dismiss it. The size trigger reads the real number: every assistant turn in the
+session transcript records its `usage`, and `input_tokens` +
+`cache_read_input_tokens` + `cache_creation_input_tokens` is exactly the context
+that turn was sent. Keep `every` alongside it as a floor for a session that
+stays small but goes stale.
+
+The size nudge names the number it saw, so the agent can judge for itself. It
+re-arms when a clear actually lands (a `/clear` starts a fresh transcript, and
+the reading drops with it — there is no high-water mark to reset), and otherwise
+stays quiet until the context has grown by another quarter of the threshold. So
+ignoring one nudge is not punished every minute, but a session that keeps
+growing is told again. A transcript that cannot be read counts as `0` and can
+never trip the threshold — the failure direction is silence, not a false alarm.
 
 ### Handing work across the clear
 

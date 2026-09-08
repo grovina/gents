@@ -310,26 +310,42 @@ if [ -s "$REPO/.gent/hello.md" ]; then
   ) &
 fi
 
-# Periodic context-refresh NUDGE. If the repo's gent.json sets clear.every (e.g.
-# "6h"), poke the claude pane on that cadence with an invitation to wrap up and
-# run `gent-clear`. This is the ONLY thing on a timer — it never clears anything
-# itself. The MODEL decides whether/when it's actually ready (work checkpointed,
-# durable state saved) and runs `gent-clear`, which does the /clear + replays
-# .gent/hello.md. Opt-in: no clear.every → no nudge loop. Backgrounded as a child
-# of PID 1, so it dies with the container; it also self-exits if the session goes.
+# Context-refresh NUDGE, on a CADENCE and/or on real CONTEXT SIZE. If the repo's gent.json
+# sets clear.every (e.g. "6h") and/or clear.atTokens (e.g. 300000), poke the claude pane with
+# an invitation to wrap up and run `gent-clear`. This never clears anything itself. The MODEL
+# decides whether/when it's actually ready (work checkpointed, durable state saved) and runs
+# `gent-clear`, which does the /clear + replays .gent/hello.md. Opt-in: neither key → no nudge
+# loop. Backgrounded as a child of PID 1, so it dies with the container; it also self-exits if
+# the session goes.
 #
-# IDLE-SKIP: we only nudge when something has actually happened since our last
-# baseline. Without this, an idle box churns forever — it clears, the fresh
-# session holds only the hello, the next nudge fires into it, and since "idle" IS
-# a good stopping point the model clears AGAIN: an empty clear + re-greet every
-# cadence on a quiet box. The newest transcript's path+size is the activity
-# fingerprint (a /clear starts a fresh <id>.jsonl; turns append; a fully idle
-# interval — including a pristine post-clear session — leaves it identical), so an
-# unchanged fingerprint means "nothing happened, including the last clear" → skip.
-CLEAR_EVERY_RAW=""
+# ★★ WHY SIZE, AND WHY BOTH ARE KEPT. A cadence fires whether or not the session is actually
+# full — a box that worked hard for twenty minutes is nudged at the same moment as one that
+# idled for six hours, which is how a nudge trains its reader to dismiss it. The transcript
+# already knows the true number: every assistant turn records `usage`, and
+# input_tokens + cache_read_input_tokens + cache_creation_input_tokens IS the context that
+# turn was sent. `atTokens` nudges on that; `every` stays useful as a floor for a session that
+# is small but stale. Either alone is a valid config.
+# ⚠ IT IS THE LAST TURN'S NUMBER, NOT A HIGH-WATER MARK. After a /clear the newest transcript
+#   is a new file whose first turns are small, so the reading drops on its own — no reset to
+#   remember, and a stale large number cannot survive a clear.
+# ⓘ Bounded read: only the transcript's last 2 MB is parsed. The figure we want is on the most
+#   recent turn, and a long session's file can reach tens of MB — re-reading all of it once a
+#   minute would be real I/O for a number that only ever lives at the end.
+#
+# IDLE-SKIP: we only nudge when something has actually happened since our last baseline.
+# Without this, an idle box churns forever — it clears, the fresh session holds only the
+# hello, the next nudge fires into it, and since "idle" IS a good stopping point the model
+# clears AGAIN: an empty clear + re-greet every cadence on a quiet box. The newest
+# transcript's path+size is the activity fingerprint (a /clear starts a fresh <id>.jsonl;
+# turns append; a fully idle interval — including a pristine post-clear session — leaves it
+# identical), so an unchanged fingerprint means "nothing happened, including the last clear"
+# → skip.
+CLEAR_EVERY_RAW=""; CLEAR_AT_TOKENS_RAW=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   CLEAR_EVERY_RAW="$(jq -r '.clear.every // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  CLEAR_AT_TOKENS_RAW="$(jq -r '.clear.atTokens // empty' "$REPO/gent.json" 2>/dev/null || true)"
 fi
+CLEAR_EVERY_SEC=0
 if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -qE '^[0-9]+$'; then
   _n="${CLEAR_EVERY_RAW%[smhd]}"; _u="${CLEAR_EVERY_RAW#"$_n"}"
   case "$_u" in
@@ -339,16 +355,78 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
     d)    CLEAR_EVERY_SEC=$((_n * 86400)) ;;
     *)    CLEAR_EVERY_SEC=0 ;;
   esac
-  if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ]; then
-    NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then reset your context with \`gent-clear -m \"<what to pick up next>\"\` as your final action. Your fresh self remembers nothing, so name the task and the next step (bare \`gent-clear\` clears nothing — it just opens a draft to write that handoff in; \`gent-clear --none\` if truly nothing carries over). Mid-task? Ignore this; you'll be nudged again later."
-    echo "gents: periodic clear nudge every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)" >&2
+fi
+CLEAR_AT_TOKENS=0
+printf '%s' "$CLEAR_AT_TOKENS_RAW" | grep -qE '^[0-9]+$' && CLEAR_AT_TOKENS="$CLEAR_AT_TOKENS_RAW"
+if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] || [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ]; then
+    NUDGE_TAIL="wrap up — commit anything worth keeping, save durable notes to memory — then reset your context with \`gent-clear -m \"<what to pick up next>\"\` as your final action. Your fresh self remembers nothing, so name the task and the next step (bare \`gent-clear\` clears nothing — it just opens a draft to write that handoff in; \`gent-clear --none\` if truly nothing carries over). Mid-task? Ignore this; you'll be nudged again later."
+    _desc=""
+    [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] && _desc="every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)"
+    [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ] && _desc="${_desc:+$_desc, }at ${CLEAR_AT_TOKENS} context tokens"
+    echo "gents: clear nudge ${_desc}" >&2
     ( trap : INT
+      POLL_SEC=60
       fp() { local n; n="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true)"; [ -n "$n" ] && printf '%s:%s' "$n" "$(wc -c < "$n" 2>/dev/null || echo 0)"; }
-      base="$(fp)"
+      newest() { ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true; }
+      # Context size at the newest assistant turn, or 0 if it cannot be read. NEVER fabricates
+      # a number: an unparseable or missing transcript reads 0, which cannot trip a threshold.
+      ctx() {
+        local n; n="$(newest)"; [ -n "$n" ] || { echo 0; return; }
+        python3 - "$n" 2>/dev/null <<'PY' || echo 0
+import json, os, sys
+p = sys.argv[1]; best = 0
+try:
+    size = os.path.getsize(p)
+    with open(p, "rb") as fh:
+        if size > 2_000_000:
+            fh.seek(size - 2_000_000)
+            fh.readline()                      # drop the partial line the seek landed inside
+        for raw in fh:
+            try: d = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError: continue
+            m = d.get("message")
+            if not isinstance(m, dict): continue
+            u = m.get("usage")
+            if not isinstance(u, dict): continue
+            t = ((u.get("input_tokens") or 0)
+                 + (u.get("cache_read_input_tokens") or 0)
+                 + (u.get("cache_creation_input_tokens") or 0))
+            if t: best = t                     # last one wins: the most recent turn
+except OSError: pass
+print(best)
+PY
+      }
+      base="$(fp)"; waited=0; nudged_tokens=0; nudged_path=""
       while :; do
-        sleep "$CLEAR_EVERY_SEC"
+        sleep "$POLL_SEC"
         tmux has-session -t gent 2>/dev/null || exit 0
-        [ "$(fp)" = "$base" ] && continue   # nothing happened since last baseline (incl. an idle post-clear session) — skip
+        waited=$((waited + POLL_SEC))
+        TRIG=""
+        # SIZE first: it is the specific reason, and a session over the threshold should be
+        # told the number rather than "it has been six hours".
+        if [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ]; then
+          now_tokens="$(ctx)"; now_path="$(newest)"
+          if [ "${now_tokens:-0}" -ge "$CLEAR_AT_TOKENS" ]; then
+            # RE-ARM RULE: after a size nudge, stay quiet until either a clear actually landed
+            # (the transcript is a different file) or the context has grown by another quarter
+            # of the threshold — so ignoring one nudge is not punished every minute, but a
+            # session that keeps growing is told again.
+            if [ "$now_path" != "$nudged_path" ] || \
+               [ "${now_tokens:-0}" -ge $((nudged_tokens + CLEAR_AT_TOKENS / 4)) ]; then
+              TRIG="size"
+            fi
+          fi
+        fi
+        if [ -z "$TRIG" ] && [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] && [ "$waited" -ge "$CLEAR_EVERY_SEC" ]; then
+          TRIG="time"
+        fi
+        [ -n "$TRIG" ] || continue
+        [ "$(fp)" = "$base" ] && { [ "$TRIG" = "time" ] && waited=0; continue; }   # nothing happened since last baseline (incl. an idle post-clear session) — skip
+        if [ "$TRIG" = "size" ]; then
+          NUDGE_TEXT="🧠 Context is at ~${now_tokens} tokens, past this box's ${CLEAR_AT_TOKENS} mark — long enough that your recall of earlier turns is getting worse, not just longer. If you're at a good stopping point, ${NUDGE_TAIL}"
+        else
+          NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, ${NUDGE_TAIL}"
+        fi
         # Deliver only at an actual stopping point. A bare `send-keys "$text" Enter`
         # into a BUSY pane leaves the text unsent in the composer, where the next
         # nudge (and any `gent send`) stacks onto it — observed as fused nudges. And
@@ -365,10 +443,12 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
           else stable=0; fi
           prev="$cur"; sleep 1
         done
-        [ "$ready" = 1 ] || continue   # never idle within ~90s — skip; next cadence retries
+        [ "$ready" = 1 ] || continue   # never idle within ~90s — skip; next tick retries
         printf '%s' "$NUDGE_TEXT" | tmux load-buffer -b gent-nudge -
         tmux paste-buffer -b gent-nudge -t gent:claude -p -d
         tmux send-keys -t gent:claude Enter 2>/dev/null || true
+        waited=0
+        [ "$TRIG" = "size" ] && { nudged_tokens="${now_tokens:-0}"; nudged_path="$now_path"; }
         # Re-baseline AFTER the nudge is fully handled — wait for the session to go
         # quiescent (incl. any gent-clear: new transcript + re-greet), capped — so
         # the nudge's OWN churn isn't misread as fresh activity on the next tick.
@@ -383,7 +463,6 @@ if [ -n "$CLEAR_EVERY_RAW" ] && printf '%s' "${CLEAR_EVERY_RAW%[smhd]}" | grep -
         done
         base="$cur"
       done ) &
-  fi
 fi
 
 # Unified event bus + watchdog. The box surfaces every async wake-up — inbound
