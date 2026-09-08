@@ -1287,8 +1287,11 @@ def cmd_host_clear(fleet, a):
         argv += ["-m", a.message]
     elif getattr(a, "none", False):
         argv += ["--none"]
-    elif getattr(a, "file", False):
-        argv += ["--file"]
+    elif getattr(a, "file", None):
+        # ⚠ `--file` alone arrives as True (argparse `const`); `--file NOTE.md` as the string. The
+        #   script's own parser takes the path positionally after -f, so only pass one when there
+        #   is one — `["--file", "True"]` would look for a file named True and refuse to clear.
+        argv += ["--file"] + ([a.file] if isinstance(a.file, str) else [])
     raise SystemExit(subprocess.run(argv, env=env).returncode)
 
 
@@ -1753,7 +1756,12 @@ def main():
     hc = hsub.add_parser("clear", help="/clear the host's own session, then re-greet it (same command the boxes run)")
     hc.add_argument("-m", "--message", help="handoff note for your post-clear self")
     hc.add_argument("--none", action="store_true", help="clear with no handoff at all")
-    hc.add_argument("--file", action="store_true", help="clear, taking the handoff from the staged draft")
+    # ⓘ `nargs="?"` SO A PATH IS OPTIONAL, matching `gent-clear`'s own `-f [path]`: bare `--file`
+    #   means the staged draft, `--file NOTE.md` means that file. Without this the wrapper could
+    #   only ever reach the default draft, and a session with a handoff already written somewhere
+    #   had to copy it into `~/.local/state/gent/handoff.md` first.
+    hc.add_argument("-f", "--file", nargs="?", const=True, metavar="PATH",
+                    help="clear, taking the handoff from the staged draft (or from PATH)")
     hsub.add_parser("attach", help="attach to the host session")
     hsub.add_parser("status", help="show session state + token expiry + keepalive job")
     hk = hsub.add_parser("keepalive", help="poke/bounce the host session so idle Remote Control survives (for cron)")
