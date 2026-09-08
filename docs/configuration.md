@@ -236,6 +236,13 @@ session transcript records its `usage`, and `input_tokens` +
 that turn was sent. Keep `every` alongside it as a floor for a session that
 stays small but goes stale.
 
+The two nudges differ in tone on purpose. The cadence nudge says *"mid-task?
+ignore this"* — a timer has no evidence the session is actually full. The size
+nudge does not, because past the threshold **staying is the more expensive
+option**: recall of earlier turns is already degrading, so "later" means finishing
+the work in a worse state. It says to land what is in flight — finish it, commit
+it, save what's durable — and then clear, without starting anything new first.
+
 The size nudge names the number it saw, so the agent can judge for itself. It
 re-arms when a clear actually lands (a `/clear` starts a fresh transcript, and
 the reading drops with it — there is no high-water mark to reset), and otherwise

@@ -359,7 +359,7 @@ fi
 CLEAR_AT_TOKENS=0
 printf '%s' "$CLEAR_AT_TOKENS_RAW" | grep -qE '^[0-9]+$' && CLEAR_AT_TOKENS="$CLEAR_AT_TOKENS_RAW"
 if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] || [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ]; then
-    NUDGE_TAIL="wrap up — commit anything worth keeping, save durable notes to memory — then reset your context with \`gent-clear -m \"<what to pick up next>\"\` as your final action. Your fresh self remembers nothing, so name the task and the next step (bare \`gent-clear\` clears nothing — it just opens a draft to write that handoff in; \`gent-clear --none\` if truly nothing carries over). Mid-task? Ignore this; you'll be nudged again later."
+    NUDGE_HANDOFF="Your fresh self remembers nothing, so name the task and the next step (bare \`gent-clear\` clears nothing — it just opens a draft to write that handoff in; \`gent-clear --none\` if truly nothing carries over)."
     _desc=""
     [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] && _desc="every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)"
     [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ] && _desc="${_desc:+$_desc, }at ${CLEAR_AT_TOKENS} context tokens"
@@ -423,9 +423,13 @@ PY
         [ -n "$TRIG" ] || continue
         [ "$(fp)" = "$base" ] && { [ "$TRIG" = "time" ] && waited=0; continue; }   # nothing happened since last baseline (incl. an idle post-clear session) — skip
         if [ "$TRIG" = "size" ]; then
-          NUDGE_TEXT="🧠 Context is at ~${now_tokens} tokens, past this box's ${CLEAR_AT_TOKENS} mark — long enough that your recall of earlier turns is getting worse, not just longer. If you're at a good stopping point, ${NUDGE_TAIL}"
+          # ⚠ THE SIZE NUDGE DOES NOT SAY "ignore this if you are busy". Past the threshold,
+          # staying is the more expensive option — recall of earlier turns is already degrading,
+          # so "later" means finishing the work in a worse state. The instruction is to LAND what
+          # is in flight and then clear, not to start anything new first.
+          NUDGE_TEXT="🧠 Context is at ~${now_tokens} tokens, past this box's ${CLEAR_AT_TOKENS} mark — long enough that your recall of earlier turns is degrading, not merely long. Clear as soon as what you are on LANDS: finish it, commit it, push if you can, save anything durable to memory — then run \`gent-clear -m \"<what to pick up next>\"\` as your final action. Do not start a new item first, and do not carry this past the next landing. ${NUDGE_HANDOFF}"
         else
-          NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, ${NUDGE_TAIL}"
+          NUDGE_TEXT="⏰ Context-refresh nudge: if you're at a good stopping point, wrap up — commit anything worth keeping, save durable notes to memory — then reset your context with \`gent-clear -m \"<what to pick up next>\"\` as your final action. ${NUDGE_HANDOFF} Mid-task? Ignore this; you'll be nudged again later."
         fi
         # Deliver only at an actual stopping point. A bare `send-keys "$text" Enter`
         # into a BUSY pane leaves the text unsent in the composer, where the next
