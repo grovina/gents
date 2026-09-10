@@ -364,7 +364,7 @@ if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] || [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ]; then
     [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] && _desc="every ${CLEAR_EVERY_RAW} (${CLEAR_EVERY_SEC}s)"
     [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ] && _desc="${_desc:+$_desc, }at ${CLEAR_AT_TOKENS} context tokens"
     echo "gents: clear nudge ${_desc}" >&2
-    ( trap : INT
+    ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
       POLL_SEC=60
       fp() { local n; n="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true)"; [ -n "$n" ] && printf '%s:%s' "$n" "$(wc -c < "$n" 2>/dev/null || echo 0)"; }
       newest() { ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true; }
@@ -544,7 +544,7 @@ if [ "$EVENT_BUS" = 1 ]; then
 
   # Source 1 — schedule daemon: fire due reminders + matching cron triggers into the
   # stream, minute-aligned (cron needs each minute checked exactly once).
-  ( trap : INT
+  ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
       ( cd "$REPO" && gent-schedule fire-due ) >/dev/null 2>&1 || true
@@ -553,9 +553,13 @@ if [ "$EVENT_BUS" = 1 ]; then
   echo "gents: schedule daemon armed (gent-schedule fire-due, minute-aligned)" >&2
 
   # Source 2 — telegram bridge (telegram boxes): run the watch command box-supervised
-  # and wrap each line as a telegram event. Self-restarts if the watch exits.
+  # and wrap each line as a telegram event. Self-restarts if the watch exits — for ANY
+  # reason, which is what the `set +e` buys. The subshell inherits this script's
+  # `set -euo pipefail`, so a killed or crashed watch failed the pipeline and ended the
+  # bridge for good, silently: the Monitor stays up and simply hears nothing.
+  # (2026-09-10: a hot-redeploy's `pkill` of `tg watch` did exactly that on three boxes.)
   if [ -n "$TG_WATCH" ]; then
-    ( trap : INT
+    ( trap : INT; set +e
       while :; do
         tmux has-session -t gent 2>/dev/null || exit 0
         ( cd "$REPO" && $TG_WATCH ) 2>/dev/null \
@@ -573,7 +577,7 @@ if [ "$EVENT_BUS" = 1 ]; then
   WATCHDOG_LOG="$_wdir/watchdog.log"
   _wlog() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$WATCHDOG_LOG" 2>/dev/null || true; }
   echo "gents: event watchdog armed (monitor: $MON_WATCH; log: $WATCHDOG_LOG)" >&2
-  ( trap : INT
+  ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
