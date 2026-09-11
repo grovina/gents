@@ -21,6 +21,11 @@ A secret already gitignored inside a repo's own tree (e.g. a repo's own
 `var/token`) needs no catalog entry — it rides along with the repo mount. Prefer
 **env vars** for keys/IDs and **mounts** for credential files.
 
+Bulk data that isn't a credential — a dataset the box should read but must not
+change — doesn't belong in the catalog: grant it with `data_mounts`
+(`{ "/container/path": "~/host/path" }`, always read-only). The catalog stays
+small enough to move as a plain directory copy.
+
 ## Scoped GCP service account (per-repo identity)
 
 Each box gets its *own* SA — never the shared host `~/.config/gcloud` (which

@@ -21,6 +21,10 @@
       "mounts": {
         "/secrets/gcp/myapp-sa.json": "gcp/myapp-sa.json"
       },
+      "data_mounts": {
+        "/data/datasets": "~/data/datasets"
+      },
+      "_data_mounts_note": "OPTIONAL. Plain host data the box may read but never owns — absolute or ~ host paths, always mounted READ-ONLY (e.g. a large dataset kept out of git). Not for credentials (use `mounts`, from the catalog) or app state the box writes (use `state_mounts`). A missing source path refuses to start the box rather than mounting an empty dir.",
       "env_files": ["shared.env", "github/myorg.env", "vercel/myteam.env"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/gcp/myapp-sa.json",

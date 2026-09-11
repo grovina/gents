@@ -607,6 +607,17 @@ def cmd_up(fleet, a):
         src.mkdir(parents=True, exist_ok=True)
         args += ["-v", f"{src}:{dest}"]
 
+    # Plain host data the box may READ but never owns: {container_path: host_path},
+    # always read-only (e.g. a large dataset kept out of git and backed up
+    # elsewhere). Not a credential (that's `mounts`) and not app state (that's
+    # `state_mounts`). A missing source is fatal — docker would silently create
+    # an empty root-owned dir and the box would read "no data" as the answer.
+    for dest, src in (cfg.get("data_mounts") or {}).items():
+        src = expand(src)
+        if not src.exists():
+            die(f"{name}: data mount missing: {src}  (-> {dest})")
+        args += ["-v", f"{src}:{dest}:ro"]
+
     # Reusable .env fragments from the catalog, then inline env.
     for rel in (cfg.get("env_files") or []):
         src = fleet["secrets_root"] / rel
