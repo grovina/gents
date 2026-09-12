@@ -97,9 +97,17 @@ already mounted read-write, so the channel works immediately with no re-up and n
 new mount. Runner state stays under `state_root` either way.
 
 ```
-$GENT_HOST_ACTIONS/requests/<id>.json   {"action": "restart-api", "why": "backlog 637 note scrub"}
-$GENT_HOST_ACTIONS/results/<id>.json    {"state": "done|refused|failed", "rc": 0, "output": "…"}
+$GENT_HOST_ACTIONS/requests/<id>.json   {"action": "restart-api", "why": "backlog 637 note scrub",
+                                         "asked": "2026-09-12T15:01:37.637400+00:00"}
+$GENT_HOST_ACTIONS/results/<id>.json    {"state": "done|refused|failed", "rc": 0, "output": "…",
+                                         "asked": …, "started": …, "answered": …}
 ```
+
+Every stamp is **aware UTC ISO-8601**, full precision: the host writes `started`
+and `answered`, and echoes your `asked` back unchanged. Write `asked` the same way.
+A document that mixes an aware stamp with a naive local one turns a 39-second round
+trip into two hours — and truncating one side of that pair to whole seconds makes an
+answer arrive *before* its own ask.
 
 `gent fleet timers install` arms the runner (every 30 s, alongside the auth jobs);
 `gent fleet host-actions` runs one pass by hand. Runner state lives *outside* the

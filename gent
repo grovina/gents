@@ -10,6 +10,7 @@ in tmux, attachable from the host.
 Stdlib only. The docker command is always printed before it runs — no magic.
 """
 import argparse, json, os, re, shlex, shutil, subprocess, sys, time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -1528,6 +1529,23 @@ def _ha_save(root, st):
     (root / "state.json").write_text(json.dumps(st, indent=1))
 
 
+def _ha_stamp():
+    """An AWARE UTC stamp — these land in a record the CALLER also writes into.
+
+    ⚠ `asked` is written in the box as UTC-aware; `answered` and `started` were
+      `time.strftime(...)`, i.e. naive LOCAL. One document, two conventions: it reads
+      fine for months and then someone (or something) compares an `answered` of
+      16:45 against an `asked` of 14:45+00:00 and concludes the host answered the
+      request two hours before it was made.
+    ⚠ FULL precision, not `timespec="seconds"`: the caller's `asked` carries
+      microseconds, so a truncated `answered` in the SAME second is arithmetically
+      EARLIER than the ask — the drain runs every 30 s, and a request written just
+      before a tick is answered in that same second. Truncating one side of a
+      comparison is the same bug in a smaller unit.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _ha_answer(spool, rid, req, **fields):
     """Write the result for request `rid`. EVERY request gets one of these.
 
@@ -1537,7 +1555,7 @@ def _ha_answer(spool, rid, req, **fields):
       instead of retrying into the same wall.
     """
     body = {"id": rid, "action": req.get("action"), "asked": req.get("asked"),
-            "why": req.get("why"), "answered": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            "why": req.get("why"), "answered": _ha_stamp()}
     body.update(fields)
     tmp = spool / "results" / f".{rid}.tmp"
     tmp.write_text(json.dumps(body, indent=1))
@@ -1604,7 +1622,7 @@ def _ha_handle(name, spool, st, cfg, specs, f, verbose):
                           detail=f"fleet.json's '{act}' has no valid argv list")
 
     f.unlink(missing_ok=True)
-    started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    started = _ha_stamp()
     if verbose:
         print(f"gent: {name}/{act} → {' '.join(shlex.quote(x) for x in argv)}"
               + (f"   ({req['why']})" if req.get("why") else ""))
