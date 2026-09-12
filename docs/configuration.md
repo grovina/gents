@@ -115,7 +115,13 @@ mounted dir, so the rate limit is not a file the caller can edit.
 
 **Every request is answered.** `done`, `refused` (with the reason) or `failed`
 — never silently dropped. A dropped request is indistinguishable, to the caller,
-from one still queued, so it waits, gives up, and asks again.
+from one still queued, so it waits, gives up, and asks again. That holds through a
+**kill**, too: the runner must delete the request before running the command (or a
+crash mid-restart would re-run it every 30 s forever), so between the delete and
+the answer it keeps a host-side in-flight record. An exception is caught and
+answered; a SIGTERM at that moment — a reboot, a `systemctl stop`, an OOM — is not,
+and used to lose the ask entirely. The next drain now answers it instead, honestly:
+*the command WAS launched, so it may or may not have run.*
 
 **Two guards, both generic:**
 

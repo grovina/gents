@@ -1529,6 +1529,61 @@ def _ha_save(root, st):
     (root / "state.json").write_text(json.dumps(st, indent=1))
 
 
+def _ha_inflight(root):
+    """Where a request lives WHILE its command runs. Host-side, never the box's spool.
+
+    ★ THE INVARIANT HAS A HOLE THAT ONLY A KILL CAN REACH. `_ha_handle` unlinks the
+      request before running the command — it must, or a crash mid-restart would re-run
+      it every 30 s forever. An EXCEPTION is caught and answered; a SIGTERM is not. A
+      host shutdown, a `systemctl stop`, an OOM kill between the unlink and the answer
+      leaves no request and no result, which is the one outcome the whole design calls
+      worse than a refusal: the caller cannot tell a lost ask from a queued one, so it
+      waits, gives up, and asks again.
+    ⓘ Found 2026-09-12 by applying homer's own finding to this file — a rejected or
+      interrupted path has usually already moved something, and the question to ask of
+      any guard is not "did it refuse" but "what had it done by then".
+    """
+    d = root / "inflight"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ha_sweep_inflight(root, spool, verbose):
+    """Answer anything a previous run started and never finished. Runs before the drain.
+
+    Orphaned = its runner is gone (pid dead), or it is older than any action could
+    legitimately still be (the command's own timeout answers before then). Both rules,
+    because pids are reused and an age rule alone would leave the caller waiting
+    minutes for an answer that is already knowable.
+    """
+    for m in sorted(_ha_inflight(root).glob("*.json")):
+        try:
+            mark = json.loads(m.read_text())
+        except (OSError, json.JSONDecodeError):
+            m.unlink(missing_ok=True)
+            continue
+        pid, age = mark.get("pid"), time.time() - mark.get("at", 0)
+        alive = False
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive and age < HOST_ACTION_TIMEOUT_S + 60:
+            continue                                   # genuinely still running
+        m.unlink(missing_ok=True)
+        if verbose:
+            print(f"gent: answering an action that never finished — {mark.get('action')}")
+        # ⚠ "may or may not have run" is the honest answer and the useful one: the
+        #   command was launched, so a caller must not assume it did nothing.
+        _ha_answer(spool, mark.get("rid", m.stem), mark.get("req") or {}, state="failed",
+                   rc=None, started=mark.get("started"),
+                   detail="the runner did not survive this action (killed, or the host went "
+                          "down). The command WAS launched, so it may or may not have run — "
+                          "check the service before asking again.")
+
+
 def _ha_stamp():
     """An AWARE UTC stamp — these land in a record the CALLER also writes into.
 
@@ -1620,7 +1675,7 @@ def _ha_answer(spool, rid, req, **fields):
     return body
 
 
-def _ha_handle(name, spool, st, cfg, specs, f, verbose):
+def _ha_handle(fleet, name, spool, st, cfg, specs, f, verbose):
     """Handle ONE request file. Returns a result dict, or None if it was deferred.
 
     Deferred means: the file stays, nothing is answered, we try again next tick. Every
@@ -1699,8 +1754,14 @@ def _ha_handle(name, spool, st, cfg, specs, f, verbose):
         return _ha_answer(spool, rid, req, state="refused",
                           detail=f"fleet.json's '{act}' has no valid argv list")
 
-    f.unlink(missing_ok=True)
     started = _ha_stamp()
+    # The request stops being a request and becomes an IN-FLIGHT record in one step: the
+    # marker is written BEFORE the unlink, so no instant exists in which the ask is in
+    # neither place. See `_ha_inflight` for the kill this closes.
+    mark = _ha_inflight(host_actions_root(fleet, name)) / f"{rid}.json"
+    mark.write_text(json.dumps({"rid": rid, "action": act, "req": req, "pid": os.getpid(),
+                                "at": time.time(), "started": started}))
+    f.unlink(missing_ok=True)
     if verbose:
         print(f"gent: {name}/{act} → {' '.join(shlex.quote(x) for x in argv)}"
               + (f"   ({req['why']})" if req.get("why") else ""))
@@ -1726,6 +1787,10 @@ def _ha_handle(name, spool, st, cfg, specs, f, verbose):
     except OSError as e:
         return _ha_answer(spool, rid, req, state="failed", rc=None, started=started,
                           detail=str(e))
+    finally:
+        # Answered by any path above (including the outer handler's crash answer) -> the
+        # in-flight record is spent. Only a kill leaves it behind, which is the point.
+        mark.unlink(missing_ok=True)
 
 
 def run_host_actions(fleet, name, cfg, verbose=True):
@@ -1737,6 +1802,7 @@ def run_host_actions(fleet, name, cfg, verbose=True):
     spool = host_actions_spool(fleet, name, cfg)
     st = _ha_state(root)
     done = []
+    _ha_sweep_inflight(root, spool, verbose)
 
     # Oldest first: a queue that reorders itself surprises a caller that wrote two
     # requests expecting them in order. (mtime, name) because two files written in the
@@ -1744,7 +1810,7 @@ def run_host_actions(fleet, name, cfg, verbose=True):
     reqs = sorted((spool / "requests").glob("*.json"), key=lambda p: (p.stat().st_mtime, p.name))
     for f in reqs:
         try:
-            res = _ha_handle(name, spool, st, cfg, specs, f, verbose)
+            res = _ha_handle(fleet, name, spool, st, cfg, specs, f, verbose)
         except Exception as e:                       # noqa: BLE001 — see below
             # ★ THE INVARIANT IS "EVERY REQUEST IS ANSWERED", AND A BUG IN THE HANDLER
             #   MUST NOT BREAK IT. It already did once, in this file: the rate-limit
