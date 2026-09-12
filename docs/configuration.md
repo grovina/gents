@@ -393,6 +393,15 @@ used to be a bare positional, so *every* argument was a note — an agent runnin
 `gent-clear --help` to read the manual wiped its own context instead. A command
 whose job is destroying context can't have a swallow-anything argument.
 
+⚠ **The note in `-m` is written by your shell before `gent-clear` sees it**, and no
+argument parser can undo that. In bash double quotes, `` `backticks` `` and `$(…)`
+run as commands and `$VAR` expands — and a handoff is prose about code, which is
+mostly backticks. This has already fired: a handoff quoting a command in backticks
+ran it, and the run migrated a 208-row data file before the write it attempted was
+refused. Note the order — the refusal came *after* the schema change, so "the guard
+rejected it" did not mean "nothing happened". For any note containing backticks,
+`$` or quotes, use the draft below; a file is never interpreted.
+
 Bare `gent-clear` therefore clears nothing either. Like `git commit` with no
 `-m`, it opens a draft — `~/.local/state/gent/handoff.md`, pre-filled with
 commented instructions — and stops. Write the handoff into it and run

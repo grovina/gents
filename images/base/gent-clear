@@ -21,6 +21,18 @@
 #
 # Nothing you can typo at this command costs you a session.
 #
+# ⚠ BUT YOUR SHELL WRITES THE NOTE BEFORE THIS SCRIPT SEES IT, and that is the one
+# hazard this parser cannot catch. `-m "…"` is a double-quoted bash argument: inside
+# it, `backticks` and $(…) RUN AS COMMANDS and $VAR expands — before gent-clear is
+# even invoked. A handoff is prose, and prose about code is full of backticks, so
+# this bites in the exact case the flag is for. It has: a handoff that quoted a
+# command in backticks ran it, and it mutated a data file (a schema migration on a
+# 208-row ledger) before the write it attempted was refused — the refusal came
+# AFTER the migration, so "it was rejected" did not mean "nothing happened".
+# ▶ For any note with backticks, $ or quotes, use the DRAFT: bare `gent-clear`,
+#   write the prose into the file, then `gent-clear --file`. A file is never
+#   interpreted. Single quotes work too, until the note contains an apostrophe.
+#
 # THE HANDOFF is an instruction TO your post-clear self, delivered with the hello
 # as the fresh session's first prompt. Write it for a reader that remembers
 # nothing: name the task, the branch, the file, the next step. Without one a
@@ -80,6 +92,11 @@ Bare `gent-clear` never clears: it writes a draft file, tells you where, and
 waits. Write the handoff into it, then `gent-clear --file`. Leave it untouched
 and `--file` still clears — just with nothing handed over.
 
+⚠ The note in -m is written by YOUR SHELL first: inside bash double quotes,
+`backticks` and $(...) run as commands and $VAR expands, before gent-clear sees a
+thing. Prose about code is full of backticks. Use the draft (bare gent-clear, then
+--file) for anything with backticks, $ or quotes — a file is never interpreted.
+
 The clearing forms (-m / --file / --none) must be your FINAL action, with no
 output after: the /clear keystroke queues behind the current turn and only fires
 once the turn ends. The greet is replayed only after a brand-new transcript
@@ -131,6 +148,9 @@ if [ "$MODE" = stage ]; then
 #
 # It remembers NOTHING. Name the task, the branch, the file, the next step —
 # instructions TO it, not notes about it. Multi-line is fine.
+#
+# Writing it HERE is also why the draft exists: a file is never interpreted, while
+# a -m note goes through your shell first, where `backticks` and $(...) RUN.
 #
 # Then run:  gent-clear --file
 # Nothing carries over? Leave this untouched and run `gent-clear --file` anyway
