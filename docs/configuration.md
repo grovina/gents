@@ -128,6 +128,39 @@ from one still queued, so it waits, gives up, and asks again.
   fifteen minutes of `starting`: the second one's scanner blocked past its radio
   lock and never returned. A grouped ask that arrives too early is **deferred**
   (left queued, retried next tick), not refused — the ask is fine, its timing is not.
+- `closed_windows` (+ optional `tz`) — hours in which the action is **refused**.
+  The other two guards ask whether the *machine* is busy; this one is about *people*,
+  which nothing inside the box can measure. Restarting a BLE scale drops the weighing
+  someone is standing on, and that fact had been living in the `why` line of a
+  hand-written deferral — re-typed each time, with a deadline chosen by feel. One such
+  deadline was 22:00, which turned out to be the single most common weighing hour on
+  record (11 of 32). **A hold that expires into the peak is worse than no hold**: it
+  reads as considered and fires at the worst moment.
+
+```json
+"restart-scale": {
+  "run": ["docker", "compose", "restart", "scale"],
+  "group": "ble-radio", "group_cooldown_s": 90, "tz": "Europe/Zurich",
+  "closed_windows": [
+    {"from": "07:00", "to": "11:00", "why": "14 of 32 readings; the latest morning one is 10:50."},
+    {"from": "19:30", "to": "00:00", "why": "14 of 32; 11 at 22:00 alone, latest 23:35."}
+  ],
+  "closed_basis": "counted from the scale ledger 2026-09-12, n=32 over 15 days."
+}
+```
+
+  Refused, not deferred — a cooldown is seconds, a window is hours, and a queued
+  request would fire unattended long after its asker's session ended, at a moment
+  nobody chose. The refusal names the opening time, so the caller can come back
+  deliberately. `from`/`to` are `HH:MM` wall clock in `tz` (the host's own clock if
+  unset), half-open, and `from > to` crosses midnight. It **fails closed**: a window
+  that does not parse refuses the ask rather than reading as no guard.
+  ▶ Make each window state its own evidence. `why` and `closed_basis` are echoed in
+  the refusal, so the rule can be re-checked by whoever it stops — a bare pair of
+  times is a guess with a timestamp, and choosing the times by feel is exactly what
+  put a deadline on the peak. Check the boundaries against the record rather than
+  rounding: 10:30 and 23:30 look like the obvious edges here and each misses a real
+  reading by minutes.
 
 Keep the vocabulary tiny. Every action is a line a human wrote, and the point of
 the design is that a box's entire reach is readable in ten seconds. If you want to

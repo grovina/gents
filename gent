@@ -1546,6 +1546,62 @@ def _ha_stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _ha_hhmm(v):
+    """'07:00' -> minutes since midnight, or None if it is not a wall-clock time."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(v or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return h * 60 + mi if h < 24 and mi < 60 else None
+
+
+def _ha_closed_window(spec, now=None):
+    """(window, opens_at, minutes_until) if the wall clock sits inside a closed window.
+
+    ★ WHY A CLOCK GUARD EXISTS BESIDE THE OTHER TWO. `min_interval_s` and `group` both
+      ask "is the resource busy right now" — a question about the machine. This one asks
+      "is this a bad HOUR for the people", which no signal in the box can answer. homer's
+      scale sidecar is the case: restarting it drops a live weighing, and the reason had
+      been living in the `why` line of a hand-written deferral — i.e. in someone's memory,
+      re-typed each time, with a deadline chosen by feel. On 2026-09-12 that deadline was
+      22:00, and 22:00 turned out to be the single most common weighing hour on record
+      (11 of 32). ⚠ A hold that EXPIRES INTO THE PEAK is worse than no hold at all: it
+      reads as considered and fires at the worst moment. A window is the fix because it is
+      a property of the hour, not of when someone happened to set a timer.
+
+    ▶ REFUSED, not deferred — unlike the group cooldown. A cooldown is seconds, so
+      queueing is kind; a closed window is HOURS, and a deferred request would fire
+      unattended long after its asker's session ended, at a moment nobody chose. The
+      refusal names the opening time so the caller can come back deliberately.
+
+    ⚠ FAILS CLOSED. A window that cannot be parsed raises, and the caller is refused. A
+      guard whose spec has a typo must never read as "no guard".
+    """
+    wins = spec.get("closed_windows") or []
+    if not wins:
+        return None
+    tz = spec.get("tz")
+    if tz and now is None:
+        from zoneinfo import ZoneInfo          # stdlib; lazy, so a host with no tzdata only
+        try:                                   # breaks when a tz is actually named
+            now = datetime.now(ZoneInfo(tz))
+        except Exception as e:                 # noqa: BLE001 — any tz failure is a bad spec
+            raise ValueError(f"unusable tz {tz!r}: {e!r}") from e
+    now = now or datetime.now()
+    cur = now.hour * 60 + now.minute
+    for w in wins:
+        a, b = _ha_hhmm(w.get("from")), _ha_hhmm(w.get("to"))
+        if a is None or b is None or a == b:
+            raise ValueError(f"malformed closed_window {w!r} — expected "
+                             f"{{'from': 'HH:MM', 'to': 'HH:MM'}} with two different times")
+        # a > b is a window that crosses midnight (22:00->06:00), which is exactly when a
+        # "quiet hours" rule wants to be written. Get it wrong and the guard inverts.
+        inside = (a <= cur < b) if a < b else (cur >= a or cur < b)
+        if inside:
+            return w, w.get("to"), (b - cur) % (24 * 60)
+    return None
+
+
 def _ha_answer(spool, rid, req, **fields):
     """Write the result for request `rid`. EVERY request gets one of these.
 
@@ -1602,6 +1658,28 @@ def _ha_handle(name, spool, st, cfg, specs, f, verbose):
         return _ha_answer(spool, rid, req, state="refused",
                           detail=f"rate-limited: '{act}' ran {int(gap)}s ago, "
                                  f"min interval is {floor}s")
+
+    # Before the group check: a closed window is a stable fact about the next few hours,
+    # the group is a transient one about the next few seconds. Tell the caller the one it
+    # cannot wait out.
+    try:
+        closed = _ha_closed_window(spec)
+    except ValueError as e:
+        # A malformed window or an unusable tz refuses the ASK, loudly. The alternative —
+        # treating an unreadable guard as an absent one — is how a typo silently disarms it.
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, req, state="refused",
+                          detail=f"fleet.json's '{act}' has a broken clock guard: {e}")
+    if closed:
+        win, opens, mins = closed
+        f.unlink(missing_ok=True)
+        detail = (f"closed window: '{act}' is not run between {win.get('from')} and "
+                  f"{win.get('to')}{' ' + spec['tz'] if spec.get('tz') else ' host time'} "
+                  f"— opens in {mins // 60}h{mins % 60:02d}m, at {opens}.")
+        for extra in (win.get("why"), spec.get("closed_basis")):
+            if extra:
+                detail += f" {extra}"
+        return _ha_answer(spool, rid, req, state="refused", detail=detail)
 
     group = spec.get("group")
     if group:
