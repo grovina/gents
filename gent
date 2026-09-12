@@ -1328,33 +1328,56 @@ def cmd_host_attach(fleet, a):
 
 
 def cmd_host_down(fleet, a):
-    """Stop the host session: kill its tmux session and remove the run script.
-    Also reaps any orphaned `claude -n <name>` that outlived the tmux pane (a
-    detached Remote Control session claude can keep alive on its own, which
-    nothing would relaunch). Leaves the launchd keepalive + boot jobs — they're
-    no-ops while the session is down and `up` re-arms them; pass --keepalive to
-    remove them too."""
+    """Stop the host session: remove its jobs and run script, then kill the session.
+
+    Also reaps any orphaned `claude -n <name>` that outlived the tmux pane (a detached
+    Remote Control session claude can keep alive on its own, which nothing would
+    relaunch). `--keepalive` additionally removes the launchd/systemd keepalive AND the
+    boot job; `up` re-arms both.
+
+    ⚠⚠ EVERY DESTRUCTIVE STEP IS LAST, AND THAT ORDER IS THE WHOLE POINT. This used to
+    kill the tmux session FIRST and clean up afterwards — and the normal way to run this
+    command is from inside the session it kills, so it died at step one and never reached
+    the cleanup. What survived was the BOOT job, still armed, which brought the session
+    back at the next login: a teardown that looks complete, reports success, and quietly
+    undoes itself hours later. Reported 2026-09-12 by the Mac's own host session while
+    retiring itself. Cleanup first also fails in the safe direction — if the kill never
+    happens, a running session with nothing to resurrect it beats a dead one with a boot
+    job armed.
+
+    ⚠ A PLAIN `down` LEAVES THE BOOT JOB ARMED, and that is NOT a no-op — this docstring
+    used to claim it was. `install_host_boot` writes a RunAtLoad job (systemd: enabled
+    into default.target) whose whole purpose is to run `gent host up` at login. The
+    keepalive really is inert while the session is down; the boot job is a timer on your
+    next reboot. So say so out loud rather than letting it read as "stopped"."""
     name = host_name(fleet)
-    if tmux_has(name):
-        subprocess.run(["tmux", "kill-session", "-t", name], env=tmux_env())
-        print(f"gent: host session '{name}' stopped.")
-    else:
-        print(f"gent: host session '{name}' not running.")
+    if getattr(a, "keepalive", False):
+        remove_host_job(f"gent-host-keepalive-{name}")
+        remove_host_boot(fleet)
+        print(f"gent: keepalive + boot jobs removed.")
+    run = Path.home() / f".gent-{name}-run.sh"
+    if run.exists():
+        run.unlink()
+    # ⓘ Warn BEFORE the kill, for the same reason the cleanup runs before it: said after,
+    #   it is said by a process that may not exist any more.
+    if not getattr(a, "keepalive", False) and host_job_armed(f"gent-host-boot-{name}"):
+        print(f"gent: ⚠ boot autostart is still armed — '{name}' will come back at the "
+              f"next login. `gent host down --keepalive` removes it.")
     # Match the EXACT name argument (space or end-of-line after it) so a different
     # session's claude — e.g. your own `claude -n gents` shell — is never touched.
+    # ⚠ This can match THIS process's own claude when run from inside the session, which
+    #   is exactly why nothing that matters is left to do after it.
     orphans = [p for p in subprocess.run(
         ["pgrep", "-f", f"claude -n {name}( |$)"],
         capture_output=True, text=True).stdout.split() if p.isdigit()]
     if orphans:
         subprocess.run(["kill", *orphans], capture_output=True)
         print(f"gent: reaped {len(orphans)} orphaned '{name}' claude process(es).")
-    run = Path.home() / f".gent-{name}-run.sh"
-    if run.exists():
-        run.unlink()
-    if getattr(a, "keepalive", False):
-        remove_host_job(f"gent-host-keepalive-{name}")
-        remove_host_boot(fleet)
-        print(f"gent: keepalive + boot jobs removed.")
+    if tmux_has(name):
+        subprocess.run(["tmux", "kill-session", "-t", name], env=tmux_env())
+        print(f"gent: host session '{name}' stopped.")
+    else:
+        print(f"gent: host session '{name}' not running.")
 
 
 def cmd_host_keepalive(fleet, a):
