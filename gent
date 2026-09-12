@@ -1555,7 +1555,15 @@ def _ha_sweep_inflight(root, spool, verbose):
     legitimately still be (the command's own timeout answers before then). Both rules,
     because pids are reused and an age rule alone would leave the caller waiting
     minutes for an answer that is already knowable.
+
+    ⚠ RETURNS its answers so the caller prints them like any other result. They used to
+      be announced only under `verbose`, and the timer runs `--quiet` — so the single
+      most alarming thing this door can report (the host died mid-restart) was the only
+      outcome with no line in the journal, readable solely by a caller that had usually
+      already given up. Rank a side effect by whether anything downstream can NOTICE it,
+      not just by what it changed: silent-and-unnoticeable is the worst square.
     """
+    answers = []
     for m in sorted(_ha_inflight(root).glob("*.json")):
         try:
             mark = json.loads(m.read_text())
@@ -1577,11 +1585,13 @@ def _ha_sweep_inflight(root, spool, verbose):
             print(f"gent: answering an action that never finished — {mark.get('action')}")
         # ⚠ "may or may not have run" is the honest answer and the useful one: the
         #   command was launched, so a caller must not assume it did nothing.
-        _ha_answer(spool, mark.get("rid", m.stem), mark.get("req") or {}, state="failed",
-                   rc=None, started=mark.get("started"),
-                   detail="the runner did not survive this action (killed, or the host went "
-                          "down). The command WAS launched, so it may or may not have run — "
-                          "check the service before asking again.")
+        answers.append(_ha_answer(
+            spool, mark.get("rid", m.stem), mark.get("req") or {}, state="failed",
+            rc=None, started=mark.get("started"),
+            detail="the runner did not survive this action (killed, or the host went "
+                   "down). The command WAS launched, so it may or may not have run — "
+                   "check the service before asking again."))
+    return answers
 
 
 def _ha_stamp():
@@ -1801,8 +1811,8 @@ def run_host_actions(fleet, name, cfg, verbose=True):
     root = host_actions_root(fleet, name)
     spool = host_actions_spool(fleet, name, cfg)
     st = _ha_state(root)
-    done = []
-    _ha_sweep_inflight(root, spool, verbose)
+    # Sweep FIRST, and its answers ride home in the same list every other result does.
+    done = _ha_sweep_inflight(root, spool, verbose)
 
     # Oldest first: a queue that reorders itself surprises a caller that wrote two
     # requests expecting them in order. (mtime, name) because two files written in the
