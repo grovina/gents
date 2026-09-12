@@ -25,6 +25,16 @@
         "/data/datasets": "~/data/datasets"
       },
       "_data_mounts_note": "OPTIONAL. Plain host data the box may read but never owns — absolute or ~ host paths, always mounted READ-ONLY (e.g. a large dataset kept out of git). Not for credentials (use `mounts`, from the catalog) or app state the box writes (use `state_mounts`). A missing source path refuses to start the box rather than mounting an empty dir.",
+      "host_actions": {
+        "actions": {
+          "restart-api": { "run": ["docker", "compose", "restart", "myapp-api"], "min_interval_s": 60 },
+          "restart-scale": {
+            "run": ["docker", "compose", "restart", "scale"],
+            "min_interval_s": 300, "group": "ble-radio", "group_cooldown_s": 90
+          }
+        }
+      },
+      "_host_actions_note": "OPTIONAL, and a real grant of power \u2014 read this before adding one. A box has no docker socket (it runs claude with permissions skipped; the socket is root on the host), but a box often CANNOT restart the very process holding its code: an api container that mounts the repo read-only keeps its modules in memory, so an edit is dormant, silently, until someone on the host restarts it. Each entry gives the box ONE NAME it may ask for; the argv lives here, on the host, and the box can never compose a command, pass an argument, or name a service you didn't list. gent binds a spool at /gent/host-actions (also $GENT_HOST_ACTIONS) for boxes that declare this, and `gent fleet timers install` arms the 30 s runner that serves it. Shorthand: a bare argv list instead of the object, when the action needs no guards. `min_interval_s` stops a caller that watches a signal from restarting in a loop when the signal doesn't clear \u2014 the second ask inside the window is REFUSED, with a reason, never silently dropped. `group` + `group_cooldown_s` keep actions that share a physical resource apart (two BLE sidecars on one radio: restarted together, the second blocks past its radio lock and sits in `starting` for fifteen minutes) \u2014 a grouped ask that arrives too early is DEFERRED and retried, not refused. Keep the vocabulary tiny: every action is a line a human wrote here, and the point is that you can read a box's whole reach in ten seconds.",
       "env_files": ["shared.env", "github/myorg.env", "vercel/myteam.env"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/gcp/myapp-sa.json",

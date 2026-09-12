@@ -49,6 +49,82 @@ or in the cloud; the box is the *agent* — the claude session plus a thin daemo
 that feeds it. Anything LAN- or device-bound stays on the host, reachable from
 the box at `host.docker.internal`.
 
+## Host actions — the one thing a box can ask the host to do
+
+A box has no docker socket, deliberately: it runs `claude
+--dangerously-skip-permissions`, and the socket is root on the host. But a box
+often cannot restart **the process holding its own code**. An api container that
+bind-mounts the repo read-only keeps its modules in memory, so an edit is dormant
+— and, unlike a daemon that logs `STALE:`, it says nothing while it serves last
+hour's code. Before this existed, closing that gap meant asking a human or
+another claude session in prose. A capability exercised by asking a peer in
+English is not a capability; it is an unwritten dependency, discovered late.
+
+Grant one in `fleet.json`, per repo:
+
+```json
+"host_actions": {
+  "actions": {
+    "restart-api": { "run": ["docker", "compose", "restart", "myapp-api"], "min_interval_s": 60 },
+    "restart-scale": {
+      "run": ["docker", "compose", "restart", "scale"],
+      "min_interval_s": 300, "group": "ble-radio", "group_cooldown_s": 90
+    }
+  }
+}
+```
+
+**Names, not commands.** The box writes a request naming an *action*; the argv
+lives in `fleet.json`, on the host, which no box can read or write. A box cannot
+compose a command, pass an argument, or name a service you did not list. No shell
+is involved anywhere (`run` is an argv list, never a string). The worst a confused
+box can do is ask for one of its own listed actions at the wrong moment — which is
+what the two guards are for. A bare argv list is shorthand for an action needing
+neither.
+
+**The transport is a directory**, because the box already has one. Declaring
+`host_actions` is the whole opt-in: gent provisions
+`state_root/host-actions/<box>/spool` and binds it read-write at
+`/gent/host-actions` (also `$GENT_HOST_ACTIONS`). No port, no token, no daemon in
+the box. Boxes that declare nothing get no mount and no env var.
+
+A mount can only be added at `docker run`, so a box that is **already running**
+gains the channel only when it is next re-created — and that starts a fresh claude
+session, discarding the context of the one that is working. When that price is too
+high, name a `spool` relative to the repo root instead
+(`"spool": "app/data/host-actions"`, pointed at a gitignored dir): the repo is
+already mounted read-write, so the channel works immediately with no re-up and no
+new mount. Runner state stays under `state_root` either way.
+
+```
+$GENT_HOST_ACTIONS/requests/<id>.json   {"action": "restart-api", "why": "backlog 637 note scrub"}
+$GENT_HOST_ACTIONS/results/<id>.json    {"state": "done|refused|failed", "rc": 0, "output": "…"}
+```
+
+`gent fleet timers install` arms the runner (every 30 s, alongside the auth jobs);
+`gent fleet host-actions` runs one pass by hand. Runner state lives *outside* the
+mounted dir, so the rate limit is not a file the caller can edit.
+
+**Every request is answered.** `done`, `refused` (with the reason) or `failed`
+— never silently dropped. A dropped request is indistinguishable, to the caller,
+from one still queued, so it waits, gives up, and asks again.
+
+**Two guards, both generic:**
+
+- `min_interval_s` — the same action cannot run again within N seconds. A caller
+  watching a staleness signal would otherwise restart in a loop forever, because
+  the signal does not always clear (a lazily-imported module reads as stale until
+  something imports it). The clock starts on *attempt*, not on success.
+- `group` + `group_cooldown_s` — actions naming the same group are never run close
+  together. Two BLE sidecars sharing one radio, restarted in one command, cost
+  fifteen minutes of `starting`: the second one's scanner blocked past its radio
+  lock and never returned. A grouped ask that arrives too early is **deferred**
+  (left queued, retried next tick), not refused — the ask is fine, its timing is not.
+
+Keep the vocabulary tiny. Every action is a line a human wrote, and the point of
+the design is that a box's entire reach is readable in ten seconds. If you want to
+pass an argument from the box, add a second named action instead.
+
 ## ⚠ Running a one-off command in the image — always `--entrypoint`
 
 The consequence of the section above: the image's `ENTRYPOINT` is `bootstrap`,

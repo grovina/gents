@@ -618,6 +618,17 @@ def cmd_up(fleet, a):
             die(f"{name}: data mount missing: {src}  (-> {dest})")
         args += ["-v", f"{src}:{dest}:ro"]
 
+    # The host-action channel: a read-write spool the box uses to ask the host to run
+    # one of its OWN pre-approved commands (see § host actions). gent provisions and
+    # binds it, so there is no dir for the box to create — unless the repo named its
+    # own `spool` inside the repo tree, which is already mounted and therefore needs
+    # nothing here. Boxes that declare no actions get no mount and no env var, and
+    # cannot reach the host at all.
+    if host_action_specs(cfg) and not (cfg.get("host_actions") or {}).get("spool"):
+        spool = host_actions_spool(fleet, name, cfg)
+        args += ["-v", f"{spool}:{HOST_ACTIONS_BOX_DIR}",
+                 "-e", f"GENT_HOST_ACTIONS={HOST_ACTIONS_BOX_DIR}"]
+
     # Reusable .env fragments from the catalog, then inline env.
     for rel in (cfg.get("env_files") or []):
         src = fleet["secrets_root"] / rel
@@ -1397,6 +1408,292 @@ def cmd_host_keepalive(fleet, a):
         say("host token expired but couldn't find the session's claude to bounce.")
 
 
+# ── host actions: a box asks the host to run one named, pre-approved command ──
+#
+# ★★★ WHY THIS EXISTS AT ALL. A box has no docker socket, on purpose — it runs
+# `claude --dangerously-skip-permissions`, and the socket is root on the host. But
+# several boxes legitimately need ONE host-side effect: the process holding their
+# code runs in a container the box cannot reach. homer's `homer-api` mounts the repo
+# read-only and keeps its modules in memory, so an edit is dormant — invisibly, with
+# the family's board serving last hour's code — until someone on the host runs
+# `docker compose restart homer-api`. Until now that "someone" was a human or another
+# claude session, asked in prose. A capability that is exercised by asking a peer in
+# English is not a capability; it is an unwritten dependency that is discovered late.
+#
+# ▶ THE SHAPE: NAMES, NOT COMMANDS. The box writes a request naming an ACTION
+#   ("restart-api"). The host maps that name to an exact argv that lives HERE, in
+#   fleet.json, which no box can read or write. A box can never compose a command,
+#   pass an argument, or reach a service its repo didn't declare — the worst a
+#   compromised or confused box can do is ask for one of its own listed actions at
+#   the wrong moment, which is what the guards below are for. No shell is involved
+#   at any point (`run` is an argv list, never a string).
+#
+# ▶ THE TRANSPORT IS A DIRECTORY, because the box already has one. By default gent
+#   provisions `state_root/host-actions/<box>/spool` and binds it read-write at a
+#   fixed path (`/gent/host-actions`, also exported as $GENT_HOST_ACTIONS); a repo
+#   that would rather not wait for its next re-up can name a `spool` inside its own
+#   tree instead (see `host_actions_spool`). No port, no token, no daemon in the box:
+#   the mount IS the grant, and it is the same trust boundary the repo mount already
+#   is. Runner state (last-run times) deliberately sits OUTSIDE whichever spool is in
+#   use, so the rate limit is never a file the caller could edit.
+#
+# ⚠⚠ TWO GUARDS, BOTH GENERIC, BOTH LEARNED FROM REAL DAMAGE:
+#   `min_interval_s` — the same action cannot run again within N seconds. A caller
+#   that watches a staleness signal and asks on every tick would otherwise restart in
+#   a loop forever; the signal it is watching does not always clear (a lazily-imported
+#   module reads as stale until it is imported), so "it will stop when it's fixed" is
+#   not true. Refused requests are ANSWERED, not dropped — silence would read as
+#   still-queued and the caller would ask again.
+#   `group` + `group_cooldown_s` — actions naming the same group are never run close
+#   together. homer's two BLE sidecars share one radio: restarted in one command at
+#   04:58 on 2026-09-10, the wearable's first scan took the radio and the scale's
+#   scanner construction blocked past its 3 s lock and never returned — fifteen
+#   minutes of `starting`, caught only because a not-checked row existed. That rule
+#   was written in a comment in homer's freshness.py, where it protected only the
+#   readers who happened to read it. Here it is a gate that holds whoever asks.
+#   A grouped request that arrives too early is DEFERRED (left in the queue, retried
+#   next tick), not refused — the ask is legitimate, only its timing is wrong.
+#
+# ⓘ WHAT THIS IS NOT. It is not a general RPC and must not grow into one: every new
+#   power is a line a human writes in fleet.json, on the host, per repo. If you find
+#   yourself wanting to pass an argument from the box, add a second named action
+#   instead — the point of the design is that the box's whole vocabulary is a list
+#   you can read in ten seconds.
+
+#: Where the spool is bound inside every box that declares host_actions. Fixed and
+#: repo-agnostic, like /secrets/ssh/key — the box learns it from $GENT_HOST_ACTIONS.
+HOST_ACTIONS_BOX_DIR = "/gent/host-actions"
+
+#: Seconds a single action may run before the runner gives up on it. A `docker
+#: compose restart` is seconds; anything that blocks longer has hung, and holding the
+#: runner hostage would stall every other box's queue behind it.
+HOST_ACTION_TIMEOUT_S = 300
+
+#: Results older than this are swept. They exist for the caller to read once, plus a
+#: window for a person asking "what did it do last night" — not as an archive.
+RESULT_TTL_S = 7 * 86400
+
+
+def host_actions_root(fleet, name):
+    """This box's host-action directory on the HOST: spool/ (shared) + state.json."""
+    return fleet["state_root"] / "host-actions" / name
+
+
+def host_actions_spool(fleet, name, cfg=None):
+    """The half the box can see. Created here so a box never has to mkdir a mount.
+
+    ⓘ TWO PLACES IT CAN LIVE, and the choice is about WHEN a box gets the capability.
+      Default: under state_root, bound into the box by `gent up` — clean (gent writes
+      nothing into your repo) and the right answer for a box you are about to start.
+      But a mount can only be added at `docker run`, so an ALREADY-RUNNING box gains
+      the channel only when it is next re-created — and re-creating a box starts a
+      FRESH claude session, throwing away the context of the one that is working.
+      That is a real price for a plumbing change.
+      So a repo may instead name a `spool` path relative to its own root: the box
+      already has the repo mounted read-write, so the channel works immediately, with
+      no re-up and no new mount. Point it at a gitignored dir. Runner state stays
+      under state_root either way — never somewhere the caller could edit it.
+    """
+    rel = (cfg or {}).get("host_actions", {}).get("spool")
+    spool = (cfg["abs_path"] / rel) if rel else (host_actions_root(fleet, name) / "spool")
+    (spool / "requests").mkdir(parents=True, exist_ok=True)
+    (spool / "results").mkdir(parents=True, exist_ok=True)
+    return spool
+
+
+def host_action_specs(cfg):
+    """{name: spec} for this repo, tolerating the shorthand form.
+
+    Long form is a dict per action; the shorthand `"restart-api": ["docker", …]` is
+    the same thing with no guards, which is right for an action that is cheap and
+    has no shared resource.
+    """
+    out = {}
+    for act, spec in ((cfg.get("host_actions") or {}).get("actions") or {}).items():
+        if isinstance(spec, list):
+            spec = {"run": spec}
+        out[act] = spec
+    return out
+
+
+def _ha_state(root):
+    f = root / "state.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"actions": {}, "groups": {}}
+
+
+def _ha_save(root, st):
+    (root / "state.json").write_text(json.dumps(st, indent=1))
+
+
+def _ha_answer(spool, rid, req, **fields):
+    """Write the result for request `rid`. EVERY request gets one of these.
+
+    ★ A request that is silently dropped is indistinguishable, to the caller, from
+      one still in the queue — so it waits, gives up, and asks again. Refusals are
+      answers; they carry `state` and `detail` so the caller can say WHY out loud
+      instead of retrying into the same wall.
+    """
+    body = {"id": rid, "action": req.get("action"), "asked": req.get("asked"),
+            "why": req.get("why"), "answered": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    body.update(fields)
+    tmp = spool / "results" / f".{rid}.tmp"
+    tmp.write_text(json.dumps(body, indent=1))
+    # Atomic rename: a caller polling for the file must never read a half-written one.
+    tmp.rename(spool / "results" / f"{rid}.json")
+    return body
+
+
+def _ha_handle(name, spool, st, cfg, specs, f, verbose):
+    """Handle ONE request file. Returns a result dict, or None if it was deferred.
+
+    Deferred means: the file stays, nothing is answered, we try again next tick. Every
+    other outcome unlinks the request and writes exactly one result — see `_ha_answer`
+    for why a dropped request is worse than a refused one.
+    """
+    rid, req = f.stem, {}
+    try:
+        req = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, {}, state="refused", detail=f"unreadable request: {e}")
+
+    act = req.get("action")
+    spec = specs.get(act)
+    if not spec:
+        # The allowlist is the whole security model — name the known set so a typo is
+        # self-correcting, and run nothing.
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, req, state="refused",
+                          detail=f"'{act}' is not an action this box may ask for "
+                                 f"(fleet.json allows: {', '.join(sorted(specs)) or 'none'})")
+
+    # ⚠ FRESH, not captured once per drain. Read at the top of the loop, this clock is
+    #   EARLIER than the timestamp an action run in this same tick just wrote — so the
+    #   next request for it saw a NEGATIVE gap, below every threshold including zero,
+    #   and was refused as rate-limited with no rate limit configured. Two requests in
+    #   one tick is the normal case, not a corner: it is what a caller does when it has
+    #   two things to ask for.
+    now = time.time()
+    floor = spec.get("min_interval_s", 0)
+    gap = now - st["actions"].get(act, 0)
+    if gap < floor:
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, req, state="refused",
+                          detail=f"rate-limited: '{act}' ran {int(gap)}s ago, "
+                                 f"min interval is {floor}s")
+
+    group = spec.get("group")
+    if group:
+        cool = spec.get("group_cooldown_s", 0)
+        ggap = now - st["groups"].get(group, 0)
+        if ggap < cool:
+            # DEFERRED, not refused: leave the file, answer nothing, retry next tick.
+            # The ask is legitimate; the shared resource is busy.
+            if verbose:
+                print(f"gent: {name}/{act} deferred — group '{group}' busy "
+                      f"({int(cool - ggap)}s left)")
+            return None
+
+    argv = spec.get("run")
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, req, state="refused",
+                          detail=f"fleet.json's '{act}' has no valid argv list")
+
+    f.unlink(missing_ok=True)
+    started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if verbose:
+        print(f"gent: {name}/{act} → {' '.join(shlex.quote(x) for x in argv)}"
+              + (f"   ({req['why']})" if req.get("why") else ""))
+    # ⚠ The clock starts on ATTEMPT, not on success, and is written BEFORE the command
+    #   runs. A restart takes seconds; if the runner is killed mid-command the next
+    #   tick must still see that we tried, or a caller polling a signal that never
+    #   cleared gets a fresh attempt every 30 s forever.
+    st["actions"][act] = time.time()
+    if group:
+        st["groups"][group] = time.time()
+    try:
+        # cwd = the repo, so a repo-relative command (`docker compose …`) finds its own
+        # compose file. shell=False always: argv comes from fleet.json, but the habit is
+        # the protection.
+        r = subprocess.run(argv, cwd=str(cfg["abs_path"]), capture_output=True,
+                           text=True, timeout=HOST_ACTION_TIMEOUT_S)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        return _ha_answer(spool, rid, req, state="done" if r.returncode == 0 else "failed",
+                          rc=r.returncode, started=started, output=out[-4000:])
+    except subprocess.TimeoutExpired:
+        return _ha_answer(spool, rid, req, state="failed", rc=None, started=started,
+                          detail=f"timed out after {HOST_ACTION_TIMEOUT_S}s")
+    except OSError as e:
+        return _ha_answer(spool, rid, req, state="failed", rc=None, started=started,
+                          detail=str(e))
+
+
+def run_host_actions(fleet, name, cfg, verbose=True):
+    """Drain one box's request queue. Returns the list of results produced."""
+    specs = host_action_specs(cfg)
+    if not specs:
+        return []
+    root = host_actions_root(fleet, name)
+    spool = host_actions_spool(fleet, name, cfg)
+    st = _ha_state(root)
+    done = []
+
+    # Oldest first: a queue that reorders itself surprises a caller that wrote two
+    # requests expecting them in order. (mtime, name) because two files written in the
+    # same instant must still drain in a fixed order.
+    reqs = sorted((spool / "requests").glob("*.json"), key=lambda p: (p.stat().st_mtime, p.name))
+    for f in reqs:
+        try:
+            res = _ha_handle(name, spool, st, cfg, specs, f, verbose)
+        except Exception as e:                       # noqa: BLE001 — see below
+            # ★ THE INVARIANT IS "EVERY REQUEST IS ANSWERED", AND A BUG IN THE HANDLER
+            #   MUST NOT BREAK IT. It already did once, in this file: the rate-limit
+            #   branch unlinked the request and THEN raised on a missing key, so the ask
+            #   vanished with no result — the caller polls a file that will never appear.
+            #   A handler crash is a failed action, reported as one.
+            f.unlink(missing_ok=True)
+            res = _ha_answer(spool, f.stem, {}, state="failed",
+                             detail=f"host-action runner error: {e!r}")
+        finally:
+            _ha_save(root, st)
+        if res:
+            done.append(res)
+
+    # Sweep read results. Cheap, and keeps a months-old failure from being mistaken for
+    # a current one by a person listing the dir.
+    cutoff = time.time() - RESULT_TTL_S
+    for r in (spool / "results").glob("*.json"):
+        try:
+            if r.stat().st_mtime < cutoff:
+                r.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return done
+
+
+def cmd_fleet_host_actions(fleet, a):
+    """Serve every approved box's host-action queue once (this is the timer's job)."""
+    any_spec = False
+    for name, cfg in (fleet.get("repos") or {}).items():
+        if not cfg.get("allow") or not (cfg.get("host_actions") or {}).get("actions"):
+            continue
+        any_spec = True
+        try:
+            cfg = repo_cfg(fleet, name)
+        except SystemExit:
+            continue
+        for res in run_host_actions(fleet, name, cfg, verbose=not getattr(a, "quiet", False)):
+            mark = {"done": "✓", "deferred": "·"}.get(res.get("state"), "✗")
+            print(f"{mark} {name}/{res.get('action')}: {res.get('state')}"
+                  + (f" — {res['detail']}" if res.get("detail") else ""))
+    if not any_spec and not getattr(a, "quiet", False):
+        print("gent: no box declares host_actions in fleet.json")
+
+
 # ── recurring host jobs ───────────────────────────────────────────────────────
 # The fleet needs two jobs running on the HOST, forever, whether or not anyone is
 # logged in: `gent fleet refresh-auth` (re-mints the shared 8h token when the whole
@@ -1425,6 +1722,13 @@ def host_jobs(fleet):
         (f"gent-auth-watch",
          ["/bin/bash", str(HERE / "scripts" / "auth-watch.sh")],
          600, "gent: watch the shared login; alert + reconnect boxes on auth failure"),
+        # ⓘ 30 s, not 600: this one is in a person's way. A box asking for a restart
+        #   waits out the whole interval before anything happens, and the caller is
+        #   usually an agent that then has to re-verify. Harmless when idle — it is a
+        #   readdir over an empty dir per box that declares any action at all.
+        (f"gent-host-actions",
+         [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "host-actions", "--quiet"],
+         30, "gent: run boxes' pre-approved host actions (restarts they cannot do themselves)"),
     ]
 
 
@@ -1484,7 +1788,11 @@ def timer_install(label, argv, every, desc):
         # OnCalendar) to match launchd's StartInterval semantics — every N seconds
         # after the last run, not at wall-clock marks. Persistent catches up a run
         # missed while the box was off.
-        f"OnBootSec=2min\nOnUnitActiveSec={every}s\nAccuracySec=30s\nPersistent=true\n\n"
+        # AccuracySec must scale with the interval: systemd may delay a unit by up to
+        # this much to batch wakeups, so a flat 30 s turns a 30 s timer into an
+        # anything-from-30-to-60 s one — visible as lag to whoever is waiting on it.
+        f"OnBootSec=2min\nOnUnitActiveSec={every}s\nAccuracySec={max(1, min(30, every // 4))}s\n"
+        f"Persistent=true\n\n"
         f"[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", f"{label}.timer"],
@@ -1753,6 +2061,9 @@ def main():
         "--no-pull", action="store_true", help="build this checkout as-is; don't fast-forward first")
     fsub.add_parser("auth",   help="shared-login status")
     fsub.add_parser("refresh-auth", help="re-mint the shared login if it expired while the fleet idled (for cron)")
+    fha = fsub.add_parser("host-actions",
+                          help="run any pending box-requested host actions once (for the timer)")
+    fha.add_argument("--quiet", action="store_true", help="print only what actually ran")
     ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
     ft.add_argument("action", nargs="?", choices=["install", "status", "uninstall"], default="status")
 
