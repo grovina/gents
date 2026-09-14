@@ -293,7 +293,14 @@ def cmd_ls(fleet, _a):
     hname = host_name(fleet)
     up = tmux_has(hname)
     cwd = host_session_cwd(hname) if up else None
-    note = "  (host session)" if up else "  (host session — `gent host up` to start)"
+    if up:
+        note = "  (host session)"
+    elif not host_revive_cwd(hname)[0]:
+        note = "  (host session — `gent host up` to start)"
+    elif host_job_armed(f"gent-host-keepalive-{hname}"):
+        note = "  (host session — DIED; keepalive revives it within 10m, or `gent host up`)"
+    else:
+        note = "  (host session — DIED, keepalive off — `gent host up`)"
     print(f"{hname:<16}{'running' if up else '—':<12}{'-/-':<12}"
           f"{host_rel_path(fleet, cwd)}{note}")
 
@@ -944,7 +951,9 @@ HOST_SUPERVISOR = r'''#!/usr/bin/env bash
 #      idle session nearing token expiry so it re-mints in place (and bounces it
 #      if the token already lapsed, e.g. after the laptop slept). This is what an
 #      ACTIVE box gets for free from its own API calls.
-# Stop everything: tmux kill-session -t @@NAME@@
+# Stop everything: gent host down. A bare `tmux kill-session` looks exactly like a
+# crash, and the keepalive revives a crashed session while this file exists.
+# gent-host-cwd: @@CWD@@
 set -u
 trap : INT   # Ctrl+C reaches claude (it resets handlers on exec), not this loop.
 PROJ_DIR="@@PROJ@@"
@@ -967,7 +976,7 @@ while :; do
   # shell. Bare + non-login = "command not found" every 5s, forever, silently.
   "@@CLAUDE@@" -n "@@NAME@@" "$@"
   echo
-  echo "[claude exited — relaunching in 5s; 'tmux attach -t @@NAME@@' to watch, 'tmux kill-session -t @@NAME@@' to stop]"
+  echo "[claude exited — relaunching in 5s; 'tmux attach -t @@NAME@@' to watch, 'gent host down' to stop]"
   sleep 5
 done
 '''
@@ -1053,10 +1062,11 @@ HOST_BOOT_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 '''
 
-# The Linux twin of HOST_BOOT_PLIST. RemainAfterExit is the load-bearing line: `up`
-# is a oneshot that returns as soon as tmux is detached, and systemd tears down a
-# finished unit's whole cgroup — which would kill the tmux server (and the session)
-# seconds after starting it. Staying "active" leaves the cgroup alone.
+# The Linux twin of HOST_BOOT_PLIST. `up` is a oneshot that returns as soon as tmux is
+# detached, and systemd tears down a finished unit's whole cgroup — which would kill
+# the tmux server (and the session) seconds after starting it. `host_start_session`
+# now moves tmux into its own scope, so that no longer reaches it; RemainAfterExit
+# stays as the backstop for the plain-tmux fallback, where it is still load-bearing.
 HOST_BOOT_UNIT = '''[Unit]
 Description=gent: this host's supervised claude session
 # The supervisor is useless without a network to reach the API.
@@ -1219,6 +1229,89 @@ def host_session_cwd(name):
     return Path(p) if p and Path(p).is_dir() else None
 
 
+# ★ THE RUN SCRIPT IS THE "MEANT TO BE UP" MARKER. `up` writes it, `down` deletes it,
+#   nothing else touches it. So a missing tmux session with the script still present
+#   means the session died without anyone asking, and the keepalive revives it. The
+#   gap this closes: the supervisor lives INSIDE tmux, so anything that takes tmux down
+#   takes the supervisor with it. The keepalive only poked an existing session and the
+#   boot job only fires at boot, so nothing brought it back. On 2026-09-13 21:17 the
+#   host session ran a test harness whose `tmux kill-server` reached the real server
+#   ($TMUX outranks TMUX_TMPDIR), and the host stayed down ~20.5h until someone ssh'd
+#   in and ran `up` by hand.
+HOST_CWD_TAG = "# gent-host-cwd: "
+
+def host_run_script(name):
+    return Path.home() / f".gent-{name}-run.sh"
+
+
+def write_host_supervisor(name, cwd, claude_bin):
+    """Write the supervisor for a session started in `cwd`. Atomic (tmp + rename): `up`
+    also refreshes it under a LIVE session, and bash reads a running script by offset,
+    so an in-place rewrite would feed the live loop garbage. A rename leaves the running
+    bash on the old inode."""
+    run = host_run_script(name)
+    # claude keys per-project state by the working dir, slashes -> dashes.
+    proj_dir = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-")
+    tmp = run.with_name(run.name + ".tmp")
+    tmp.write_text(HOST_SUPERVISOR
+                   .replace("@@NAME@@", name)
+                   .replace("@@CWD@@", str(cwd))
+                   .replace("@@PROJ@@", str(proj_dir))
+                   .replace("@@CLAUDE@@", str(claude_bin))
+                   .replace("@@GENT@@", str(HERE / "gent")))
+    tmp.chmod(0o755)
+    os.replace(tmp, run)
+    return run
+
+
+def host_revive_cwd(name):
+    """(meant_up, cwd). meant_up: the run script exists, i.e. no `down` since the last
+    `up`. cwd: where to revive, or None when the script predates the recorded cwd (any
+    `gent host up` rewrites it)."""
+    run = host_run_script(name)
+    try:
+        text = run.read_text()
+    except OSError:
+        return False, None
+    for line in text.splitlines():
+        if line.startswith(HOST_CWD_TAG):
+            p = Path(line[len(HOST_CWD_TAG):])
+            return True, (p if p.is_dir() else None)
+    return True, None
+
+
+def host_start_session(name, cwd, run):
+    """Start the tmux session running the supervisor. Returns once tmux is detached.
+
+    ⚠⚠ ON SYSTEMD, TMUX GETS ITS OWN SCOPE. The tmux server stays in the cgroup of
+    whatever started it, and when that is a oneshot service (the keepalive timer's
+    unit), systemd kills the cgroup's leftovers the moment the unit finishes. The
+    session would die a second after being revived. Tested 2026-09-14 on isolated
+    sockets: tmux started from a oneshot was gone; the same command under
+    `systemd-run --user --scope` survived. The boot unit got away without this only
+    because RemainAfterExit keeps its cgroup alive. The scope also frees the session
+    from an ssh login's scope. No user manager to talk to (no bus, not systemd):
+    plain tmux, which is what every start did before."""
+    # A revive from a timer unit inherits systemd's bare PATH, and the tmux server
+    # hands its env to claude and to every tool claude runs. Add the job PATH's dirs
+    # (claude's, tmux's) without reordering an interactive PATH that already has them.
+    cur = os.environ.get("PATH", "")
+    missing = [d for d in host_job_path().split(":") if d not in cur.split(":")]
+    env = {**tmux_env(), "PATH": ":".join(missing + ([cur] if cur else []))}
+    argv = ["tmux", "new-session", "-d", "-s", name, "-n", "claude",
+            "-c", str(cwd), f"exec bash {shlex.quote(str(run))}"]
+    tries = []
+    if not IS_MAC and shutil.which("systemd-run"):
+        tries.append(["systemd-run", "--user", "--scope", "--quiet", "--collect", *argv])
+    tries.append(argv)
+    for cmd in tries:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # A lost race (the boot job and the keepalive both starting it) is a success.
+        if r.returncode == 0 or tmux_has(name):
+            return
+    die(f"could not start tmux session '{name}': {(r.stderr or r.stdout).strip()}")
+
+
 def cmd_host_up(fleet, a):
     """Start (or report) this host's supervised claude session in tmux. Resumes
     the newest transcript in the launch dir, so the phone reconnects the SAME
@@ -1235,6 +1328,10 @@ def cmd_host_up(fleet, a):
     if tmux_has(name):
         print(f"gent: host session '{name}' already running — `gent host attach` to join.")
         boot_cwd = expand(a.cwd) if getattr(a, "cwd", None) else host_session_cwd(name)
+        # Refresh the supervisor too, so the keepalive knows where to revive this
+        # session. A script from before the cwd was recorded gets fixed by any `up`.
+        if boot_cwd and boot_cwd.is_dir():
+            write_host_supervisor(name, boot_cwd, claude_bin)
     else:
         cwd = expand(a.cwd) if getattr(a, "cwd", None) else Path.cwd()
         if not cwd.is_dir():
@@ -1246,18 +1343,8 @@ def cmd_host_up(fleet, a):
         # which is public. Forgetting once publishes the memory.
         if (cwd / ".git").exists():
             ensure_memory_dir({"abs_path": cwd})
-        # claude keys per-project state by the working dir, slashes -> dashes.
-        proj_dir = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-")
-        run = Path.home() / f".gent-{name}-run.sh"
-        run.write_text(HOST_SUPERVISOR
-                       .replace("@@NAME@@", name)
-                       .replace("@@PROJ@@", str(proj_dir))
-                       .replace("@@CLAUDE@@", str(claude_bin))
-                       .replace("@@GENT@@", str(HERE / "gent")))
-        run.chmod(0o755)
-        subprocess.run(["tmux", "new-session", "-d", "-s", name, "-n", "claude",
-                        "-c", str(cwd), f"exec bash {shlex.quote(str(run))}"],
-                       check=True, env=tmux_env())
+        run = write_host_supervisor(name, cwd, claude_bin)
+        host_start_session(name, cwd, run)
         apply_host_tmux_opts(name)
         print(f"gent: host session '{name}' up in tmux (cwd {cwd}).")
     # Arm the keepalive every time (idempotent), so a single `up` is all it takes —
@@ -1272,7 +1359,7 @@ def cmd_host_up(fleet, a):
     # reboot — not just a crash (supervisor) or idle expiry (keepalive).
     if boot_cwd and install_host_boot(fleet, boot_cwd, quiet=True):
         print(f"      boot autostart armed ({'launchd — at login' if IS_MAC else 'systemd — at boot'}).")
-    print(f"      attach: gent host attach   |   stop: tmux kill-session -t {name}")
+    print(f"      attach: gent host attach   |   stop: gent host down")
 
 
 def cmd_host_clear(fleet, a):
@@ -1355,7 +1442,9 @@ def cmd_host_down(fleet, a):
         remove_host_job(f"gent-host-keepalive-{name}")
         remove_host_boot(fleet)
         print(f"gent: keepalive + boot jobs removed.")
-    run = Path.home() / f".gent-{name}-run.sh"
+    # Removing the run script is also what tells the keepalive this stop was on
+    # purpose (see HOST_CWD_TAG), so it must happen before the kill, like the rest.
+    run = host_run_script(name)
     if run.exists():
         run.unlink()
     # ⓘ Warn BEFORE the kill, for the same reason the cleanup runs before it: said after,
@@ -1389,14 +1478,35 @@ def cmd_host_keepalive(fleet, a):
     entirely if the session is busy (it's re-minting itself) or if we'd be acting
     too early. Only once the token has actually lapsed — the post-sleep case where
     the socket already dropped and a poke can't revive it — do we BOUNCE claude,
-    letting the supervisor relaunch it to re-mint and reconnect Remote Control."""
+    letting the supervisor relaunch it to re-mint and reconnect Remote Control.
+
+    A session that is GONE but was never `down`ed gets REVIVED: started again in the
+    dir it was last `up`ed in, resuming its newest transcript. The worst case after a
+    tmux crash or kill-server becomes one timer interval instead of the next reboot.
+    Revives always print, even with --quiet: the timer's journal is the only record."""
     name = host_name(fleet)
     quiet = getattr(a, "quiet", False)
     def say(m):
         if not quiet:
             print(f"gent: {m}")
     if not tmux_has(name):
-        say(f"host session '{name}' not running — nothing to keep alive.")
+        meant_up, cwd = host_revive_cwd(name)
+        if not meant_up:
+            say(f"host session '{name}' not running (stopped with `gent host down`) — nothing to keep alive.")
+            return
+        if cwd is None:
+            print(f"gent: host session '{name}' died, but its run script records no usable cwd "
+                  f"to revive it in — run `gent host up` from its dir once.", file=sys.stderr)
+            raise SystemExit(1)
+        claude_bin = host_claude_bin()
+        if not claude_bin:
+            print(f"gent: host session '{name}' died and there is no claude to revive it with.",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        print(f"gent: host session '{name}' died without `gent host down` — reviving it in {cwd}.")
+        run = write_host_supervisor(name, cwd, claude_bin)
+        host_start_session(name, cwd, run)
+        apply_host_tmux_opts(name)
         return
     remaining = host_token_remaining()
     if remaining is None:
@@ -2216,7 +2326,10 @@ def cmd_host_status(fleet, a):
         f"~{int(remaining // 60)}m left" if remaining > 0 else "EXPIRED")
     ka = host_job_armed(f"gent-host-keepalive-{name}")
     boot = host_job_armed(f"gent-host-boot-{name}")
-    print(f"gent: host session '{name}': {'up' if up else 'down'}  |  token: {tok}  |  "
+    state = "up" if up else (
+        ("DIED (keepalive revives it)" if ka else "DIED (keepalive off — `gent host up`)")
+        if host_revive_cwd(name)[0] else "down")
+    print(f"gent: host session '{name}': {state}  |  token: {tok}  |  "
           f"keepalive: {'on' if ka else 'off'}  |  boot autostart: {'on' if boot else 'off'}")
 
 

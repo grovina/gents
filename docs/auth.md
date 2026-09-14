@@ -32,7 +32,7 @@ survives a reboot:
 
 ```
 gent host up        # tmux + self-healing supervisor + keepalive + boot autostart, all armed
-gent host down      # stop it (kill tmux + reap any orphaned claude)
+gent host down      # stop it (kill tmux + reap any orphaned claude) — the only stop the keepalive respects
 gent host status    # session state + token expiry + keepalive & boot-autostart jobs
 gent host attach    # join the session (`gent attach host` is the same thing)
 ```
@@ -52,12 +52,19 @@ fleet, not a thing off to the side.
   prompt to force an in-place re-mint (skipped if the session is busy — it's
   re-minting itself); only once the token has actually lapsed (e.g. after the
   laptop slept) does it **bounce** claude so the supervisor relaunches it and
-  reconnects Remote Control.
+  reconnects Remote Control. If the session is **gone** without a `gent host down`
+  (the tmux server crashed or was killed, which takes the supervisor down with it),
+  it **revives** it in the dir it was last `up`ed in, within one 10-minute tick.
+  `up` records that dir in `~/.gent-<name>-run.sh`, and `down` deletes the file,
+  which is how the keepalive tells a crash from a deliberate stop. So stop with
+  `gent host down`: a bare `tmux kill-session` looks like a crash and comes back.
+  On systemd, tmux is started in its own `systemd-run --user --scope`. Without it,
+  systemd kills a revived tmux server as soon as the keepalive's oneshot unit exits.
 - **boot autostart** (`gent-host-boot-<name>`: a `RunAtLoad` launchd job on macOS,
   a systemd `--user` unit on Linux) runs `gent host up` at login/boot — the tmux
-  server doesn't survive a reboot,
-  and keepalive only pokes an *existing* session, so without this a rebooted host
-  has no session until someone runs `up` by hand. It remembers the cwd `up` was
+  server doesn't survive a reboot. Without this job, a rebooted host would wait up to
+  one keepalive tick for a revive, or have no session at all if `gent host down --keepalive`
+  removed both jobs. It remembers the cwd `up` was
   last started in, and its PATH is widened to find `claude` (often `~/.local/bin`)
   and `tmux`. `gent host down --keepalive` removes it along with the keepalive.
   Both jobs need systemd lingering on Linux (`gent` enables it, or tells you to);
