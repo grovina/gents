@@ -118,6 +118,20 @@ def append_sched(rec):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _read_note(raw):
+    """Resolve a --note value: '-' reads the payload from stdin (the standard
+    homer-door convention — matches every other door's `- <<'EOF' ... EOF` idiom),
+    and either way an empty/whitespace note is refused. A reminder's note IS its
+    whole payload, so a silently-empty one deletes the work and it only surfaces
+    at the deadline (bl962: `--note -` used to store the literal character "-"
+    and the heredoc piped on stdin was never read, exit 0)."""
+    note = sys.stdin.read() if raw == "-" else raw
+    if not note or not note.strip():
+        sys.exit("--note is empty — a reminder's note is its whole payload; "
+                  "pass text, or `--note -` to pipe one in on stdin")
+    return note
+
+
 def fold():
     items = {}
     p = sched_path()
@@ -141,6 +155,16 @@ def fold():
                 items[rid]["fired"] = True
             elif op == "done" and rid in items:
                 items[rid]["done"] = True
+            elif op == "edit" and rid in items:
+                if "note" in r:
+                    items[rid]["add"]["note"] = r["note"]
+                if "fire_at" in r:
+                    items[rid]["add"]["fire_at"] = r["fire_at"]
+                    # A corrected time must nag again — `fired` marks "the daemon
+                    # already emitted this instance", which is no longer true of
+                    # the NEW time. Leaving it True would silently skip it forever
+                    # in cmd_fire_due (`if it["fired"]: continue`).
+                    items[rid]["fired"] = False
     return items
 
 
@@ -183,8 +207,9 @@ def cmd_add(argv):
             every = argv[i + 1]; i += 2
         else:
             sys.exit("add: unknown arg %r" % a)
-    if not note:
-        sys.exit("add: --note required")
+    if note is None:
+        sys.exit("add: --note required (or `--note -` to pipe one in on stdin)")
+    note = _read_note(note)
     recur = parse_dur(every) if every else None
     if at:
         try:
@@ -267,6 +292,57 @@ def cmd_rm(argv):
     if not argv:
         sys.exit("usage: gent-schedule rm <id>")
     _resolve(argv[0], reschedule=False)
+
+
+def cmd_edit(argv):
+    """Change a queued reminder's note and/or fire time in place — an append-only
+    `edit` record, same shape as `add`/`fire`/`done`. Exists so correcting a typo
+    or a wrong date is one call instead of `rm` + `add` with the payload retyped
+    by hand (bl962/bl965)."""
+    if not argv:
+        sys.exit("usage: gent-schedule edit <id> [--note <text>|-] [--at <iso>|--in <dur>]")
+    rid, rest = argv[0], argv[1:]
+    items = fold()
+    if rid not in items:
+        sys.exit("no reminder %s" % rid)
+    if items[rid]["done"]:
+        sys.exit("edit: %s is already done" % rid)
+    note = at = in_d = None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--note":
+            note = rest[i + 1]; i += 2
+        elif a == "--at":
+            at = rest[i + 1]; i += 2
+        elif a == "--in":
+            in_d = rest[i + 1]; i += 2
+        else:
+            sys.exit("edit: unknown arg %r" % a)
+    if at and in_d:
+        sys.exit("edit: pass --at or --in, not both")
+    if note is None and at is None and in_d is None:
+        sys.exit("edit: nothing to change — pass --note and/or --at/--in")
+    rec = {"op": "edit", "id": rid, "at": iso(now())}
+    if note is not None:
+        rec["note"] = _read_note(note)
+    if at:
+        try:
+            fire = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except Exception:
+            sys.exit("edit: bad --at %r (use ISO 8601, e.g. 2026-06-15T09:00:00Z)" % at)
+        if fire.tzinfo is None:
+            fire = fire.replace(tzinfo=datetime.UTC)
+        rec["fire_at"] = iso(fire)
+    elif in_d:
+        rec["fire_at"] = iso(now() + datetime.timedelta(seconds=parse_dur(in_d)))
+    append_sched(rec)
+    said = []
+    if "note" in rec:
+        said.append("note updated")
+    if "fire_at" in rec:
+        said.append("now fires %s" % rec["fire_at"])
+    print("edited %s — %s" % (rid, ", ".join(said)))
 
 
 # ── cron triggers (calendar slots; no backfill) ───────────────────────────────
@@ -488,15 +564,35 @@ def cmd_fire_due(_argv):
     _fire_cron()
 
 
+USAGE = """usage: gent-schedule <command> [args]
+
+  add --note <text>|- [--at <iso>|--in <dur>] [--every <dur>]   schedule a reminder
+  edit <id> [--note <text>|-] [--at <iso>|--in <dur>]           change a queued one
+  list                                                          show pending reminders
+  due                                                           show reminders due now
+  done <id>                                                     mark done (advances --every)
+  rm <id>                                                       remove (ends a recurring series)
+  fire-due                                                      daemon tick (bootstrap-run)
+
+`--note -` reads the note from stdin (e.g. `--note - <<'EOF' ... EOF`) — use it for
+anything with quotes, backticks or newlines. An empty or whitespace-only note is
+refused: a reminder's note is its whole payload. See the module docstring (top of
+this file) for cron triggers (calendar slots, $GENT_CRON_PATH)."""
+
+
 def main():
     if len(sys.argv) < 2:
-        sys.exit("usage: gent-schedule <add|list|due|done|rm|fire-due> ...")
+        sys.exit(USAGE)
     cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd in ("--help", "-h", "help"):
+        print(USAGE)
+        return
     return {
-        "add": cmd_add, "list": cmd_list, "due": cmd_due,
+        "add": cmd_add, "edit": cmd_edit, "list": cmd_list, "due": cmd_due,
         "done": cmd_done, "rm": cmd_rm, "fire-due": cmd_fire_due,
         "_exec": cmd_exec,
-    }.get(cmd, lambda _a: sys.exit("gent-schedule: unknown subcommand %r" % cmd))(rest)
+    }.get(cmd, lambda _a: sys.exit(
+        "gent-schedule: unknown subcommand %r — see `gent-schedule --help`" % cmd))(rest)
 
 
 if __name__ == "__main__":
