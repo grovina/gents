@@ -12,6 +12,14 @@
 
   "_comment": "Copy this file to fleet.json and edit — fleet.json is gitignored (it's your machine's private grants). state_root (~/.gent/state) is the single relocatable home for precious, non-git fleet state: secrets/ (a shared CATALOG of reusable credential files + .env fragments, referenced by relative path — isolation happens in the grant, so a box sees only what its entry lists and can never get more) and app/<box>/ (per-box app state pulled out of volumes/repos, bound read-write via a repo's `state_mounts`). secrets_root defaults to state_root/secrets. projects_root is where your repos live; each repo's `path` is relative to it.",
 
+  "cost": {
+    "_note": "OPTIONAL. The fleet's standing guard against paying to re-read an ever-longer context — which is what the bill actually is (cache reads on a 250–900K-token context were ~75% of spend; output and effort a small part). `gent fleet cost` writes these into the shared claude-home AND the host's ~/.claude, and only the keys named here; `gent fleet doctor` warns when they drift, and `gent up` re-asserts them. autocompact_window: tokens at which claude compacts, main agents AND subagents (measured: it fires ~35K below the number, so 400000 compacts near 365K). Without it a native-1M model grows to ~967K. Keep your clear nudge (a repo's gent.json `clear.atTokens`) BELOW that point so the model hands off cleanly before the lossy compaction backstop. subagent_model: model every subagent is forced onto. disable_fast_mode: a saved fastMode in a shared file would otherwise put every box on the 2x-priced tier. `eco` is the profile `gent eco on` lays over all this when the quota runs low (`gent eco off` restores exactly): the main model (an alias, so a release does not stale it), a cap on effort, and a tighter window.",
+    "autocompact_window": 400000,
+    "subagent_model": "claude-sonnet-5-5",
+    "disable_fast_mode": true,
+    "eco": { "model": "sonnet", "max_effort": "medium", "autocompact_window": 200000 }
+  },
+
   "repos": {
     "myapp": {
       "path": "myorg/myapp",

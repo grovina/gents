@@ -440,6 +440,87 @@ delegates rather than reimplements — the queued keystroke, the
 prove-it-by-a-new-transcript check and the idle-gated greet are subtle enough
 that a second copy would drift from the first the moment either changed.
 
+## What the bill actually is — the compaction ceiling, and eco mode
+
+A long agent session is not expensive because it *writes* a lot. Measured over
+three weeks of one fleet's transcripts, **~75% of the spend was cache reads**:
+every request re-reads the whole context, and a native-1M model does not
+compact until ~967K tokens. The median request carried 250–330K tokens; builder
+subagents grew to 500–900K and cost more than the main agent that spawned them.
+Output (and so effort) was ~6%. So the lever is *how long a context may grow*,
+and second *which model reads it*.
+
+Both are claude settings, and a fleet keeps them in **two files** — the shared
+`claude-home` every box mounts, and the host's own `~/.claude` — which drift if
+edited by hand. So `fleet.json`'s `cost` block is the authority, and gent is the
+only writer of the keys it names:
+
+```json
+"cost": {
+  "autocompact_window": 400000,
+  "subagent_model": "claude-sonnet-5-5",
+  "disable_fast_mode": true,
+  "eco": { "model": "sonnet", "max_effort": "medium", "autocompact_window": 200000 }
+}
+```
+
+```bash
+gent fleet cost            # apply the standing policy (idempotent; --check only reports)
+gent fleet doctor          # warns when it has drifted; `gent up` re-asserts it
+```
+
+- **`autocompact_window`** → `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Measured on CLI
+  2.1.296, not documented: it reaches **subagents** too, and compaction fires
+  ~**35K below** the number (a 100K window compacted a subagent at ~64K), so
+  400000 compacts near 365K.
+- **`subagent_model`** → `CLAUDE_CODE_SUBAGENT_MODEL` + `…_FORCE=1`.
+- **`disable_fast_mode`** → a saved `fastMode` in a shared file would otherwise
+  put every box on the 2×-priced tier.
+
+A key you leave out is never touched, so this does not delete a setting someone
+made by hand.
+
+**Keep the clear nudge below the compaction point.** Compaction is the lossy
+backstop; the nudge (`clear.atTokens`, above) lets the model hand off in its own
+words first. With a 400K window, a 350K nudge leaves the model ~15K tokens of
+runway — raise the window, not the nudge, if it lands mid-thought.
+
+### Eco mode — for when the quota is running out
+
+```bash
+gent eco on        # cheaper model + effort cap + tighter window, fleet-wide
+gent eco off       # put everything back exactly as it was
+gent eco status    # what each session is configured for vs. actually running
+```
+
+`on` changes, and `off` restores from a record in `<state_root>/eco.json`:
+
+- the shared claude-home **and** the host's `~/.claude`: `model`, `maxEffortLevel`,
+  and the window (the profile in `cost.eco`; the model is an *alias* so a
+  release does not stale it);
+- `model` in `<repo>/.claude/settings.local.json` of every box whose
+  **project** settings pin a model — a project pin outranks the shared default,
+  which is the usual reason a fleet-wide model change "did nothing" for one
+  repo. The local file outranks the pin and is gitignored, so no tracked file
+  is touched;
+- every **running** session, switched in place with `/model`. A running
+  session ignores a settings change to its model (it is fixed at launch, and a
+  restart resumes the model the transcript recorded), so the pane is the only
+  lever that keeps the conversation. gent answers the CLI's "Switch model? the
+  full history gets re-read" menu — which would otherwise block an unattended
+  pane — and skips sessions already on the target, since a switch is a
+  full-history re-read.
+
+`--dry-run` prints the plan and changes nothing; `--no-live` changes config only.
+
+⚠ `/model` writes `model` and `modelSettings[<id>].effortLevel` into the **shared**
+settings ("saved as your default for new sessions"), and the effort it records is
+the *switching session's* — from an `xhigh` box that would put the whole fleet on
+`xhigh`. So eco snapshots `modelSettings` before switching and puts it back
+after. ⚠ And `/model` makes no request of its own: `eco status` reads each
+session's real model from its transcript, so a switch shows up there only after
+that session's next turn.
+
 ## A custom "hi" per box — `.gent/hello.md`
 
 Drop a `.gent/hello.md` in the repo and gents replays it into the claude pane as

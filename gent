@@ -255,6 +255,14 @@ def cmd_doctor(fleet, _a):
               + ("" if good else " — run: gent fleet timers install"))
         ok = ok and good
 
+    # The cost policy is a standing guard, not a one-off: without its compaction window a
+    # native-1M session grows to ~967K tokens and re-reads all of it on every request. A warning,
+    # not a failure — drift here makes the fleet expensive, not broken.
+    if cost_cfg(fleet):
+        drift = apply_cost_policy(fleet, check=True, quiet=True)
+        print(f"{'✓' if not drift else '!'} cost policy "
+              + ("in place" if not drift else f"has drifted in {drift} place(s) — run: gent fleet cost"))
+
     # Per-repo claude memory MUST be gitignored, in every repo, always. It is
     # agent-written and records whatever the agent learned about your machines and
     # your fleet; several of these repos are public. One `git add -A` would publish it
@@ -526,6 +534,8 @@ def cmd_up(fleet, a):
     shared_claude = fleet["secrets_root"] / "claude-home"
     shared_claude.mkdir(parents=True, exist_ok=True)
     args += ["-v", f"{shared_claude}:/home/gent/.claude"]
+    if cost_cfg(fleet):                 # fleet.json is the authority for the cost keys in it
+        apply_cost_policy(fleet, quiet=True)
 
     # Per-repo claude MEMORY lives IN THE REPO (<repo>/.claude/memory), not under
     # ~/.claude/projects/<abs-path-key>. That one move is what makes memory portable:
@@ -788,51 +798,93 @@ def cmd_shell(fleet, a):
     os.execvp("docker", ["docker", "exec", "-it", container(a.repo), "bash", "-l"])
 
 
+class Pane:
+    """A claude session's tmux pane — a box's, or this host's own.
+
+    ONE implementation of "put text into a session and read its screen", so `gent send`, `gent
+    peek` and `gent eco` cannot drift apart on the parts that were learned the hard way. A box's
+    tmux lives in its container; the host's runs on this machine under the name `fleet.json`
+    gives it. Nothing else differs, so nothing else is parameterised."""
+
+    def __init__(self, fleet, name):
+        self.name = name
+        if is_host(fleet, name):
+            self.host, self.session = True, f"{host_name(fleet)}:claude"
+            self.prefix, self.env = ["tmux"], tmux_env()
+        else:
+            self.host, self.session = False, "gent"
+            self.prefix, self.env = ["docker", "exec", container(name), "tmux"], None
+
+    @classmethod
+    def of(cls, fleet, name):
+        """The pane for `name`, refusing a session that is not running."""
+        if is_host(fleet, name):
+            if not tmux_has(host_name(fleet)):
+                die(f"host session '{host_name(fleet)}' is not running — `gent host up` first")
+        else:
+            repo_cfg(fleet, name)
+            state = container_state(name)
+            if state != "running":
+                die(f"'{name}' box is not running (state: {state}) — `gent up {name}` first")
+        return cls(fleet, name)
+
+    def tmux(self, *args, capture=False):
+        r = subprocess.run([*self.prefix, *args], capture_output=capture, text=True, env=self.env)
+        return r.stdout if capture else None
+
+    def screen(self):
+        return self.tmux("capture-pane", "-p", "-t", self.session, capture=True) or ""
+
+    def key(self, *keys):
+        """Bare keystrokes — what a menu takes. `send` is paste-then-submit and cannot answer one."""
+        self.tmux("send-keys", "-t", self.session, *keys)
+
+    def send(self, msg):
+        """Type `msg` into the session and submit it.
+
+        A naive `send-keys "text" Enter` lands the text *and* the Enter as one blob, which the TUI
+        reads as a newline in the compose box — the message just sits there unsent (learned the
+        hard way). So we first CLEAR the composer, then paste the body through a tmux buffer with
+        BRACKETED paste (`paste-buffer -p`, so the TUI treats it as pasted text — multi-line and
+        key-like words like 'Enter' stay literal, never interpreted), settle, then send Enter as
+        its own keystroke to submit.
+
+        The clear matters: an earlier inject into a BUSY pane leaves its text unsent in the
+        composer, so without clearing, this message concatenates onto that stale draft and both go
+        out as one garbled blob (observed: two queued nudges + a heads-up fused together). We clear
+        with a burst of Ctrl+U (kill-to-line-start): one clears a single line, and repeated
+        presses walk up and clear a multi-line draft too (empirically ~2 per line; double-Esc, the
+        documented "clear input", did NOT clear reliably on a bypass-permissions box, so we don't
+        rely on it). Ctrl+U on an already-empty composer is a harmless no-op, so we send a
+        generous fixed count — the box's composer only ever holds prior injects, never a human's
+        live draft, so clearing it is always safe. Killed text stays on the readline kill-ring
+        (C-y), so nothing is truly lost."""
+        self.tmux("send-keys", "-t", self.session, "-N", "60", "C-u")
+        time.sleep(0.2)                    # let the composer clear before we paste
+        self.tmux("set-buffer", "-b", "gent-send", "--", msg)
+        self.tmux("paste-buffer", "-t", self.session, "-b", "gent-send", "-d", "-p")
+        time.sleep(0.4)                    # let the paste settle before the submit keystroke
+        self.key("Enter")
+
+
 def cmd_peek(fleet, a):
-    repo_cfg(fleet, a.repo)
-    docker("exec", container(a.repo), "tmux", "capture-pane", "-p", "-t", "gent", check=False)
+    print(Pane.of(fleet, a.repo).screen(), end="")
 
 
 def cmd_send(fleet, a):
     """Type a message into a box's claude session and submit it — the ergonomic
-    way to prompt a box from the host (or from another box).
+    way to prompt a box from the host (or from another box). `host` addresses this
+    machine's own session the same way.
 
         gent send homer "reconcile your tree, I just pushed a fix"
         some_long_thing | gent send homer          # body from stdin
 
-    Why it's a command and not two raw tmux calls: a naive `send-keys "text" Enter`
-    lands the text *and* the Enter as one blob, which the TUI reads as a newline in
-    the compose box — the message just sits there unsent (learned the hard way). So
-    we first CLEAR the composer, then paste the body through a tmux buffer with
-    BRACKETED paste (`paste-buffer -p`, so the TUI treats it as pasted text —
-    multi-line and key-like words like 'Enter' stay literal, never interpreted),
-    settle, then send Enter as its own keystroke to submit.
-
-    The clear matters: an earlier inject into a BUSY pane leaves its text unsent in
-    the composer, so without clearing, this message concatenates onto that stale
-    draft and both go out as one garbled blob (observed: two queued nudges + a
-    heads-up fused together). We clear with a burst of Ctrl+U (kill-to-line-start):
-    one clears a single line, and repeated presses walk up and clear a multi-line
-    draft too (empirically ~2 per line; double-Esc, the documented "clear input",
-    did NOT clear reliably on a bypass-permissions box, so we don't rely on it).
-    Ctrl+U on an already-empty composer is a harmless no-op, so we send a generous
-    fixed count — the box's composer only ever holds prior injects, never a human's
-    live draft, so clearing it is always safe. Killed text stays on the readline
-    kill-ring (C-y), so nothing is truly lost."""
-    repo_cfg(fleet, a.repo)
-    state = container_state(a.repo)
-    if state != "running":
-        die(f"'{a.repo}' box is not running (state: {state}) — `gent up {a.repo}` first")
+    Why it's a command and not two raw tmux calls: see Pane.send."""
+    pane = Pane.of(fleet, a.repo)
     msg = " ".join(a.message).strip() if a.message else sys.stdin.read().strip()
     if not msg:
         die("nothing to send — pass a message or pipe it on stdin")
-    c = container(a.repo)
-    docker("exec", c, "tmux", "send-keys", "-t", "gent", "-N", "60", "C-u", check=False)
-    time.sleep(0.2)                    # let the composer clear before we paste
-    docker("exec", c, "tmux", "set-buffer", "-b", "gent-send", "--", msg, check=False)
-    docker("exec", c, "tmux", "paste-buffer", "-t", "gent", "-b", "gent-send", "-d", "-p", check=False)
-    time.sleep(0.4)                    # let the paste settle before the submit keystroke
-    docker("exec", c, "tmux", "send-keys", "-t", "gent", "Enter", check=False)
+    pane.send(msg)
     print(f"gent: sent to {a.repo} ({len(msg)} chars). `gent peek {a.repo}` to watch.")
 
 
@@ -2344,6 +2396,430 @@ def cmd_deploy_key(fleet, a):
     print(f"gent: {a.repo} deploy key ready: {key}")
 
 
+# ── cost policy + eco mode ───────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. Spend is not driven by output or by effort; it is the cache READ of a long
+# context, paid again on every request. Measured over three weeks of this fleet's transcripts
+# at list price: cache reads were ~75% of cost, output ~6%, and the median request was
+# sent with a 250–330K-token context because native-1M models do not compact until ~967K. Builder
+# subagents grew to 500–900K tokens and cost MORE than the main agent they worked for. So the
+# lever that matters is how long a context may grow — and the second is which model reads it.
+#
+# Both are claude settings, and the fleet has TWO places that hold them: the shared claude-home
+# every box bind-mounts, and the host's own ~/.claude. Hand-editing both drifts; so fleet.json's
+# `cost` block is the authority and these commands are the only writers of the keys it names:
+#
+#   gent fleet cost          apply the standing policy (idempotent; `--check` only reports)
+#   gent eco on|off|status   the quota-is-running-out switch: cheaper model + effort cap + a
+#                            tighter window, reversible exactly
+#
+# ⓘ MEASURED 2026-10-11 (CLI 2.1.296, host probes, not in the docs): CLAUDE_CODE_AUTO_COMPACT_WINDOW
+#   in a settings `env` block DOES reach subagents (a subagent compacted at ~64K under a 100K
+#   window). The window is the nominal size, not the trigger: compaction fired ~35K BELOW it, so a
+#   400K window compacts around 365K. The documented subagent-specific knob
+#   (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) therefore is not needed, and is not used.
+
+MISSING = object()        # "the key is absent" — distinct from any value, None included
+
+# fleet.json `cost` key -> the settings.json paths it owns. A key that is not configured is not
+# touched: this never deletes a setting someone made by hand.
+COST_POLICY = {
+    "autocompact_window": lambda v: {"env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(v))},
+    "subagent_model":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL": str(v),
+                                     "env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+    "disable_fast_mode":  lambda v: {"env.CLAUDE_CODE_DISABLE_FAST_MODE": "1"} if v else {},
+}
+# What `eco on` changes besides the policy. `model` is an alias by default — never a pinned id —
+# so a model release does not make this stale.
+ECO_DEFAULTS = {"model": "sonnet", "max_effort": "medium", "autocompact_window": 200000}
+
+
+def _jget(d, path):
+    for k in path.split("."):
+        if not isinstance(d, dict) or k not in d:
+            return MISSING
+        d = d[k]
+    return d
+
+
+def _jset(d, path, value):
+    *parents, leaf = path.split(".")
+    for k in parents:
+        d = d.setdefault(k, {})
+    if value is MISSING:
+        d.pop(leaf, None)
+    else:
+        d[leaf] = value
+
+
+def _jdrop_empty(d, path):
+    """After deleting a leaf, drop the parent objects that only existed to hold it."""
+    parents = path.split(".")[:-1]
+    for i in range(len(parents), 0, -1):
+        node = _jget(d, ".".join(parents[:i]))
+        if node == {}:
+            _jset(d, ".".join(parents[:i]), MISSING)
+
+
+def read_settings(path):
+    """A settings file as a dict; {} when absent. Refuses one it cannot parse — it is a live
+    config of a running fleet, and a half-understood file is not ours to rewrite."""
+    if not path.exists() or not path.read_text().strip():
+        return {}
+    try:
+        d = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{path} is not valid JSON ({e}) — fix it by hand; gent won't clobber a file it can't read")
+    if not isinstance(d, dict):
+        die(f"{path} is not a JSON object")
+    return d
+
+
+def write_settings(path, d):
+    """Atomic, mode-preserving rewrite. A box reads this file as a different user than the one
+    that wrote it, and mkstemp's 0600 would make it unreadable there — so the original mode is
+    copied, never defaulted."""
+    mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
+    tmp = path.with_name(f".{path.name}.gent-{os.getpid()}")
+    tmp.write_text(json.dumps(d, indent=2) + "\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def cost_cfg(fleet):
+    c = fleet.get("cost") or {}
+    bad = [k for k in c if not k.startswith("_") and k not in (*COST_POLICY, "eco")]
+    if bad:
+        die(f"fleet.json cost: unknown key(s) {', '.join(bad)} (known: {', '.join(COST_POLICY)}, eco)")
+    return c
+
+
+def eco_cfg(fleet):
+    e = {**ECO_DEFAULTS, **(cost_cfg(fleet).get("eco") or {})}
+    e = {k: v for k, v in e.items() if not k.startswith("_")}
+    bad = [k for k in e if k not in ECO_DEFAULTS]
+    if bad:
+        die(f"fleet.json cost.eco: unknown key(s) {', '.join(bad)} (known: {', '.join(ECO_DEFAULTS)})")
+    return e
+
+
+def eco_state_path(fleet):
+    return fleet["state_root"] / "eco.json"
+
+
+def eco_state(fleet):
+    p = eco_state_path(fleet)
+    return json.loads(p.read_text()) if p.exists() else {"on": False}
+
+
+def settings_targets(fleet):
+    """(label, path) of every user-scope settings file the policy governs. The shared claude-home
+    is every box; the host's ~/.claude is the host session. A missing file is skipped, not
+    created — it appears on first login, and a box-only host has no host claude at all."""
+    out = [("fleet", fleet["secrets_root"] / "claude-home" / "settings.json")]
+    if (Path.home() / ".claude").is_dir():
+        out.append(("host", Path.home() / ".claude" / "settings.json"))
+    return [(l, p) for l, p in out if p.exists()]
+
+
+def policy_values(fleet, eco_on):
+    """{settings path: value} the config currently demands — the standing policy, with the eco
+    profile laid over it while eco is on."""
+    want = {}
+    for key, v in cost_cfg(fleet).items():
+        if key in COST_POLICY:
+            want.update(COST_POLICY[key](v))
+    if eco_on:
+        e = eco_cfg(fleet)
+        want["model"] = e["model"]
+        want["maxEffortLevel"] = e["max_effort"]
+        want["env.CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(e["autocompact_window"]))
+    return want
+
+
+def apply_cost_policy(fleet, check=False, quiet=False):
+    """Write the standing policy (plus eco's overlay while eco is on) into every target.
+    Returns the number of (target, key) pairs that differed. With check=True, writes nothing."""
+    want = policy_values(fleet, eco_state(fleet).get("on", False))
+    drift = 0
+    for label, path in settings_targets(fleet):
+        d = read_settings(path)
+        changed = []
+        for k, v in want.items():
+            if _jget(d, k) != v:
+                changed.append((k, _jget(d, k), v))
+                _jset(d, k, v)
+        drift += len(changed)
+        if changed and not check:
+            write_settings(path, d)
+        for k, old, new in changed:
+            if not quiet:
+                print(f"  {label:<6} {k}: {'—' if old is MISSING else old} → {new}"
+                      + ("  (would change)" if check else ""))
+    return drift
+
+
+def cmd_fleet_cost(fleet, a):
+    """Apply fleet.json's standing `cost` policy to the shared claude-home and the host's ~/.claude.
+
+    Idempotent, and it only ever writes the keys the policy names. `--check` writes nothing and
+    exits 1 on drift (what `gent fleet doctor` runs). Running boxes see an `env` change at their
+    next subagent spawn; the model of a running session is unaffected (see `gent eco`)."""
+    if not cost_cfg(fleet):
+        die("fleet.json has no `cost` block — nothing to apply (see fleet.example.json)")
+    n = apply_cost_policy(fleet, check=a.check)
+    state = "ON" if eco_state(fleet).get("on") else "off"
+    if a.check:
+        print(f"gent: cost policy {'has drifted in ' + str(n) + ' place(s)' if n else 'is in place'} (eco {state})")
+        sys.exit(1 if n else 0)
+    print(f"gent: cost policy {'applied (' + str(n) + ' change(s))' if n else 'already in place'} (eco {state})")
+
+
+# ── eco mode ─────────────────────────────────────────────────────────────────
+
+def repo_pins_model(cfg):
+    """Does this repo pin a model at PROJECT scope? Project scope outranks the shared user
+    settings, so a pin there makes the fleet's default inert for that box — which is the usual
+    reason eco "did nothing" on one repo."""
+    return _jget(read_settings(cfg["abs_path"] / ".claude" / "settings.json"), "model") is not MISSING
+
+
+def configured_model(fleet, name):
+    """What a FRESH session in `name` would run: local project > project > user. None = the CLI's
+    own default."""
+    if is_host(fleet, name):
+        cwd = host_session_cwd(host_name(fleet)) or Path.cwd()
+        files = [cwd / ".claude" / "settings.local.json", cwd / ".claude" / "settings.json",
+                 Path.home() / ".claude" / "settings.json"]
+    else:
+        repo = fleet["projects_root"] / fleet["repos"][name]["path"]
+        files = [repo / ".claude" / "settings.local.json", repo / ".claude" / "settings.json",
+                 fleet["secrets_root"] / "claude-home" / "settings.json"]
+    for f in files:
+        v = _jget(read_settings(f), "model")
+        if v is not MISSING:
+            return v
+    return None
+
+
+def live_model(fleet, name):
+    """The model the session's MOST RECENT main-agent turn actually ran on, from its transcript —
+    the surface, not the settings (a pin in settings.json says nothing about a resumed session).
+    None until it has taken a turn: `/model` itself makes no request, so a switch shows up here
+    only after the next one."""
+    if is_host(fleet, name):
+        cwd = host_session_cwd(host_name(fleet)) or Path.cwd()
+        proj = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    else:
+        key = re.sub(r"[^A-Za-z0-9]", "-", f"/repos/{fleet['repos'][name]['path']}")
+        proj = fleet["secrets_root"] / "claude-home" / "projects" / key
+    files = sorted(proj.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not files:
+        return None
+    with files[0].open("rb") as fh:                  # the answer is at the END of a file that can
+        fh.seek(max(0, files[0].stat().st_size - 2_000_000))   # reach tens of MB
+        lines = fh.read().decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        if '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        m = (d.get("message") or {}).get("model")
+        if d.get("type") == "assistant" and not d.get("isSidechain") and m and m != "<synthetic>":
+            return m
+    return None
+
+
+def model_matches(live, want):
+    """Does a transcript's full model id satisfy a configured alias or pin?"""
+    if live is None or want is None:
+        return False
+    return want.split("[")[0] in live
+
+
+def eco_sessions(fleet):
+    """Every running session eco can reach: allowed boxes that are up, and the host's own."""
+    names = [n for n, c in fleet.get("repos", {}).items()
+             if c.get("allow") and container_state(n) == "running"]
+    if have_tmux() and tmux_has(host_name(fleet)):
+        names.append(host_name(fleet))
+    return names
+
+
+def switch_live(fleet, name, model, wait=75):
+    """Switch a RUNNING session to `model` in place, keeping its context.
+
+    A running session ignores any settings change to the model (it is fixed at launch, and a
+    resume restores what the transcript recorded), so `/model` through its pane is the only
+    lever that lands without losing the conversation. Two things in the way, both met in
+    production: the CLI may ask "Switch model? … the full history gets re-read", a menu that
+    blocks an unattended pane exactly like the usage-limit modal does; and a session that is
+    mid-turn queues the command behind it. So answer the menu if it appears, and report honestly
+    when the switch is still queued at the deadline — never claim a landing nobody observed."""
+    pane = Pane.of(fleet, name)
+    acks = pane.screen().count("Set model to")         # old acks stay on screen — count, don't look
+    pane.send(f"/model {model or 'default'}")
+    deadline, answered = time.time() + wait, False
+    while time.time() < deadline:
+        time.sleep(2.5)
+        screen = pane.screen()
+        if re.search(r"Switch model\?", screen):
+            if not answered:
+                pane.key("Enter")                      # the highlighted "1. Yes, switch to …"
+                answered = True
+            continue
+        if answered:
+            return "switched (answered the re-read prompt)"
+        if screen.count("Set model to") > acks:
+            return "switched"
+    return "sent, still queued behind its current turn — `gent eco status` shows it landing"
+
+
+def cmd_eco(fleet, a):
+    """Eco mode: the switch for when the quota is running out.
+
+        gent eco on      cheaper main model + effort cap + tighter compaction window, fleet-wide
+        gent eco off     put everything back exactly as it was
+        gent eco status  what each session is configured for, and what it is actually running
+
+    Profile in fleet.json `cost.eco` (defaults: model `sonnet`, max_effort `medium`,
+    autocompact_window 200000). It changes, and `off` restores from a record kept in
+    <state_root>/eco.json:
+      · the shared claude-home and the host's ~/.claude: `model`, `maxEffortLevel`, the window;
+      · `model` in <repo>/.claude/settings.local.json of every box whose project settings PIN a
+        model (a project pin outranks the user-scope default; the local file outranks the pin and
+        is gitignored, so no tracked file is touched);
+      · every running session, switched in place with `/model` — a running session keeps its model
+        otherwise, and a restart does not change that.
+    `--no-live` skips the last step; `--dry-run` prints the plan and changes nothing."""
+    if a.action == "status":
+        return eco_status(fleet)
+    on = a.action == "on"
+    st = eco_state(fleet)
+    prior = st.get("prior", {})
+    e = eco_cfg(fleet)
+    say = (lambda m: print(("[dry-run] " if a.dry_run else "") + m))
+
+    # ── config: settings files ───────────────────────────────────────────────
+    want = policy_values(fleet, on)
+    if on:
+        eco_keys = ("model", "maxEffortLevel", "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+    else:
+        eco_keys = tuple(sorted({k for rec in prior.values() for k in rec}))
+    plan = []                                           # (label, path, key, new)
+    for label, path in settings_targets(fleet):
+        d = read_settings(path)
+        for k in eco_keys:
+            if on:
+                new = want[k]
+            elif k in prior.get(label, {}):
+                p = prior[label][k]
+                new = MISSING if p is None else p["v"]
+            else:
+                continue
+            plan.append((label, path, k, new))
+    if on:
+        for n, c in fleet.get("repos", {}).items():
+            if c.get("allow") and repo_pins_model(repo_cfg(fleet, n)):
+                plan.append((f"repo:{n}", fleet["projects_root"] / c["path"] / ".claude" / "settings.local.json",
+                             "model", e["model"]))
+    elif any(l.startswith("repo:") for l in prior):
+        for l, rec in prior.items():
+            if l.startswith("repo:") and "model" in rec:
+                p = rec["model"]
+                n = l.split(":", 1)[1]
+                plan.append((l, fleet["projects_root"] / fleet["repos"][n]["path"] / ".claude" / "settings.local.json",
+                             "model", MISSING if p is None else p["v"]))
+
+    new_prior = {l: dict(r) for l, r in prior.items()}
+    files = {}
+    for label, path, k, new in plan:
+        d = files.setdefault(path, read_settings(path))
+        old = _jget(d, k)
+        if on and k not in new_prior.get(label, {}):    # a second `on` must not overwrite the REAL prior
+            new_prior.setdefault(label, {})[k] = None if old is MISSING else {"v": old}
+        if old != new:
+            say(f"  {label:<18} {k}: {'—' if old is MISSING else old} → {'—' if new is MISSING else new}")
+            _jset(d, k, new)
+            if new is MISSING:
+                _jdrop_empty(d, k)
+    if not a.dry_run:
+        for path, d in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_settings(path, d)
+        if on:
+            eco_state_path(fleet).parent.mkdir(parents=True, exist_ok=True)
+            eco_state_path(fleet).write_text(json.dumps(
+                {"on": True, "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "prior": new_prior}, indent=2) + "\n")
+        elif eco_state_path(fleet).exists():
+            eco_state_path(fleet).unlink()
+        # off must also put back whatever the standing policy owns that eco had overlaid
+        apply_cost_policy(fleet, quiet=True)
+
+    # ── live sessions ────────────────────────────────────────────────────────
+    if a.no_live:
+        print("gent: eco " + ("on" if on else "off") + " — config only (--no-live): running sessions keep their model")
+        return
+    # `/model` writes `model` and `modelSettings[<id>].effortLevel` into the SHARED settings file
+    # ("saved as your default for new sessions"). The effort it records is the SWITCHING session's
+    # — from an xhigh box that puts the whole fleet on xhigh (it did, 2026-08-28). So snapshot, and
+    # put back exactly what we meant after the switches land.
+    snap = {label: read_settings(path).get("modelSettings", MISSING) for label, path in settings_targets(fleet)}
+    results = {}
+    for name in eco_sessions(fleet):
+        want_model = e["model"] if on else configured_model(fleet, name)
+        now = live_model(fleet, name)
+        if model_matches(now, want_model):             # a switch is a full-history re-read: never for nothing
+            print(f"  {name:<18} already on {now}")
+            continue
+        if a.dry_run:
+            say(f"  {name:<18} /model {want_model or 'default'}   (now: {now or 'no turn yet'})")
+            continue
+        results[name] = switch_live(fleet, name, want_model)
+        print(f"  {name:<18} /model {want_model or 'default'}: {results[name]}")
+    if not a.dry_run:
+        time.sleep(3)                                   # let the last write-back land first
+        final = {path: new for label, path, k, new in plan if k == "model" and not label.startswith("repo:")}
+        for label, path in settings_targets(fleet):
+            d = read_settings(path)
+            before = json.dumps(d, sort_keys=True)
+            _jset(d, "modelSettings", snap[label])
+            if path in final:
+                _jset(d, "model", final[path])
+            if json.dumps(d, sort_keys=True) != before:
+                write_settings(path, d)
+                print(f"  {label:<18} put back what the switch wrote (modelSettings / model)")
+    print(f"gent: eco {'ON' if on else 'off'}" + (" (dry run)" if a.dry_run else "")
+          + " — `gent eco status` reads each session's real model once it has taken a turn")
+
+
+def eco_status(fleet):
+    st = eco_state(fleet)
+    e = eco_cfg(fleet)
+    print(f"eco: {'ON since ' + st.get('since', '?') if st.get('on') else 'off'}"
+          f"   (profile: model={e['model']}, effort≤{e['max_effort']}, window={e['autocompact_window']})")
+    print(f"{'SESSION':<14}{'CONFIGURED':<26}{'RUNNING (last turn)':<28}")
+    for name in [*[n for n, c in fleet.get("repos", {}).items() if c.get("allow")], host_name(fleet)]:
+        if name != host_name(fleet) and container_state(name) != "running":
+            continue
+        if name == host_name(fleet) and not (have_tmux() and tmux_has(name)):
+            continue
+        cfgm = configured_model(fleet, name)
+        live = live_model(fleet, name)
+        drift = "" if cfgm is None or live is None or model_matches(live, cfgm) else "   ← differs: a session keeps its launch model; `gent eco on|off` switches it in place"
+        print(f"{name:<14}{(cfgm or '(cli default)'):<26}{(live or '—'):<28}{drift}")
+    print()
+    show = lambda v: "—" if v is MISSING else v
+    for label, path in settings_targets(fleet):
+        d = read_settings(path)
+        print(f"{label:<14} window={show(_jget(d, 'env.CLAUDE_CODE_AUTO_COMPACT_WINDOW'))!s:<9}"
+              f" maxEffort={show(_jget(d, 'maxEffortLevel'))!s:<8}"
+              f" subagent={show(_jget(d, 'env.CLAUDE_CODE_SUBAGENT_MODEL'))}")
+
+
 REPO_CMDS = ("up", "down", "attach", "shell", "peek", "logs", "deploy-key")
 
 
@@ -2372,6 +2848,8 @@ def main():
     fha = fsub.add_parser("host-actions",
                           help="run any pending box-requested host actions once (for the timer)")
     fha.add_argument("--quiet", action="store_true", help="print only what actually ran")
+    fc = fsub.add_parser("cost", help="apply fleet.json's standing cost policy (compaction window, subagent model, fast mode off)")
+    fc.add_argument("--check", action="store_true", help="write nothing; exit 1 if the settings have drifted")
     ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
     ft.add_argument("action", nargs="?", choices=["install", "status", "uninstall"], default="status")
 
@@ -2402,10 +2880,14 @@ def main():
     # Per-repo box commands — repo defaults to the cwd's repo when omitted.
     sub.add_parser("up",         help="create + start a repo's box").add_argument("repo", nargs="?")
     sub.add_parser("attach",     help="attach to a box's claude session (or `host` for this machine's)").add_argument("repo", nargs="?")
-    sub.add_parser("peek",       help="print a box's claude pane without attaching").add_argument("repo", nargs="?")
-    sp = sub.add_parser("send", help="type a message into a box's claude session and submit it")
-    sp.add_argument("repo", help="target box (required — no cwd inference, so it works from the host)")
+    sub.add_parser("peek",       help="print a box's claude pane (or `host`'s) without attaching").add_argument("repo", nargs="?")
+    sp = sub.add_parser("send", help="type a message into a box's (or `host`'s) claude session and submit it")
+    sp.add_argument("repo", help="target box, or `host` (required — no cwd inference, so it works from the host)")
     sp.add_argument("message", nargs="*", help="the message; omit to read it from stdin")
+    sp = sub.add_parser("eco", help="eco mode for when the quota runs low: cheaper model + effort cap + tighter window, fleet-wide")
+    sp.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
+    sp.add_argument("--no-live", action="store_true", help="change config only; leave running sessions on their model")
+    sp.add_argument("--dry-run", action="store_true", help="print what would change and change nothing")
     sub.add_parser("logs",       help="show a box's recent container logs").add_argument("repo", nargs="?")
     sub.add_parser("deploy-key", help="mint + register this repo's GitHub deploy key").add_argument("repo", nargs="?")
     sp = sub.add_parser("down", help="stop + remove a box (home volume kept unless --wipe)")

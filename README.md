@@ -73,7 +73,7 @@ gent up     myapp   # create + start a repo's agent (persistent, detached)
 gent attach myapp   # drop into its live claude session (tmux)
 gent shell  myapp   # a separate shell in the box (or `-- cmd` for a one-off)
 gent peek   myapp   # snapshot the session without attaching
-gent send   myapp "do X"   # prompt the box's session from the host (or pipe on stdin)
+gent send   myapp "do X"   # prompt the box's session from the host (or pipe on stdin); `host` works too
 gent logs   myapp   # container/bootstrap logs
 gent down   myapp   # stop + remove (home volume kept; --wipe to clear it)
 ```
@@ -88,6 +88,8 @@ gent fleet down     # stop + remove all boxes (home volumes kept)
 gent fleet doctor   # check docker, base image, shared login, secret dirs
 gent fleet build    # build the base image
 gent fleet auth     # shared-login status
+gent fleet cost     # apply fleet.json's cost policy (context ceiling, subagent model)
+gent eco on|off     # eco mode for a low quota: cheaper model + effort cap, fleet-wide
 ```
 
 `fleet up` skips `allow: false` repos and already-running boxes, and never
