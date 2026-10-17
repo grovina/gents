@@ -279,6 +279,22 @@ fi
 
 echo "gents: claude live in tmux 'gent' (window 0); services in their own windows" >&2
 
+# A GREET IN FLIGHT OWNS THE PANE'S NEXT IDLE MOMENT. `gent-clear` types /clear, then its watcher
+# waits for the fresh session to settle and pastes the hello + handoff. Every automated paster below
+# (the clear nudge, the watchdog poke) waits for that SAME settle — so whichever polls first wins it,
+# and the loser's text becomes the fresh session's first prompt INSTEAD of the greet. Measured
+# 2026-09-13 on homer: gent-clear at 19:07:59Z, /clear landed 19:08:05.9Z, and at 19:08:09.8Z the
+# fresh session's first prompt was a size nudge about the 400k context it no longer had. The greet
+# never arrived; Gabriel noticed. So gent-clear's watcher records its pid here while it runs, and
+# the pasters stand down until it is gone. A leftover file (a SIGKILLed watcher) cannot hold them
+# forever: the pid must still be running AND the file younger than any watcher lives (~12 min).
+CLEAR_PENDING="${GENT_STATE_DIR:-$HOME/.local/state/gent}/clear-pending"
+greet_pending() {
+  local pid; pid="$(cat "$CLEAR_PENDING" 2>/dev/null)" || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -d "/proc/$pid" ] && [ -n "$(find "$CLEAR_PENDING" -mmin -20 2>/dev/null)" ]
+}
+
 # Greet on startup: once claude's TUI has settled, replay the box's hello (if any)
 # so a freshly `up`ed box is oriented/kicked exactly like it is after a gent-clear.
 # Backgrounded (child of PID 1, dies with the container); fires ONCE per container
@@ -325,9 +341,16 @@ fi
 # input_tokens + cache_read_input_tokens + cache_creation_input_tokens IS the context that
 # turn was sent. `atTokens` nudges on that; `every` stays useful as a floor for a session that
 # is small but stale. Either alone is a valid config.
-# ⚠ IT IS THE LAST TURN'S NUMBER, NOT A HIGH-WATER MARK. After a /clear the newest transcript
-#   is a new file whose first turns are small, so the reading drops on its own — no reset to
-#   remember, and a stale large number cannot survive a clear.
+# ⚠ IT IS THE LAST TURN'S NUMBER, NOT A HIGH-WATER MARK. After a /clear the transcript is a new
+#   file whose first turns are small, so the reading drops on its own — no reset to remember.
+# ⚠⚠ BUT NOT AT ONCE, AND THIS COMMENT ONCE SAID A STALE NUMBER "CANNOT SURVIVE A CLEAR". It can:
+#   claude writes a last line to the OLD transcript ~100 ms after creating the new one, so by
+#   mtime "newest" stays the old file until the fresh session writes something — and a nudge
+#   measured on one side of a clear can be delivered on the other (the idle wait below can last
+#   90 s). That is how homer's fresh session was told it was at 400k (2026-09-13). So a nudge is
+#   bound to the session it measured: the transcript SET (name-sorted — the fingerprint gent-clear
+#   proves a clear with) must be unchanged from the previous tick to measure, and unchanged from
+#   the measurement to deliver. A set that moved means a clear landed; that tick says nothing.
 # ⓘ Bounded read: only the transcript's last 2 MB is parsed. The figure we want is on the most
 #   recent turn, and a long session's file can reach tens of MB — re-reading all of it once a
 #   minute would be real I/O for a number that only ever lives at the end.
@@ -368,6 +391,7 @@ if [ "${CLEAR_EVERY_SEC:-0}" -gt 0 ] || [ "${CLEAR_AT_TOKENS:-0}" -gt 0 ]; then
       POLL_SEC=60
       fp() { local n; n="$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true)"; [ -n "$n" ] && printf '%s:%s' "$n" "$(wc -c < "$n" 2>/dev/null || echo 0)"; }
       newest() { ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1 || true; }
+      sessions() { ls "$PROJ_DIR"/*.jsonl 2>/dev/null || true; }   # the SET — a /clear adds a file
       # Context size at the newest assistant turn, or 0 if it cannot be read. NEVER fabricates
       # a number: an unparseable or missing transcript reads 0, which cannot trip a threshold.
       ctx() {
@@ -396,11 +420,16 @@ except OSError: pass
 print(best)
 PY
       }
-      base="$(fp)"; waited=0; nudged_tokens=0; nudged_path=""
+      base="$(fp)"; waited=0; nudged_tokens=0; nudged_path=""; seen="$(sessions)"
       while :; do
         sleep "$POLL_SEC"
         tmux has-session -t gent 2>/dev/null || exit 0
         waited=$((waited + POLL_SEC))
+        # A clear landed since the last tick: `newest` may still be the frozen pre-clear file, so
+        # whatever it reads is about a session that is gone. Re-baseline on the new set and skip.
+        measured="$(sessions)"
+        [ "$measured" = "$seen" ] || { seen="$measured"; base="$(fp)"; continue; }
+        greet_pending && continue   # gent-clear is mid-flight: its greet, not a nudge, is next
         TRIG=""
         # SIZE first: it is the specific reason, and a session over the threshold should be
         # told the number rather than "it has been six hours".
@@ -448,6 +477,12 @@ PY
           prev="$cur"; sleep 1
         done
         [ "$ready" = 1 ] || continue   # never idle within ~90s — skip; next tick retries
+        # RE-CHECK AT DELIVERY. The idle we just found may be the FRESH session's: a turn that ran
+        # gent-clear ends, the queued /clear fires, the new pane settles — all inside the wait above.
+        if [ "$(sessions)" != "$measured" ] || greet_pending; then
+          echo "gents: clear nudge dropped — a clear landed while it waited for idle (it measured the old session)" >&2
+          seen="$(sessions)"; base="$(fp)"; continue
+        fi
         printf '%s' "$NUDGE_TEXT" | tmux load-buffer -b gent-nudge -
         tmux paste-buffer -b gent-nudge -t gent:claude -p -d
         tmux send-keys -t gent:claude Enter 2>/dev/null || true
@@ -465,7 +500,7 @@ PY
           else stable=0; fi
           prev="$cur"; sleep 1
         done
-        base="$cur"
+        base="$cur"; seen="$(sessions)"   # a clear the nudge prompted is not news to the next tick
       done ) &
 fi
 
@@ -620,6 +655,9 @@ if [ "$EVENT_BUS" = 1 ]; then
       # send-keys into a busy pane leaves the text sitting in the composer), but the
       # cost of never escalating is a deaf box, and nothing but this log says so.
       [ "$ready" = 1 ] || { _wlog "pane never idle within ~2min; deferring poke"; continue; }
+      # A clear's greet is due into this idle (see greet_pending). Standing down costs one loop: if
+      # the Monitor is still down once the greet has landed, the next pass pokes as usual.
+      greet_pending && { _wlog "gent-clear greet pending; deferring poke"; sleep 10; continue; }
       printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
       tmux send-keys -t gent:claude Enter

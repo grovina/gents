@@ -205,8 +205,26 @@ tmux send-keys -t "$PANE" "/clear" Enter
 # Detached watcher (setsid + closed stdio) so it OUTLIVES both this Bash tool call
 # and the model turn that ends right after: wait for the clear to land, then — once
 # the fresh TUI settles — replay the hello.
-export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before" GENT_NOTE="$NOTE" GENT_SESSION="$SESSION"
+#
+# ⚠ THE SETTLE IT WAITS FOR IS NOT ITS ALONE. The box's clear nudge and watchdog
+# poke wait for the pane to go idle too, and the first to see it pastes. On homer
+# (2026-09-13) a size nudge won by about a second: the fresh session's first prompt
+# was "Context is at ~400136 tokens", the session went busy on it, and this greet —
+# the hello AND the handoff — never arrived. So while the watcher runs it holds
+# $STATE/clear-pending (its pid), which the box's pasters stand down for; it removes
+# the file on exit, if the file is still its own.
+#
+# Its outcome goes to $STATE/gent-clear.log. It used to go to /dev/null, so a greet
+# that was skipped left no trace anywhere: whether homer's watcher gave up or was
+# starved could not be told afterwards, only that its handoff never arrived.
+mkdir -p "$STATE" 2>/dev/null || true
+export GENT_PANE="$PANE" GENT_PROJ="$PROJ" GENT_BEFORE="$before" GENT_NOTE="$NOTE" GENT_SESSION="$SESSION" \
+       GENT_PENDING="$STATE/clear-pending"
 setsid bash -c '
+  printf "%s\n" "$$" > "$GENT_PENDING" 2>/dev/null
+  release() { [ "$(cat "$GENT_PENDING" 2>/dev/null)" = "$$" ] && rm -f "$GENT_PENDING"; }
+  trap release EXIT
+  say() { printf "%s gent-clear[%s]: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$*"; }
   cleared=0
   for _ in $(seq 1 300); do
     tmux has-session -t "$GENT_SESSION" 2>/dev/null || exit 0
@@ -214,7 +232,8 @@ setsid bash -c '
     [ -n "$now" ] && [ "$now" != "$GENT_BEFORE" ] && { cleared=1; break; }
     sleep 1
   done
-  [ "$cleared" = 1 ] || { echo "gent-clear: clear never landed (turn not ended?) — no re-greet" >&2; exit 0; }
+  [ "$cleared" = 1 ] || { say "clear never landed (turn not ended?) — no re-greet"; exit 0; }
+  say "clear landed; waiting for the fresh session to settle"
   # Wait for the fresh session to go idle — same gate as the startup greet: pane
   # unchanged for a few seconds and not showing "esc to interrupt" — then greet.
   prev=""; stable=0; ready=0
@@ -226,8 +245,13 @@ setsid bash -c '
     else stable=0; fi
     prev="$cur"; sleep 1
   done
-  [ "$ready" = 1 ] && gent-hello "$GENT_NOTE" || echo "gent-clear: fresh session never went idle — greet skipped (run gent-hello)" >&2
-' </dev/null >/dev/null 2>&1 &
+  if [ "$ready" = 1 ]; then
+    gent-hello "$GENT_NOTE"; say "greeted (handoff: ${#GENT_NOTE} chars)"
+  else
+    say "fresh session never went idle — greet skipped; the handoff was:"
+    printf "%s\n" "$GENT_NOTE" | sed "s/^/  | /"
+  fi
+' </dev/null >>"$STATE/gent-clear.log" 2>&1 &
 
 if [ -n "$NOTE" ]; then
   echo "gent-clear: /clear queued; once it lands the fresh session gets the hello + your handoff" >&2
