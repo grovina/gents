@@ -2203,8 +2203,11 @@ def backup_sqlite_snapshots(fleet, name, repo, rels):
           "for rel in sys.argv[1:]:\n"
           "  dst='/stage/'+rel; os.makedirs(os.path.dirname(dst),exist_ok=True); tmp=dst+'.tmp'\n"
           "  s=sqlite3.connect('file:/repo/'+rel+'?mode=ro',uri=True); d=sqlite3.connect(tmp)\n"
-          "  s.backup(d); d.close(); s.close(); os.replace(tmp,dst)\n")
+          "  s.backup(d); d.close(); s.close(); os.replace(tmp,dst)\n"
+          "  os.chown(dst,int(os.environ['OWNER_UID']),int(os.environ['OWNER_GID'])); os.chmod(dst,0o600)\n")
+    # Root to READ the file (a service may own it); the copy is handed back to the host user.
     subprocess.run(["docker", "run", "--rm", "-u", "0", "--entrypoint", "python3",
+                    "-e", f"OWNER_UID={os.getuid()}", "-e", f"OWNER_GID={os.getgid()}",
                     "-v", f"{repo}:/repo:ro", "-v", f"{stage}:/stage",
                     fleet["image"], "-c", py, *rels], check=True, capture_output=True, text=True)
     return stage
