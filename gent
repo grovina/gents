@@ -2196,15 +2196,21 @@ def backup_ensure_repo(fleet, name):
 def backup_sqlite_snapshots(fleet, name, repo, rels):
     """A live SQLite file copied mid-write can restore corrupt. Take a consistent copy
     with SQLite's own backup API (as root, in the base image) into a staging dir that
-    is backed up instead; the live file and its -wal/-shm are excluded."""
+    is backed up instead; the live file and its -wal/-shm are excluded. The copy is
+    switched out of WAL mode, so it is one self-contained file, and the staging tree
+    is handed back to the host user (a WAL database cannot even be READ from a dir
+    its reader cannot write to)."""
     stage = fleet["state_root"] / "backup-staging" / name
     stage.mkdir(parents=True, exist_ok=True)
     py = ("import sqlite3,sys,os\n"
           "for rel in sys.argv[1:]:\n"
           "  dst='/stage/'+rel; os.makedirs(os.path.dirname(dst),exist_ok=True); tmp=dst+'.tmp'\n"
           "  s=sqlite3.connect('file:/repo/'+rel+'?mode=ro',uri=True); d=sqlite3.connect(tmp)\n"
-          "  s.backup(d); d.close(); s.close(); os.replace(tmp,dst)\n"
-          "  os.chown(dst,int(os.environ['OWNER_UID']),int(os.environ['OWNER_GID'])); os.chmod(dst,0o600)\n")
+          "  s.backup(d); d.execute('pragma journal_mode=delete'); d.close(); s.close(); os.replace(tmp,dst)\n"
+          "u,g=int(os.environ['OWNER_UID']),int(os.environ['OWNER_GID'])\n"
+          "for root,dirs,files in os.walk('/stage'):\n"
+          "  for n in [root]+[os.path.join(root,f) for f in files]: os.chown(n,u,g)\n"
+          "  for f in files: os.chmod(os.path.join(root,f),0o600)\n")
     # Root to READ the file (a service may own it); the copy is handed back to the host user.
     subprocess.run(["docker", "run", "--rm", "-u", "0", "--entrypoint", "python3",
                     "-e", f"OWNER_UID={os.getuid()}", "-e", f"OWNER_GID={os.getgid()}",
