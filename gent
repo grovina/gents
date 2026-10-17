@@ -263,6 +263,20 @@ def cmd_doctor(fleet, _a):
         print(f"{'✓' if not drift else '!'} cost policy "
               + ("in place" if not drift else f"has drifted in {drift} place(s) — run: gent fleet cost"))
 
+    # Backups: a timer that runs is not a backup that succeeds. Freshness per box.
+    if backup_cfg(fleet):
+        stale = [n for n, *_ in backup_targets(fleet)
+                 if not (lambda st: st.get("ok") and age_s(st.get("last_success")) < BACKUP_STALE_S)(
+                     json.loads(backup_status_path(fleet, n).read_text())
+                     if backup_status_path(fleet, n).exists() else {})]
+        print(f"{'✓' if not stale else '✗'} backups "
+              + ("fresh for every box" if not stale else f"stale or failing: {', '.join(stale)} — `gent fleet backup status`"))
+        ok = ok and not stale
+        esc = fleet["secrets_root"] / "backup" / "escrow.pass"
+        if esc.exists():
+            print("· backup escrow password: keep a copy OFF this machine "
+                  f"({esc}) — without it, losing the host loses the backups too")
+
     # Per-repo claude memory MUST be gitignored, in every repo, always. It is
     # agent-written and records whatever the agent learned about your machines and
     # your fleet; several of these repos are public. One `git add -A` would publish it
@@ -2051,6 +2065,295 @@ def cmd_fleet_host_actions(fleet, a):
         print("gent: no box declares host_actions in fleet.json")
 
 
+# ── backup ────────────────────────────────────────────────────────────────────
+# A platform service, not a per-box chore: the HOST backs up every approved box (its
+# checkout, its home volume, its state_root app dir) plus the host's own fleet state
+# (this checkout — fleet.json is gitignored — and state_root, i.e. the secrets
+# catalog). Boxes hold no backup credential and configure nothing; each one reads a
+# status file to see that its backup ran.
+#
+# Engine: restic, run from its own pinned image (the host needs nothing installed),
+# as root so it can read root-owned files and docker volumes, every source mounted
+# read-only. One restic repository PER BOX, each with its own password, so a restore
+# of one box never decrypts another's. Every repository ALSO carries one shared
+# escrow key (secrets_root/backup/escrow.pass): that single password is the thing to
+# keep OFF this machine — lose the host and the per-box passwords go with it.
+#
+# Where the bytes go is fleet.json's business (`backup.repository`, any restic URL
+# with `{name}`), so nothing here is tied to one cloud. Deletion protection is the
+# backend's job too: restic must delete its own lock files, and `forget` deletes
+# snapshot files, so an add-only credential cannot run it. Use the bucket's
+# soft-delete / versioning, which the backup credential cannot turn off.
+BACKUP_IMAGE = "restic/restic:0.17.3"
+BACKUP_STATUS_REL = ".git/gent-backup-status.json"   # in each checkout: never tracked, box-readable, no re-up
+BACKUP_STALE_S = 2 * 3600 + 900                       # hourly timer + slack
+BACKUP_PRUNE_EVERY_S = 7 * 86400
+BACKUP_CHECK_EVERY_S = 30 * 86400
+# Regenerable trees, skipped everywhere. A box's own `backup.exclude` adds to these.
+BACKUP_EXCLUDES = ["node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+                   ".mypy_cache", ".ruff_cache", ".next", ".turbo", ".gradle", ".DS_Store"]
+BACKUP_REPO_EXCLUDES = [".claude/worktrees", BACKUP_STATUS_REL]   # the status file would make every run "changed"
+BACKUP_HOME_EXCLUDES = [".cache", ".npm", ".gradle", ".nuget", "Android", ".venvs",
+                        ".local/lib", ".local/share/pnpm", "opt", ".dotnet", ".config/gcloud/logs"]
+BACKUP_DEFAULT_KEEP = {"hourly": 24, "daily": 14, "weekly": 8, "monthly": 12}
+
+
+def backup_cfg(fleet):
+    return fleet.get("backup") or None
+
+
+def backup_dir(fleet):
+    d = fleet["secrets_root"] / "backup"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def backup_password(fleet, name):
+    """The per-repository password file, minted on first use (0600, host only)."""
+    p = backup_dir(fleet) / f"{name}.pass"
+    if not p.exists():
+        import secrets as _s
+        p.write_text(_s.token_urlsafe(32) + "\n")
+        p.chmod(0o600)
+    return p
+
+
+def backup_targets(fleet, only=None):
+    """[(name, sources, excludes, sqlite, abs_path)] — sources maps /src/<x> -> host path or volume."""
+    out = []
+    for name, cfg in (fleet.get("repos") or {}).items():
+        if not cfg.get("allow") or (cfg.get("backup") or {}).get("skip"):
+            continue
+        if only and name not in only:
+            continue
+        repo = fleet["projects_root"] / cfg["path"]
+        if not repo.is_dir():
+            continue
+        b = cfg.get("backup") or {}
+        src = {"/src/repo": str(repo)}
+        vol = f"gent-{name}-home"
+        if docker("volume", "ls", "-q", "--filter", f"name=^{vol}$", capture=True):
+            src["/src/home"] = vol
+        app = fleet["state_root"] / "app" / name
+        if app.is_dir():
+            src["/src/state"] = str(app)
+        ex = ([f"/src/repo/{e}" for e in BACKUP_REPO_EXCLUDES]
+              + [f"/src/home/{e}" for e in BACKUP_HOME_EXCLUDES]
+              + [f"/src/repo/{e.strip('/')}" for e in b.get("exclude", [])])
+        out.append((name, src, ex, b.get("sqlite", []), repo))
+    if not only or "host" in only:
+        # The host's own fleet state: this checkout (fleet.json is gitignored here) and
+        # state_root (secrets catalog, per-box app state). The catalog's package cache
+        # is regenerable.
+        sr = fleet["state_root"]
+        ex = ["/src/state/backup-staging"]               # already inside each box's own repository
+        if fleet["secrets_root"].is_relative_to(sr):
+            ex.append(f"/src/state/{(fleet['secrets_root'] / 'cache').relative_to(sr)}")
+        out.append(("host", {"/src/gents": str(HERE), "/src/state": str(sr)}, ex, [], HERE))
+    return out
+
+
+def restic(fleet, name, args, sources=None, extra_mounts=(), check=False, capture=True):
+    """Run one restic command against box `name`'s repository, in a throwaway container."""
+    b = backup_cfg(fleet)
+    url = b["repository"].replace("{name}", name)
+    cmd = ["docker", "run", "--rm", "-i", "--hostname", "gent-backup",
+           "-e", f"RESTIC_REPOSITORY={url}", "-e", "RESTIC_PASSWORD_FILE=/run/gent/pass",
+           "-v", f"{backup_password(fleet, name)}:/run/gent/pass:ro",
+           "-v", "gent-restic-cache:/root/.cache/restic"]
+    if url.startswith("/"):                              # a local repository: bind its parent dir
+        Path(url).parent.mkdir(parents=True, exist_ok=True)
+        cmd += ["-v", f"{Path(url).parent}:{Path(url).parent}"]
+    for dest, rel in (b.get("mounts") or {}).items():    # backend credentials from the catalog
+        cmd += ["-v", f"{fleet['secrets_root'] / rel}:{dest}:ro"]
+    for k, v in (b.get("env") or {}).items():
+        cmd += ["-e", f"{k}={v}"]
+    for dest, src in (sources or {}).items():
+        cmd += ["-v", f"{src}:{dest}:ro"]
+    for m in extra_mounts:
+        cmd += ["-v", m]
+    cmd += [BACKUP_IMAGE, *args]
+    r = subprocess.run(cmd, capture_output=capture, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"restic {args[0]} failed (rc={r.returncode}): {(r.stderr or '').strip()[-400:]}")
+    return r
+
+
+def backup_ensure_repo(fleet, name):
+    """Init the repository on first use, then add the escrow key. Idempotent."""
+    r = restic(fleet, name, ["cat", "config"])
+    if r.returncode == 0:
+        return False
+    if r.returncode != 10:                               # 10 = repository does not exist
+        raise RuntimeError(f"cannot open repository (rc={r.returncode}): {r.stderr.strip()[-400:]}")
+    restic(fleet, name, ["init"], check=True)
+    escrow = backup_password(fleet, "escrow")
+    restic(fleet, name, ["key", "add", "--new-password-file", "/run/gent/escrow"],
+           extra_mounts=[f"{escrow}:/run/gent/escrow:ro"], check=True)
+    return True
+
+
+def backup_sqlite_snapshots(fleet, name, repo, rels):
+    """A live SQLite file copied mid-write can restore corrupt. Take a consistent copy
+    with SQLite's own backup API (as root, in the base image) into a staging dir that
+    is backed up instead; the live file and its -wal/-shm are excluded."""
+    stage = fleet["state_root"] / "backup-staging" / name
+    stage.mkdir(parents=True, exist_ok=True)
+    py = ("import sqlite3,sys,os\n"
+          "for rel in sys.argv[1:]:\n"
+          "  dst='/stage/'+rel; os.makedirs(os.path.dirname(dst),exist_ok=True); tmp=dst+'.tmp'\n"
+          "  s=sqlite3.connect('file:/repo/'+rel+'?mode=ro',uri=True); d=sqlite3.connect(tmp)\n"
+          "  s.backup(d); d.close(); s.close(); os.replace(tmp,dst)\n")
+    subprocess.run(["docker", "run", "--rm", "-u", "0", "--entrypoint", "python3",
+                    "-v", f"{repo}:/repo:ro", "-v", f"{stage}:/stage",
+                    fleet["image"], "-c", py, *rels], check=True, capture_output=True, text=True)
+    return stage
+
+
+def backup_one(fleet, name, src, excludes, sqlite, keep, prev):
+    st = {"box": name, "repository": backup_cfg(fleet)["repository"].replace("{name}", name),
+          "last_run": now_iso(), "ok": False,
+          "last_success": prev.get("last_success"), "last_prune": prev.get("last_prune"),
+          "last_check": prev.get("last_check")}
+    created = backup_ensure_repo(fleet, name)
+    src = dict(src)
+    if sqlite:
+        src["/src/sqlite"] = str(backup_sqlite_snapshots(fleet, name, src["/src/repo"], sqlite))
+        excludes = excludes + [f"/src/repo/{r}{sfx}" for r in sqlite for sfx in ("", "-wal", "-shm", "-journal")]
+    args = ["backup", "--json", "--host", name, "--tag", "gent", "--skip-if-unchanged"]
+    for e in BACKUP_EXCLUDES:
+        args += ["--exclude", e]
+    for e in excludes:
+        args += ["--exclude", e]
+    r = restic(fleet, name, args + sorted(src), sources=src)
+    summary = {}
+    for line in (r.stdout or "").splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if j.get("message_type") == "summary":
+            summary = j
+    # rc 3 = snapshot written but some files were unreadable: a partial success, said so.
+    if r.returncode not in (0, 3) or not summary:
+        raise RuntimeError(f"backup failed (rc={r.returncode}): {(r.stderr or '').strip()[-400:]}")
+    st.update({"ok": True, "last_success": now_iso(), "created_repository": created,
+               "snapshot": (summary.get("snapshot_id") or "")[:8] or "unchanged",
+               "files_new": summary.get("files_new"), "files_changed": summary.get("files_changed"),
+               "bytes_added": summary.get("data_added"), "bytes_total": summary.get("total_bytes_processed"),
+               "warning": "some files were unreadable" if r.returncode == 3 else None})
+    fargs = ["forget", "--host", name, "--tag", "gent"]
+    for k in ("hourly", "daily", "weekly", "monthly"):
+        fargs += [f"--keep-{k}", str(keep.get(k, BACKUP_DEFAULT_KEEP[k]))]
+    if age_s(st["last_prune"]) > BACKUP_PRUNE_EVERY_S:
+        fargs.append("--prune")
+        st["last_prune"] = now_iso()
+    restic(fleet, name, fargs, check=True)
+    if age_s(st["last_check"]) > BACKUP_CHECK_EVERY_S:
+        restic(fleet, name, ["check", "--read-data-subset", "2%"], check=True)
+        st["last_check"] = now_iso()
+    snaps = restic(fleet, name, ["snapshots", "--json", "--host", name])
+    try:
+        st["snapshots"] = len(json.loads(snaps.stdout or "[]"))
+    except ValueError:
+        pass
+    return st
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def age_s(iso):
+    if not iso:
+        return float("inf")
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return float("inf")
+
+
+def backup_status_path(fleet, name):
+    d = fleet["state_root"] / "backup-status"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{name}.json"
+
+
+def backup_publish(fleet, name, repo, st):
+    """Canonical copy in state_root; a box-readable copy in its checkout's .git/."""
+    st["stale_after"] = BACKUP_STALE_S
+    st["note"] = ("Written by the host's `gent fleet backup` (hourly). ok=false, or last_success older "
+                  "than stale_after seconds, means this box is NOT being backed up: tell the host.")
+    text = json.dumps(st, indent=2) + "\n"
+    backup_status_path(fleet, name).write_text(text)
+    if (repo / ".git").is_dir():
+        (repo / BACKUP_STATUS_REL).write_text(text)
+
+
+def cmd_fleet_backup(fleet, a):
+    if not backup_cfg(fleet):
+        die("no `backup` block in fleet.json — see docs/configuration.md § backup")
+    action = getattr(a, "action", None) or "run"
+    if action == "status":
+        sys.exit(1 if backup_print_status(fleet) else 0)
+    if action == "restore":
+        return backup_restore(fleet, a)
+    only = set(a.names) if getattr(a, "names", None) else None
+    keep = backup_cfg(fleet).get("keep") or {}
+    failed = []
+    for name, src, ex, sq, repo in backup_targets(fleet, only):
+        sp = backup_status_path(fleet, name)
+        prev = json.loads(sp.read_text()) if sp.exists() else {}
+        t0 = time.time()
+        try:
+            st = backup_one(fleet, name, src, ex, sq, keep, prev)
+        except Exception as e:                            # one box failing must not stop the rest
+            st = {**prev, "box": name, "ok": False, "last_run": now_iso(), "error": str(e)}
+            failed.append(name)
+        st["seconds"] = round(time.time() - t0, 1)
+        backup_publish(fleet, name, repo, st)
+        if st["ok"]:
+            if not getattr(a, "quiet", False):
+                mb = (st.get("bytes_added") or 0) / 1e6
+                print(f"✓ {name:<11} {st['snapshot']:<9} +{mb:.1f} MB  {st.get('snapshots', '?')} snapshots  "
+                      f"{st['seconds']}s" + (f"  ⚠ {st['warning']}" if st.get("warning") else ""))
+        else:
+            print(f"✗ {name:<11} {st['error']}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
+
+
+def backup_print_status(fleet):
+    bad = 0
+    for name, *_ in backup_targets(fleet):
+        sp = backup_status_path(fleet, name)
+        st = json.loads(sp.read_text()) if sp.exists() else {}
+        age = age_s(st.get("last_success"))
+        fresh = st.get("ok") and age < BACKUP_STALE_S
+        bad += not fresh
+        when = "never" if age == float("inf") else f"{age / 3600:.1f}h ago"
+        print(f"{'✓' if fresh else '✗'} {name:<11} last success {when:<10} "
+              f"{st.get('snapshots', '?')} snapshots" + (f"  — {st['error']}" if st.get("error") and not st.get("ok") else ""))
+    return bad
+
+
+def backup_restore(fleet, a):
+    """Restore one box's snapshot into a NEW host directory (never over a live checkout)."""
+    target = Path(a.target).expanduser().resolve()
+    if target.exists() and any(target.iterdir()):
+        die(f"{target} is not empty — restore into a fresh directory, then copy what you need")
+    target.mkdir(parents=True, exist_ok=True)
+    args = ["restore", a.snapshot, "--host", a.box, "--target", "/restore"]
+    for inc in (a.include or []):
+        args += ["--include", inc]
+    r = restic(fleet, a.box, args, extra_mounts=[f"{target}:/restore"], capture=False)
+    # restic runs as root; hand the files back to the invoking user.
+    subprocess.run(["docker", "run", "--rm", "-v", f"{target}:/t", "alpine",
+                    "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/t"], check=False)
+    if r.returncode:
+        die(f"restore failed (rc={r.returncode})")
+    print(f"✓ restored {a.box}@{a.snapshot} → {target}  (/src/repo = checkout, /src/home = home volume)")
+
+
 # ── recurring host jobs ───────────────────────────────────────────────────────
 # The fleet needs two jobs running on the HOST, forever, whether or not anyone is
 # logged in: `gent fleet refresh-auth` (re-mints the shared 8h token when the whole
@@ -2086,7 +2389,13 @@ def host_jobs(fleet):
         (f"gent-host-actions",
          [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "host-actions", "--quiet"],
          30, "gent: run boxes' pre-approved host actions (restarts they cannot do themselves)"),
-    ]
+    ] + ([
+        # Only once fleet.json configures a destination: a timer that fails every hour
+        # because nothing was set up is noise, not a guard.
+        ("gent-backup",
+         [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "backup", "run", "--quiet"],
+         3600, "gent: back up every box and the host's fleet state (restic)"),
+    ] if backup_cfg(fleet) else [])
 
 
 def _systemd_linger_ok():
@@ -2852,6 +3161,17 @@ def main():
     fc.add_argument("--check", action="store_true", help="write nothing; exit 1 if the settings have drifted")
     ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
     ft.add_argument("action", nargs="?", choices=["install", "status", "uninstall"], default="status")
+    fb = fsub.add_parser("backup", help="back up every box + the host's fleet state (restic; the hourly timer runs this)")
+    fbs = fb.add_subparsers(dest="action", metavar="<action>")
+    fbr = fbs.add_parser("run", help="back up now (default)")
+    fbr.add_argument("names", nargs="*", help="only these boxes (or `host`)")
+    fbr.add_argument("--quiet", action="store_true", help="print only failures")
+    fbs.add_parser("status", help="freshness of every box's backup")
+    fbx = fbs.add_parser("restore", help="restore a snapshot into a NEW directory")
+    fbx.add_argument("box")
+    fbx.add_argument("target", help="empty or absent host directory")
+    fbx.add_argument("--snapshot", default="latest")
+    fbx.add_argument("--include", action="append", help="restore only this path (e.g. /src/repo/var), repeatable")
 
     # `gent host …` — THIS machine's own claude session (run on the host, not in a
     # box): give it a box's idle-survival (supervisor + keepalive) for Remote Control.

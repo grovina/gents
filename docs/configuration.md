@@ -172,6 +172,62 @@ Keep the vocabulary tiny. Every action is a line a human wrote, and the point of
 the design is that a box's entire reach is readable in ten seconds. If you want to
 pass an argument from the box, add a second named action instead.
 
+## Backups — the host backs up every box, boxes do nothing
+
+A fleet-level `backup` block in fleet.json turns it on (see `fleet.example.json`).
+From then on `gent fleet timers install` adds an hourly `gent fleet backup`, which
+backs up, with [restic](https://restic.net) run from its own pinned image:
+
+- **every approved box**: its whole checkout (git-tracked files too, so unpushed
+  commits and stashes come back; deduplication makes that nearly free), its home
+  volume, and its `state_root/app/<box>` dir;
+- **the host itself** (as box `host`): this checkout, where the gitignored
+  `fleet.json` lives, and `state_root`, i.e. the secrets catalog.
+
+Regenerable trees are skipped everywhere (`node_modules`, `.venv`, `__pycache__`,
+`.next`, `.gradle`, …; in home volumes also `.cache`, `.local/lib`, toolchains);
+the lists are at the top of the backup section in `gent`. A box needs no entry at
+all. Its fleet.json `backup` is only for exceptions: `exclude` (checkout-relative
+paths), `sqlite` (live SQLite files to snapshot consistently first; a file copied
+mid-write can restore corrupt), `skip: true`.
+
+**What a box sees** is one file, `.git/gent-backup-status.json` in its own checkout
+(never tracked, so no repo has to ignore it, and present without a re-up):
+`ok`, `last_success`, `snapshots`, `error`, `stale_after`. `ok: false`, or a
+`last_success` older than `stale_after` seconds, means the box is not being backed
+up. Boxes hold no backup credential and cannot reach the repository.
+
+**Keys.** One restic repository per box, each with its own password minted into
+`secrets_root/backup/<box>.pass`, so restoring one box never decrypts another.
+Every repository also accepts `secrets_root/backup/escrow.pass`.
+⚠ **Keep a copy of `escrow.pass` off this machine** (a password manager). The
+per-box passwords live on the host; lose the host without the escrow copy and
+the backups are unreadable ciphertext. `gent fleet doctor` reminds you.
+
+**Deletion protection is the backend's job**, not the key's. restic deletes its
+own lock files on every run and `forget` deletes snapshot files, so an add-only
+credential cannot run it. Turn on the bucket's soft-delete (or object versioning)
+with a credential the host does NOT hold: a compromised host can then delete, but
+not irrecoverably, and the status files show a vanished snapshot within the hour.
+Prefer a STANDARD storage class: restic rewrites pack files on prune, and archive
+classes bill every object for a minimum duration (a year, for GCS ARCHIVE).
+
+**Schedule.** Every run: `backup` (`--skip-if-unchanged`), then `forget` by the
+fleet's `keep` (default 24 hourly, 14 daily, 8 weekly, 12 monthly). Weekly:
+`--prune`. Monthly: `check --read-data-subset 2%`.
+
+```bash
+gent fleet backup                 # run now, every box (what the timer does)
+gent fleet backup run axt host    # only these
+gent fleet backup status          # freshness per box; exit 1 if any is stale
+gent fleet backup restore axt /tmp/axt-restore [--snapshot ID] [--include /src/repo/var]
+```
+
+A restore always goes into a NEW directory (it refuses a non-empty one), never over
+a live checkout: `/src/repo` is the checkout, `/src/home` the home volume,
+`/src/state` the app state, `/src/sqlite` the consistent SQLite copies. Files are
+handed back to your user. Copy over what you need, then `gent up` as usual.
+
 ## ⚠ Running a one-off command in the image — always `--entrypoint`
 
 The consequence of the section above: the image's `ENTRYPOINT` is `bootstrap`,

@@ -20,6 +20,14 @@
     "eco": { "model": "sonnet", "max_effort": "medium", "autocompact_window": 200000 }
   },
 
+  "backup": {
+    "_note": "OPTIONAL. Turns on the host's backup service: `gent fleet timers install` then adds an hourly `gent fleet backup` that backs up EVERY approved box (checkout, home volume, state_root/app/<box>) plus the host's own fleet state (this checkout, state_root) with restic, from its own image — nothing to install, nothing for a box to configure. `repository` is any restic URL; `{name}` becomes the box (one repository + password per box). `mounts`/`env` hand the backend its credentials from the catalog, like a box's. Passwords are minted under secrets_root/backup/; every repository also accepts escrow.pass — keep THAT one off this machine. Deletion protection belongs to the backend (bucket soft-delete/versioning), not to an add-only key: restic deletes its own lock files. See docs/configuration.md § Backups.",
+    "repository": "gs:my-backup-bucket:/{name}",
+    "mounts": { "/secrets/backup-sa.json": "gcp/backup-writer.json" },
+    "env": { "GOOGLE_PROJECT_ID": "my-backup-project", "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/backup-sa.json" },
+    "keep": { "hourly": 24, "daily": 14, "weekly": 8, "monthly": 12 }
+  },
+
   "repos": {
     "myapp": {
       "path": "myorg/myapp",
@@ -32,6 +40,8 @@
       "data_mounts": {
         "/data/datasets": "~/data/datasets"
       },
+      "backup": { "exclude": ["data/raw-dumps"], "sqlite": ["var/app.db"] },
+      "_backup_note": "OPTIONAL — only for exceptions; with no entry the box is backed up whole (minus regenerable trees: node_modules, .venv, caches, builds, .claude/worktrees). `exclude`: checkout-relative paths to skip (data already backed up elsewhere, say). `sqlite`: live SQLite files to copy CONSISTENTLY (SQLite's backup API) before each run — a file copied mid-write can restore corrupt. `skip: true` leaves the box out.",
       "_data_mounts_note": "OPTIONAL. Plain host data the box may read but never owns — absolute or ~ host paths, always mounted READ-ONLY (e.g. a large dataset kept out of git). Not for credentials (use `mounts`, from the catalog) or app state the box writes (use `state_mounts`). A missing source path refuses to start the box rather than mounting an empty dir.",
       "host_actions": {
         "actions": {
