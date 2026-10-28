@@ -12,6 +12,8 @@ Monitor is down (a gap is recovered by `tg pending` / `gent-schedule due` on re-
 
   gent-events emit <kind> [key=value ...]   append an event (ts added automatically)
   gent-events watch                         tail + format the stream (the Monitor command)
+  gent-events next                          block until new events exist, print them, exit
+  gent-events pending [--older-than SECS]   exit 0 if unconsumed events wait (the watchdog's probe)
 
 `watch` is a NEWEST-WINS SINGLETON (pidfile, like the tg poller): arming a second
 one stands the older one down. Duplicate watchers are otherwise invisible — the
@@ -19,6 +21,18 @@ watchdog's liveness check is a `pgrep -f "gent-events watch"`, which any number 
 them satisfy — and each extra tail delivers every event again, so an agent that
 ACTS on events acts twice (replies twice, sends the same poll twice). Newest-wins
 because the newest watcher is the one the harness actually holds the Monitor on.
+
+`next` is the same stream without the Monitor's 30-minute cap. The agent runs it as a
+BACKGROUND Bash command (run_in_background): it blocks until at least one event exists
+past a durable cursor, prints the batch, advances the cursor and EXITS — the exit is
+what wakes the agent, so a quiet night wakes nobody. The agent re-arms after handling.
+The cursor (events.cursor next to the stream, a byte offset into it) is written
+only AFTER the batch is printed, so an event that lands between one `next` exiting and
+the next one starting is simply the first thing the next one returns — no gap to
+reconcile. First use starts at the END of the stream (history is not replayed); a
+stream shorter than the cursor (truncated / rotated) restarts at offset 0. `next`
+shares the watcher pidfile with `watch`, so newest-wins holds across both: two
+waiters never consume the same events. `watch` itself is unchanged.
 """
 import sys
 import os
@@ -157,15 +171,155 @@ def cmd_watch(_argv):
         _release_watch()
 
 
+def _cursor_path():
+    # Beside the stream (not in the state dir): the watchdog finds both from the stream's directory.
+    return os.path.join(os.path.dirname(events_path()), "events.cursor")
+
+
+def _read_cursor():
+    try:
+        with open(_cursor_path(), encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cursor(off):
+    """Atomic replace: a crash mid-write must never leave a torn cursor."""
+    path = _cursor_path()
+    tmp = "%s.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(str(off))
+    os.replace(tmp, path)
+
+
+def _read_from(path, off):
+    """(events, new_offset, drops): the COMPLETE lines at/after `off`. A half-written
+    last line is left for the next pass (new_offset stops before it). Unparsable lines
+    fail OPEN — surfaced as a raw bullet, never silently dropped; self_* kinds are the
+    only intentional drop, and are reported in `drops` (the caller logs each to stderr)."""
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read()
+    end = data.rfind(b"\n") + 1
+    evs, drops = [], []
+    for raw in data[:end].splitlines():
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+            if not isinstance(ev, dict):
+                raise ValueError("not an object")
+        except Exception:
+            evs.append({"kind": "unparsable", "line": line})
+            continue
+        if str(ev.get("kind", "")).startswith("self_"):
+            drops.append(ev.get("kind"))
+            continue
+        evs.append(ev)
+    return evs, off + end, drops
+
+
+def _start_offset(path):
+    """Where this run reads from, plus a note when the cursor could not be trusted."""
+    size = os.path.getsize(path)
+    cur = _read_cursor()
+    if cur is None:
+        return size, "no cursor yet — starting at the end of the stream (%d bytes)" % size
+    if cur > size:
+        return 0, "stream shrank below the cursor (%d > %d) — restarting at offset 0" % (cur, size)
+    return cur, None
+
+
+def cmd_next(_argv):
+    path = events_path()
+    open(path, "a").close()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    mypid = str(os.getpid())
+    pidpath = watch_pid_path()
+    with open(pidpath, "w", encoding="utf-8") as f:
+        f.write(mypid)
+
+    def mine():
+        try:
+            with open(pidpath, encoding="utf-8") as f:
+                return f.read().strip() == mypid
+        except OSError:
+            return False
+
+    try:
+        off, note = _start_offset(path)
+        if note:
+            print("[gent-events] " + note, file=sys.stderr, flush=True)
+            _write_cursor(off)
+        while True:
+            if not mine():
+                # Superseded: leave the cursor alone, the newer waiter owns the events.
+                print("[gent-events] next superseded by a newer waiter — standing down", flush=True)
+                return
+            if os.path.getsize(path) < off:
+                off = 0
+                print("[gent-events] stream shrank below the cursor — restarting at offset 0",
+                      file=sys.stderr, flush=True)
+            evs, new_off, drops = _read_from(path, off)
+            if evs:
+                time.sleep(0.2)   # batch whatever else lands in the same burst
+                evs, new_off, drops = _read_from(path, off)
+                if not mine():
+                    continue      # superseded during the batch window: let the top handle it
+                for k in drops:
+                    print("[gent-events] dropped %s (self event)" % k, file=sys.stderr)
+                for ev in evs:
+                    print(_fmt(ev), flush=True)
+                _write_cursor(new_off)   # AFTER the print: a crash re-delivers, never loses
+                return
+            if new_off != off:           # only self_* / blank lines: consume, keep waiting
+                for k in drops:
+                    print("[gent-events] dropped %s (self event)" % k, file=sys.stderr, flush=True)
+                off = new_off
+                _write_cursor(off)
+            time.sleep(0.5)
+    finally:
+        _release_watch()
+
+
+def cmd_pending(argv):
+    """Exit 0 when a printable event waits past the cursor (and, with --older-than SECS,
+    the OLDEST such event is at least that old); exit 1 otherwise. Read-only."""
+    min_age = 0
+    if argv:
+        if len(argv) != 2 or argv[0] != "--older-than":
+            sys.exit("usage: gent-events pending [--older-than SECS]")
+        min_age = float(argv[1])
+    path = events_path()
+    cur = _read_cursor()
+    if cur is None or not os.path.exists(path):
+        sys.exit(1)
+    evs, _off, _drops = _read_from(path, 0 if cur > os.path.getsize(path) else cur)
+    if not evs:
+        sys.exit(1)
+    try:
+        ts = datetime.datetime.fromisoformat(evs[0]["ts"])
+        age = (datetime.datetime.now(datetime.UTC) - ts).total_seconds()
+    except Exception:
+        age = min_age   # no usable ts: treat as old enough rather than hide it
+    sys.exit(0 if age >= min_age else 1)
+
+
 def main():
     if len(sys.argv) < 2:
-        sys.exit("usage: gent-events <emit|watch> ...")
+        sys.exit("usage: gent-events <emit|watch|next|pending> ...")
     cmd, rest = sys.argv[1], sys.argv[2:]
     if cmd == "emit":
         return cmd_emit(rest)
     if cmd == "watch":
         return cmd_watch(rest)
-    sys.exit("gent-events: unknown subcommand %r (want emit|watch)" % cmd)
+    if cmd == "next":
+        return cmd_next(rest)
+    if cmd == "pending":
+        return cmd_pending(rest)
+    sys.exit("gent-events: unknown subcommand %r (want emit|watch|next|pending)" % cmd)
 
 
 if __name__ == "__main__":

@@ -292,11 +292,11 @@ repo — another session, a running daemon, a scheduled job: it is also how to r
 a **sabotage control** (break the thing on purpose, confirm the check goes red)
 without a broken file ever existing on disk where something else could commit it.
 
-## The event bus — one Monitor, many sources
+## The event bus — one waiter, many sources
 
 A box's async wake-ups — an inbound Telegram message, a due reminder, a cron slot
 — all land in **one** append-only stream (`events.jsonl`), and the agent watches
-it with **one** Monitor (`gent-events watch`). The sources that feed the stream
+it with **one** waiter (`gent-events next`, or the Monitor `gent-events watch`). The sources that feed the stream
 are **box-supervised**, so they keep running across `/clear`, compaction, and a
 dropped Monitor; only the thin final hop is session-bound, and a watchdog re-arms
 it when it drops. Turn the bus on with `"events": true` (or any `.events` object):
@@ -324,6 +324,49 @@ to keep alive and what to tell the agent to run on re-arm:
 Use `"monitor": { "watch": …, "reconcile": …, "live": … }` for a box that watches
 its own raw stream rather than `gent-events watch` (`live` is the pgrep pattern
 that proves it's up).
+
+### Waiting for events: `next` (no 30-minute cap) or `watch`
+
+A harness Monitor ends after 30 minutes, so a `gent-events watch` Monitor wakes
+the agent twice an hour just to re-arm it, quiet night or not. `gent-events next`
+removes that: it blocks until there is at least one new event, prints the batch
+(everything landing within ~200 ms, formatted like `watch`, `self_*` kinds
+skipped), advances a durable cursor and **exits**. The agent runs it as a
+**background Bash command** (`run_in_background`, which is not subject to the
+Monitor cap and reports once, when the command exits) and **re-arms after handling
+each wake**:
+
+```
+gent-events next        # run_in_background; the wake is its exit; re-run after handling
+```
+
+- **The cursor** (`events.cursor` next to the stream) is a byte offset, written
+  only after the batch is printed. An event that arrives while the agent is
+  handling the previous one is the first thing the next `next` returns, at once:
+  there is no gap to reconcile with `tg pending`. First use starts at the end of
+  the stream (said on stderr: history is not replayed); a stream shorter than the
+  cursor (truncated) restarts at offset 0, also said.
+- **One waiter.** `next` takes the same pidfile as `watch` (newest wins), so two
+  waiters never consume the same events; the older one prints that it stood
+  down and exits without touching the cursor.
+- **Fails open.** An unparsable line is printed raw, never dropped; every
+  `self_*` drop is logged on stderr.
+- `gent-events pending [--older-than SECS]` is the read-only probe the watchdog
+  uses: exit 0 when a non-`self_*` event waits past the cursor (and the oldest
+  one is at least SECS old).
+- `watch` is unchanged, for boxes that keep the Monitor.
+
+**What the watchdog does** (default waiter: either command counts as alive; a
+custom `monitor.watch` keeps its own `live` pattern). Once `next` has run on a
+box (the cursor exists) the waiter is legitimately absent after every event,
+while the agent works, so absent alone is not "down". It pokes only if the
+waiter is absent **and** a real event has waited over 120 s
+(`GENT_WD_PENDING_AGE`), or it has been absent over 10 min
+(`GENT_WD_ABSENT_MAX`: the agent forgot to re-arm). Without a cursor (pure
+`watch` boxes) a gap over 6 s is down, as before. In both modes the poke waits
+for an idle pane and then checks liveness **once more** right before pasting: a
+waiter that came back meanwhile logs `recovered before poke; no poke` and nothing
+is sent (a restart after expiry takes 10-20 s, longer than the 6 s blip check).
 
 ### Cron slots: put the file in the repo
 

@@ -530,6 +530,9 @@ fi
 #   .monitor {watch,reconcile,live} → a box that watches its OWN raw stream (e.g.
 #                                  `tail -F events.log`); else Monitor defaults
 #                                  to `gent-events watch`. `.live` = liveness regex.
+# The default waiter is EITHER `gent-events next` (a background command that ends at
+# the first event — no 30-minute cap, wakes the agent only for an event) or the
+# `gent-events watch` Monitor; the watchdog accepts both (see "The watchdog" below).
 TG_WATCH=""; TG_RECONCILE=""; MON_WATCH=""; MON_RECONCILE=""; MON_LIVE=""
 EV_PATH=""; CRON_PATH=""; SCHED_TZ=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
@@ -568,14 +571,23 @@ if [ "$EVENT_BUS" = 1 ]; then
   [ -n "$MON_WATCH" ] || MON_WATCH="gent-events watch"
   if [ -z "$MON_LIVE" ]; then
     case "$MON_WATCH" in
-      "gent-events watch") MON_LIVE="gent-events watch" ;;
+      "gent-events watch") MON_LIVE="gent-events (watch|next)" ;;   # pgrep -f takes an ERE
       *) MON_LIVE="$MON_WATCH" ;;   # imperfect — set .monitor.live for a custom watch
     esac
   fi
   RECONCILE_HINT="run \`gent-schedule due\`"
   [ -n "$MON_RECONCILE" ] && RECONCILE_HINT="$MON_RECONCILE"
   [ -n "$TG_RECONCILE" ] && RECONCILE_HINT="run \`$TG_RECONCILE\` and \`gent-schedule due\`"
-  REARM_TEXT="🔄 Quick check — your event Monitor (\`$MON_WATCH\`) doesn't look like it's running. Please make sure it's up: if it's down, re-arm it, then glance at $RECONCILE_HINT to catch anything that arrived meanwhile. Nothing's lost — the box keeps the sources running regardless."
+  # How the agent arms the waiter: the default bus offers `next`; a custom watch is re-armed as-is.
+  if [ "$MON_WATCH" = "gent-events watch" ]; then
+    ARM_HOW="run \`gent-events next\` as a background command (run_in_background), or arm the Monitor on \`gent-events watch\`"
+  else
+    ARM_HOW="re-arm \`$MON_WATCH\`"
+  fi
+  # POKE_WHY is set per poke, so the nudge says what the watchdog actually saw.
+  _rearm_text() {
+    printf '%s' "🔄 Quick check — no event waiter is running ($POKE_WHY). Please re-arm it: $ARM_HOW. Then glance at $RECONCILE_HINT to catch anything that arrived meanwhile. Nothing's lost — the box keeps the sources running regardless."
+  }
 
   # Source 1 — schedule daemon: fire due reminders + matching cron triggers into the
   # stream, minute-aligned (cron needs each minute checked exactly once).
@@ -604,34 +616,63 @@ if [ "$EVENT_BUS" = 1 ]; then
     echo "gents: telegram→events bridge armed (source: $TG_WATCH)" >&2
   fi
 
-  # The watchdog — keep the ONE Monitor armed. Every detection is logged to
+  # The watchdog — keep ONE event waiter armed. Every detection is logged to
   # $WATCHDOG_LOG, classified real-drop vs. self-recovering false-alarm, so the
   # pokes are auditable. Telemetry only — the log never gates anything.
+  #
+  # WHEN IT POKES. Two modes, chosen by whether `gent-events next` has ever run here
+  # (its cursor file exists):
+  #   watch mode (no cursor) — the waiter is a long-lived Monitor, so ABSENT means down:
+  #     poke once it has been gone >6s AND is still gone at the moment of delivery.
+  #   next mode (cursor)     — the waiter is legitimately ABSENT for seconds to minutes
+  #     after every event, while the agent handles it. Absent alone is not down. Poke
+  #     only when (a) it is absent AND a printable event has waited past the cursor for
+  #     >$WD_PENDING_AGE s (nobody came for it), or (b) it has been absent for
+  #     >$WD_ABSENT_MAX s (the agent forgot to re-arm; a quiet stream would hide that).
+  #     Absent with nothing pending, within the budget, is just the agent working.
+  # Either way the poke waits for an idle pane, then CHECKS AGAIN right before pasting
+  # (a restart after a 30-minute expiry takes 10-20s; by the time the pane is idle the
+  # waiter is often back) — the same re-check at delivery the clear nudge does.
+  WD_PENDING_AGE="${GENT_WD_PENDING_AGE:-120}"; WD_ABSENT_MAX="${GENT_WD_ABSENT_MAX:-600}"
   _wdir="${GENT_EVENTS_PATH:-}"; _wdir="${_wdir%/*}"; [ -n "$_wdir" ] || _wdir="$HOME/.local/state/gent"
   mkdir -p "$_wdir" 2>/dev/null || true
   WATCHDOG_LOG="$_wdir/watchdog.log"
   _wlog() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$WATCHDOG_LOG" 2>/dev/null || true; }
-  echo "gents: event watchdog armed (monitor: $MON_WATCH; log: $WATCHDOG_LOG)" >&2
+  echo "gents: event watchdog armed (waiter: $MON_WATCH; log: $WATCHDOG_LOG)" >&2
   ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
+    absent_since=0   # start of the current absence episode; states log as EDGES, not every pass
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      # Liveness — is the Monitor running? A bare `pgrep` excludes its own PID;
+      # Liveness — is the waiter running? A bare `pgrep` excludes its own PID;
       # NEVER wrap it in a shell whose argv holds the pattern.
-      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then sleep 60; continue; fi
-      # Looks down. Before poking, CONFIRM it isn't a brief blip (a CLI restart or
-      # pgrep race): re-check over ~6s. If it returns on its own it was a false
-      # alarm — log it and DON'T poke. This is how we tell real drops from noise.
-      recovered=0
-      for _ in 1 2 3; do
-        sleep 2
-        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { recovered=1; break; }
-      done
-      if [ "$recovered" = 1 ]; then
-        _wlog "FALSE-ALARM '$MON_LIVE' vanished then self-recovered <6s; no poke. now: $(pgrep -af "$MON_LIVE" 2>/dev/null | tr '\n' '|')"
-        sleep 60; continue
+      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then absent_since=0; sleep 60; continue; fi
+      [ "$absent_since" = 0 ] && absent_since="$(date +%s)"
+      if [ -f "$_wdir/events.cursor" ]; then
+        if gent-events pending --older-than "$WD_PENDING_AGE" >/dev/null 2>&1; then
+          POKE_WHY="events have waited over ${WD_PENDING_AGE}s unconsumed"
+        elif [ $(( $(date +%s) - absent_since )) -ge "$WD_ABSENT_MAX" ]; then
+          POKE_WHY="absent for over ${WD_ABSENT_MAX}s"
+        else
+          sleep 15; continue   # the agent is handling an event; give it time to re-arm
+        fi
+        _wlog "DOWN '$MON_LIVE' absent, $POKE_WHY; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
+      else
+        # Looks down. Before poking, CONFIRM it isn't a brief blip (a CLI restart or
+        # pgrep race): re-check over ~6s. If it returns on its own it was a false
+        # alarm — log it and DON'T poke. This is how we tell real drops from noise.
+        recovered=0
+        for _ in 1 2 3; do
+          sleep 2
+          pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { recovered=1; break; }
+        done
+        if [ "$recovered" = 1 ]; then
+          _wlog "FALSE-ALARM '$MON_LIVE' vanished then self-recovered <6s; no poke. now: $(pgrep -af "$MON_LIVE" 2>/dev/null | tr '\n' '|')"
+          absent_since=0; sleep 60; continue
+        fi
+        POKE_WHY="absent over 6s"
+        _wlog "DOWN '$MON_LIVE' absent >6s; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
       fi
-      _wlog "DOWN '$MON_LIVE' absent >6s; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
       # Poke the model to re-arm + reconcile. Deliver it like gent-hello: a bare
       # `send-keys "$text" Enter` into a BUSY pane leaves the text unsent in the
       # composer, so wait for the pane to go idle (stable + not "esc to interrupt"),
@@ -658,18 +699,25 @@ if [ "$EVENT_BUS" = 1 ]; then
       # A clear's greet is due into this idle (see greet_pending). Standing down costs one loop: if
       # the Monitor is still down once the greet has landed, the next pass pokes as usual.
       greet_pending && { _wlog "gent-clear greet pending; deferring poke"; sleep 10; continue; }
-      printf '%s' "$REARM_TEXT" | tmux load-buffer -b gent-tgrearm -
+      # RE-CHECK AT DELIVERY. The pane wait above can take up to ~2min; a waiter that was
+      # re-armed meanwhile (the usual case after a 30-minute expiry) must not be poked.
+      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then
+        _wlog "recovered before poke; no poke"
+        absent_since=0; sleep 60; continue
+      fi
+      _rearm_text | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
       tmux send-keys -t gent:claude Enter
-      # DEBOUNCE: wait for the Monitor to reappear (up to ~5min) before re-checking.
+      # DEBOUNCE: wait for the waiter to reappear (up to ~5min) before re-checking. A `next`
+      # that finds events waiting returns at once, so poll tightly or the blink is missed.
       rearmed=0
-      for _ in $(seq 1 60); do
+      for _ in $(seq 1 150); do
         tmux has-session -t gent 2>/dev/null || exit 0
         pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { rearmed=1; break; }
-        sleep 5
+        sleep 2
       done
       [ "$rearmed" = 1 ] && _wlog "re-armed after poke" || _wlog "NOT re-armed within ~5min after poke"
-      sleep 60
+      absent_since=0; sleep 60
     done ) &
 fi
 
