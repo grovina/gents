@@ -121,6 +121,19 @@ if [ -f /secrets/ssh/key ]; then
   install -m 600 /secrets/ssh/key "$HOME/.ssh/id_ed25519"
 fi
 
+# Stale pidfiles. A box start is a fresh PID namespace: nothing from the previous run survives, so
+# every *.pid on disk is stale by definition — and a stale pid can name a NEW process. filmograma
+# (2026-10-29): poll.pid held 92 from the last run; pid 92 was now the poller's own supervisor, whose
+# argv contains "telegram poll", so the app's "already running (pid 92)" guard skipped on every restart
+# and every liveness check (same argv match) passed — for hours, with Gabriel's DMs unread. Clear them
+# before anything starts (the repo hook below may start a poller). Tracked files are left alone.
+find "$HOME/.local/state" "$REPO" -maxdepth 5 \( -name node_modules -o -name .git \) -prune \
+     -o -type f -name '*.pid' -print 2>/dev/null \
+| while read -r _pf; do
+    case "$_pf" in "$REPO"/*) git -C "$REPO" ls-files --error-unmatch -- "$_pf" >/dev/null 2>&1 && continue ;; esac
+    rm -f -- "$_pf" && echo "gents: cleared stale pidfile $_pf" >&2
+  done || true   # pipefail + errexit: a missing ~/.local/state on a fresh volume must not stop the box
+
 # Fleet-shared pnpm store (gents mounts it at /pnpm-store). Take ownership of the
 # mount ROOT so pnpm — running as gent — can populate it; non-recursive, since the
 # package files pnpm writes underneath are already gent's. Cheap + idempotent.
