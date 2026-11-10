@@ -619,6 +619,34 @@ def cmd_up(fleet, a):
     if dkey:
         args += ["-v", f"{dkey}:/secrets/ssh/key:ro"]
 
+    # `also`: extra repos this box mounts read-write BESIDE its own, for a thin
+    # coordinator agent that works across several repos (fleet.json:
+    # "also": ["grovina/soma", "grovina/pulse"], paths under projects_root). The
+    # box's own repo is still where claude runs and where memory lives; these are
+    # just reachable at /repos/<owner>/<repo>. Each gets its OWN deploy key (GitHub
+    # won't let one key sit on two repos), keyed by repo basename in the catalog —
+    # so it is the SAME key a box for that repo would use, never a duplicate.
+    # Bootstrap installs them as per-repo ssh Host aliases; git is pointed at the
+    # alias with env-injected `insteadOf` rewrites, so neither the (ro) gitconfig nor
+    # the repos' own .git/config — shared with the host — is touched.
+    git_env = []
+    for apath in (cfg.get("also") or []):
+        ahost = fleet["projects_root"] / apath
+        if not ahost.is_dir():
+            die(f"{name}: also-repo path does not exist: {ahost}")
+        aname = Path(apath).name
+        args += ["-v", f"{ahost}:/repos/{apath.strip('/')}"]
+        akey = ensure_deploy_key(fleet, aname, {"abs_path": ahost})
+        aslug = github_slug(ahost)
+        if akey and aslug:
+            args += ["-v", f"{akey}:/secrets/ssh/also/{aname}:ro"]
+            git_env.append((f"url.git@github-{aname}:{aslug}.git.insteadOf",
+                            f"git@github.com:{aslug}.git"))
+    if git_env:
+        args += ["-e", f"GIT_CONFIG_COUNT={len(git_env)}"]
+        for i, (k, v) in enumerate(git_env):
+            args += ["-e", f"GIT_CONFIG_KEY_{i}={k}", "-e", f"GIT_CONFIG_VALUE_{i}={v}"]
+
     # Catalog mounts: container_path -> reusable entry under secrets_root, ro.
     # The catalog is shared (one SA key can serve every repo in a project);
     # isolation is here, in the grant — a box sees only what this lists.

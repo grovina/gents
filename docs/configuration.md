@@ -24,6 +24,26 @@ a file inserts its **host** path, which the container can't see (the sandbox
 wall). Copy *out* works; paste *in* is a remote limitation — drop the file into
 the repo dir (it's mounted) and reference it by path.
 
+## Several repos, one agent — `also`
+
+A box mounts exactly one repo, and that is the isolation wall. For a thin
+*coordinator* agent that works across a few sibling repos, give its fleet entry an
+`also` list (paths under `projects_root`):
+
+```json
+"lab": { "path": "myorg/lab", "also": ["myorg/api", "myorg/web"], ... }
+```
+
+The box's own repo stays where claude runs and where memory lives; the others are
+mounted read-write at `/repos/<owner>/<repo>`. Each gets its **own** deploy key
+(GitHub won't put one key on two repos) — the same catalog key (`ssh/<repo>-deploy`)
+a box for that repo would use. Inside, each key becomes an ssh `Host github-<repo>`
+alias and git is pointed at it with env-injected `insteadOf` rewrites, so the ro
+gitconfig and the repos' own `.git/config` (shared with the host) are untouched.
+Build outputs are *not* masked per also-repo: keep each repo's derived state out of
+the shared checkout yourself (e.g. `UV_PROJECT_ENVIRONMENT=~/.venvs/<repo>`).
+Secrets are granted on the coordinator's entry as usual, so list only what it needs.
+
 ## Sidecar services — a box can run a daemon next to claude
 
 Some repos need a long-running process *alongside* the agent — a poller, an

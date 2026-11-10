@@ -134,6 +134,23 @@ find "$HOME/.local/state" "$REPO" -maxdepth 5 \( -name node_modules -o -name .gi
     rm -f -- "$_pf" && echo "gents: cleared stale pidfile $_pf" >&2
   done || true   # pipefail + errexit: a missing ~/.local/state on a fresh volume must not stop the box
 
+# Extra repos (fleet.json `also`): one deploy key each at /secrets/ssh/also/<repo>.
+# A key can only sit on ONE GitHub repo, so each becomes its own ssh Host alias
+# (github-<repo>); gent points git at the alias via GIT_CONFIG_* insteadOf env.
+# The config is wholly generated, so rewrite it every start.
+if [ -d /secrets/ssh/also ]; then
+  install -d -m 700 "$HOME/.ssh/also"
+  : > "$HOME/.ssh/config"
+  for _k in /secrets/ssh/also/*; do
+    [ -f "$_k" ] || continue
+    _n=$(basename "$_k")
+    install -m 600 "$_k" "$HOME/.ssh/also/$_n"
+    printf 'Host github-%s\n  HostName github.com\n  User git\n  IdentityFile ~/.ssh/also/%s\n  IdentitiesOnly yes\n' \
+      "$_n" "$_n" >> "$HOME/.ssh/config"
+  done
+  chmod 600 "$HOME/.ssh/config"
+fi
+
 # Fleet-shared pnpm store (gents mounts it at /pnpm-store). Take ownership of the
 # mount ROOT so pnpm — running as gent — can populate it; non-recursive, since the
 # package files pnpm writes underneath are already gent's. Cheap + idempotent.
