@@ -540,6 +540,8 @@ def cmd_up(fleet, a):
     res = cfg.get("resources", {})
     if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]
     if res.get("memory"): args += ["--memory", str(res["memory"])]
+    # Opt-in: Docker's default lets a box swap up to its own memory again on top. Set memory_swap equal to memory to forbid swap.
+    if res.get("memory_swap"): args += ["--memory-swap", str(res["memory_swap"])]
 
     # Auth: ALL boxes share ONE claude config dir (creds, settings, sessions) —
     # exactly like your host's many sessions share ~/.claude. One `/login` in any
