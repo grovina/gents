@@ -120,7 +120,24 @@ class NextTests(Env):
         self.emit("telegram", line="real")
         out, err = p.communicate(timeout=10)
         self.assertEqual(out.strip(), "real")
-        self.assertIn("dropped self_sent", err)           # every drop is logged
+        self.assertIn("dropped 1 self event (self_sent x1)", err)   # one summary line, at the wake
+
+    def test_many_self_events_make_one_summary_line(self):
+        self.arm_at_end()
+        p = self.spawn("next")
+        time.sleep(0.5)
+        for _ in range(30):
+            self.emit("self_scheduled_run", text="x")
+        self.emit("self_sent", text="echo")
+        time.sleep(1.5)
+        self.assertIsNone(p.poll())
+        self.emit("telegram", line="real")
+        out, err = p.communicate(timeout=10)
+        self.assertEqual(out.strip(), "real")
+        drops = [l for l in err.splitlines() if "dropped" in l]
+        self.assertEqual(len(drops), 1, err)
+        self.assertIn("31 self events", drops[0])
+        self.assertIn("self_scheduled_run x30", drops[0])
 
     def test_unparsable_line_fails_open(self):
         self.arm_at_end()

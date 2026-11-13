@@ -253,6 +253,7 @@ def cmd_next(_argv):
         if note:
             print("[gent-events] " + note, file=sys.stderr, flush=True)
             _write_cursor(off)
+        dropped = {}   # self_* kind -> count, summarised in one line when a real event wakes us
         while True:
             if not mine():
                 # Superseded: leave the cursor alone, the newer waiter owns the events.
@@ -269,14 +270,19 @@ def cmd_next(_argv):
                 if not mine():
                     continue      # superseded during the batch window: let the top handle it
                 for k in drops:
-                    print("[gent-events] dropped %s (self event)" % k, file=sys.stderr)
+                    dropped[k] = dropped.get(k, 0) + 1
+                if dropped:   # ONE line per wake: the waiter's output IS the wake text, so a line per echo buries the event
+                    n = sum(dropped.values())
+                    print("[gent-events] dropped %d self event%s (%s)" % (
+                        n, "" if n == 1 else "s",
+                        ", ".join("%s x%d" % kv for kv in sorted(dropped.items()))), file=sys.stderr)
                 for ev in evs:
                     print(_fmt(ev), flush=True)
                 _write_cursor(new_off)   # AFTER the print: a crash re-delivers, never loses
                 return
             if new_off != off:           # only self_* / blank lines: consume, keep waiting
                 for k in drops:
-                    print("[gent-events] dropped %s (self event)" % k, file=sys.stderr, flush=True)
+                    dropped[k] = dropped.get(k, 0) + 1
                 off = new_off
                 _write_cursor(off)
             time.sleep(0.5)
