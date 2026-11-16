@@ -2775,6 +2775,13 @@ COST_POLICY = {
     "autocompact_window": lambda v: {"env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(v))},
     "subagent_model":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL": str(v),
                                      "env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+    # ⓘ MEASURED 2026-11-16 (CLI 2.1.325, host probes): with _FORCE=1 the env model beats an agent
+    #   file's own `model:` (a `model: haiku` agent ran on sonnet); without it, the env model is
+    #   only the DEFAULT for agents that pin nothing, and a pinned `model:` is honoured. So
+    #   `subagent_force: false` keeps every unpinned helper on the fleet model while letting a
+    #   repo give a role its own (e.g. a Haiku scout for a high-volume step). Listed AFTER
+    #   subagent_model: it overrides the FORCE that key implies. Absent = FORCE stays as before.
+    "subagent_force":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1" if v else MISSING},
     "disable_fast_mode":  lambda v: {"env.CLAUDE_CODE_DISABLE_FAST_MODE": "1"} if v else {},
 }
 # What `eco on` changes besides the policy. `model` is an alias by default — never a pinned id —
@@ -2874,9 +2881,10 @@ def policy_values(fleet, eco_on):
     """{settings path: value} the config currently demands — the standing policy, with the eco
     profile laid over it while eco is on."""
     want = {}
-    for key, v in cost_cfg(fleet).items():
-        if key in COST_POLICY:
-            want.update(COST_POLICY[key](v))
+    cfg = cost_cfg(fleet)
+    for key in COST_POLICY:     # COST_POLICY's order, not fleet.json's: subagent_force must follow subagent_model
+        if key in cfg:
+            want.update(COST_POLICY[key](cfg[key]))
     if eco_on:
         e = eco_cfg(fleet)
         want["model"] = e["model"]
@@ -2902,7 +2910,7 @@ def apply_cost_policy(fleet, check=False, quiet=False):
             write_settings(path, d)
         for k, old, new in changed:
             if not quiet:
-                print(f"  {label:<6} {k}: {'—' if old is MISSING else old} → {new}"
+                print(f"  {label:<6} {k}: {'—' if old is MISSING else old} → {'—' if new is MISSING else new}"
                       + ("  (would change)" if check else ""))
     return drift
 
