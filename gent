@@ -43,7 +43,7 @@ def load_fleet():
     # this). Defaults to Docker's own public fallbacks; a host that needs a
     # different resolver — a LAN-internal one, a filtered upstream — overrides with
     # a fleet-level "dns" (a list, or a single string).
-    dns = f.get("dns") or ["8.8.8.8", "8.8.4.4"]
+    dns = f.get("dns") or ["1.1.1.1", "8.8.8.8"]
     f["dns"] = [dns] if isinstance(dns, str) else list(dns)
     return f
 
@@ -536,6 +536,13 @@ def cmd_up(fleet, a):
     # keeps resolving and only external lookups change hands.
     for server in fleet["dns"]:
         args += ["--dns", server]
+    # Fail over fast: with the glibc defaults (5s timeout, 2 attempts) one
+    # unresponsive nameserver stalls every lookup for 5-15s — enough to hang a
+    # poller whose watchdog kills it at 3 min (filmograma, 2026-11-18, 8.8.8.8
+    # timing out while 1.1.1.1 answered in ms). `rotate` also spreads load so the
+    # first server isn't the single point every lookup waits on.
+    for opt in ("timeout:1", "attempts:2", "rotate"):
+        args += ["--dns-option", opt]
 
     res = cfg.get("resources", {})
     if res.get("cpus"):   args += ["--cpus", str(res["cpus"])]
