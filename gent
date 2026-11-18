@@ -2776,12 +2776,14 @@ COST_POLICY = {
     "subagent_model":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL": str(v),
                                      "env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
     # ⓘ MEASURED 2026-11-16 (CLI 2.1.325, host probes): with _FORCE=1 the env model beats an agent
-    #   file's own `model:` (a `model: haiku` agent ran on sonnet); without it, the env model is
-    #   only the DEFAULT for agents that pin nothing, and a pinned `model:` is honoured. So
-    #   `subagent_force: false` keeps every unpinned helper on the fleet model while letting a
-    #   repo give a role its own (e.g. a Haiku scout for a high-volume step). Listed AFTER
-    #   subagent_model: it overrides the FORCE that key implies. Absent = FORCE stays as before.
-    "subagent_force":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1" if v else MISSING},
+    #   file's own `model:` (a `model: haiku` agent ran on sonnet), and so does an ABSENT _FORCE
+    #   (removing the key changed nothing). Only an explicit _FORCE=0 makes the env model a mere
+    #   DEFAULT for agents that pin nothing, with a pinned `model:` honoured. So
+    #   `subagent_force: false` WRITES "0" (never deletes the key): unpinned helpers stay on the
+    #   fleet model, while a repo can give a role its own (e.g. a Haiku scout for a high-volume
+    #   step). Listed AFTER subagent_model: it overrides the FORCE that key implies. Key absent
+    #   from fleet.json = FORCE stays as before.
+    "subagent_force":     lambda v: {"env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1" if v else "0"},
     "disable_fast_mode":  lambda v: {"env.CLAUDE_CODE_DISABLE_FAST_MODE": "1"} if v else {},
 }
 # What `eco on` changes besides the policy. `model` is an alias by default — never a pinned id —

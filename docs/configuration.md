@@ -596,9 +596,10 @@ gent fleet doctor          # warns when it has drifted; `gent up` re-asserts it
 - **`subagent_model`** → `CLAUDE_CODE_SUBAGENT_MODEL` + `…_FORCE=1`.
 - **`subagent_force`** (optional bool) → `…_FORCE`. `subagent_model` alone sets
   `FORCE=1`, which makes the fleet model beat an agent file's own `model:`
-  (measured, CLI 2.1.325: a `model: haiku` agent ran on Sonnet). `false`
-  removes the FORCE key: unpinned helpers still run on `subagent_model`, but an
-  agent that pins a model (a Haiku scout for a high-volume step, say) keeps it.
+  (measured, CLI 2.1.325: a `model: haiku` agent ran on Sonnet). `false` writes
+  `FORCE=0` (an absent key behaves like 1): unpinned helpers still run on
+  `subagent_model`, but an agent that pins a model (a Haiku scout for a
+  high-volume step, say) keeps it.
 - **`disable_fast_mode`** → a saved `fastMode` in a shared file would otherwise
   put every box on the 2×-priced tier.
 
