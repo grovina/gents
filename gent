@@ -267,8 +267,7 @@ def cmd_doctor(fleet, _a):
     if backup_cfg(fleet):
         stale = [n for n, *_ in backup_targets(fleet)
                  if not (lambda st: st.get("ok") and age_s(st.get("last_success")) < BACKUP_STALE_S)(
-                     json.loads(backup_status_path(fleet, n).read_text())
-                     if backup_status_path(fleet, n).exists() else {})]
+                     backup_read_status(fleet, n))]
         print(f"{'✓' if not stale else '✗'} backups "
               + ("fresh for every box" if not stale else f"stale or failing: {', '.join(stale)} — `gent fleet backup status`"))
         ok = ok and not stale
@@ -2325,15 +2324,38 @@ def backup_status_path(fleet, name):
     return d / f"{name}.json"
 
 
+def backup_read_status(fleet, name):
+    """The last status for `name`, or {} if there is none or it is unreadable.
+    A status file torn by a full disk (0 bytes) must read as "no history", not crash
+    the run: this is read BEFORE any box is backed up, so one bad file used to stop
+    every box's backup, hourly, until someone noticed (2026-11-19, 05:02 → 4h+)."""
+    try:
+        v = json.loads(backup_status_path(fleet, name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def write_atomic(path, text):
+    """Replace `path` whole or not at all — a full disk leaves the old file, never a 0-byte one."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def backup_publish(fleet, name, repo, st):
     """Canonical copy in state_root; a box-readable copy in its checkout's .git/."""
     st["stale_after"] = BACKUP_STALE_S
     st["note"] = ("Written by the host's `gent fleet backup` (hourly). ok=false, or last_success older "
                   "than stale_after seconds, means this box is NOT being backed up: tell the host.")
     text = json.dumps(st, indent=2) + "\n"
-    backup_status_path(fleet, name).write_text(text)
+    write_atomic(backup_status_path(fleet, name), text)
     if (repo / ".git").is_dir():
-        (repo / BACKUP_STATUS_REL).write_text(text)
+        write_atomic(repo / BACKUP_STATUS_REL, text)
 
 
 def cmd_fleet_backup(fleet, a):
@@ -2348,8 +2370,7 @@ def cmd_fleet_backup(fleet, a):
     keep = backup_cfg(fleet).get("keep") or {}
     failed = []
     for name, src, ex, sq, repo in backup_targets(fleet, only):
-        sp = backup_status_path(fleet, name)
-        prev = json.loads(sp.read_text()) if sp.exists() else {}
+        prev = backup_read_status(fleet, name)
         t0 = time.time()
         try:
             st = backup_one(fleet, name, src, ex, sq, keep, prev)
@@ -2371,8 +2392,7 @@ def cmd_fleet_backup(fleet, a):
 def backup_print_status(fleet):
     bad = 0
     for name, *_ in backup_targets(fleet):
-        sp = backup_status_path(fleet, name)
-        st = json.loads(sp.read_text()) if sp.exists() else {}
+        st = backup_read_status(fleet, name)
         age = age_s(st.get("last_success"))
         fresh = st.get("ok") and age < BACKUP_STALE_S
         bad += not fresh
