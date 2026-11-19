@@ -2603,7 +2603,7 @@ def cmd_fleet_housekeeping(fleet, a):
     cfg = fleet.get("housekeeping") or {}
     hw, hh = cfg.get("host_disk_pct") or [80, 90]
     bw, bh = cfg.get("box_disk_gb") or [20, 50]
-    checks, notes = [], []
+    checks, notes, unmeasured = [], [], []
 
     pct, free, total = hk.disk_usage(fleet["state_root"])
     lvl = hk.level_for(pct, hw, hh)
@@ -2630,7 +2630,17 @@ def cmd_fleet_housekeeping(fleet, a):
             continue
         checks.append({"key": f"box:{name}:state", "level": hk.OK, "msg": f"box {name} is running"})
         b = hk.parse_size(size)
+        # `docker ps -s` intermittently answers "-1B" when it cannot size a layer (seen on
+        # the busiest box). Ask again; and if it still will not say, SAY SO — a check that
+        # quietly vanishes reads as healthy, which is the failure this exists to prevent.
+        for _ in range(4):
+            if b is not None:
+                break
+            time.sleep(2)
+            again = docker("ps", "-s", "--filter", f"name=^{cname}$", "--format", "{{.Size}}", capture=True)
+            b = hk.parse_size(again)
         if b is None:
+            unmeasured.append(name)
             continue
         lim = (fleet.get("repos", {}).get(name) or {}).get("disk_gb") or [bw, bh]
         checks.append({"key": f"box:{name}:disk", "level": hk.level_for(b / 1e9, lim[0], lim[1]),
@@ -2656,6 +2666,9 @@ def cmd_fleet_housekeeping(fleet, a):
         for u in sorted(failed):
             checks.append({"key": f"unit:{u}", "level": hk.WARN, "msg": f"host unit {u} is in failed state"})
 
+    if unmeasured:
+        print(f"! could not measure the disk footprint of: {', '.join(unmeasured)} (kept their last level)",
+              file=sys.stderr)
     now = time.time()
     sp = fleet["state_root"] / "housekeeping.json"
     try:

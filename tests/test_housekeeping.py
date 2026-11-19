@@ -20,6 +20,7 @@ class Size(unittest.TestCase):
         self.assertEqual(hk.parse_size("381MB (virtual 5.33GB)"), 381_000_000)
         self.assertEqual(hk.parse_size("0B"), 0)
         self.assertEqual(hk.parse_size("10kB"), 10_000)
+        self.assertIsNone(hk.parse_size("-1B"))     # docker could not size the layer
         self.assertIsNone(hk.parse_size("--"))
         self.assertIsNone(hk.parse_size(""))
 
