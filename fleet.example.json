@@ -3,6 +3,9 @@
   "projects_root": "~/Projects",
   "image": "gents-base:latest",
 
+  "_housekeeping_note": "OPTIONAL — the defaults are shown. `gent fleet housekeeping` (a half-hourly timer) alerts via $state_root/secrets/alert.env when the host disk, a box's disk footprint, a backup or a unit changes level; see docs/configuration.md. A repo entry's own \"disk_gb\": [warn, hard] overrides box_disk_gb for that box.",
+  "housekeeping": { "host_disk_pct": [80, 90], "box_disk_gb": [20, 50], "ignore_units": ["snap.*"] },
+
   "_dns_note": "OPTIONAL, and you almost certainly want the default. Boxes get PINNED DNS servers (default 1.1.1.1 + 8.8.8.8, with timeout:1 attempts:2 rotate so one dead server fails over fast) instead of inheriting the host's resolver state. Reason: a container's /etc/resolv.conf is written ONCE at start and never revisited, so a host that doesn't know its nameservers yet in that instant cripples the box permanently — and a box joined to a repo's host_stack network gets Docker's embedded resolver with the host's upstreams as forwarders, which with no upstreams to copy means NO forwarders at all: container names resolve, every public name SERVFAILs, and claude reports `OAuth error: getaddrinfo ESERVFAIL platform.claude.com` with no Remote Control until the container is recreated. Set \"dns\" (a list, or one string) only if these servers are wrong for your network — an internal resolver, a filtered upstream. Service-name resolution inside a host_stack network is unaffected either way.",
 
   "host": {

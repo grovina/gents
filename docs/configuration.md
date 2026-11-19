@@ -192,6 +192,37 @@ Keep the vocabulary tiny. Every action is a line a human wrote, and the point of
 the design is that a box's entire reach is readable in ten seconds. If you want to
 pass an argument from the box, add a second named action instead.
 
+## Housekeeping — a timer that measures, and speaks when something changes
+
+`gent fleet housekeeping` runs every 30 minutes (installed with `gent fleet timers install`)
+and checks: the host disk, each box's disk footprint, backup freshness, boxes that are not
+running, and failed host units. Each check is **ok / warn / hard**; a message goes out over the
+Telegram path in `$state_root/secrets/alert.env` (the same, box-independent one `auth-watch`
+uses) **when a level changes**, not on every run — a warning that repeats is a warning nobody
+reads. A `hard` level repeats every 6 hours until it is fixed; a recovery is announced once.
+`--dry-run` shows what it would say and sends/saves nothing.
+
+```json
+"housekeeping": {
+  "host_disk_pct": [80, 90],
+  "box_disk_gb": [20, 50],
+  "ignore_units": ["snap.*"]
+}
+```
+
+All optional; the values above are the defaults. A repo entry's own `"disk_gb": [warn, hard]`
+overrides the box default for that box (a box that legitimately holds a big layer).
+
+Two things worth knowing:
+- **Host disk is measured as a user hits it** — against what a non-root process may write,
+  not the raw size. Counting the filesystem's reserved 5% made a disk that was full to every
+  ordinary writer read as 94.9% on 2026-11-19, below a 95% critical line, and the guard stayed
+  silent through the outage.
+- **A box's footprint is its writable layer** (`docker ps -s`): its `/tmp`, caches, anything
+  not on a mount. Docker cannot cap that without xfs+pquota, so `hard` is a louder alert, not a
+  limit. The one automatic action is the safe one: once the host crosses its warn level, build
+  cache older than a week is pruned (regenerable; volumes and images are never touched).
+
 ## Backups — the host backs up every box, boxes do nothing
 
 A fleet-level `backup` block in fleet.json turns it on (see `fleet.example.json`).

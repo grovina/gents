@@ -2455,6 +2455,9 @@ def host_jobs(fleet):
         (f"gent-host-actions",
          [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "host-actions", "--quiet"],
          30, "gent: run boxes' pre-approved host actions (restarts they cannot do themselves)"),
+        (f"gent-housekeeping",
+         [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "housekeeping", "--quiet"],
+         1800, "gent: measure disks, boxes and backups; alert when something changes level"),
     ] + ([
         # Only once fleet.json configures a destination: a timer that fails every hour
         # because nothing was set up is noise, not a guard.
@@ -2556,6 +2559,129 @@ def timer_uninstall(label):
     (SYSTEMD_USER / f"{label}.service").unlink(missing_ok=True)
     (SYSTEMD_USER / f"{label}.timer").unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
+
+# ---- housekeeping ----------------------------------------------------------------
+# A timer that measures things and says so when they change. The measuring + "say it
+# when it changes" rules live in scripts/housekeeping.py (pure, tested); this gathers
+# the facts. fleet.json "housekeeping" overrides every threshold (all optional):
+#   host_disk_pct [warn, hard]  default [80, 90]   — of what a normal user may write
+#   box_disk_gb   [warn, hard]  default [20, 50]   — a box's WRITABLE LAYER (its /tmp,
+#                                                    caches, anything not on a mount)
+#   ignore_units  [globs]       default ["snap.*"] — failed host units not worth an alert
+# and a repo entry's own "disk_gb": [warn, hard] overrides the box default for that box.
+# Nothing here can CAP a box (Docker enforces size only on xfs+pquota); the hard level
+# is a louder, repeating alert. The one automatic action is the safe one: build cache
+# older than a week, pruned when the host crosses its warn level.
+def _hk_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("housekeeping", HERE / "scripts" / "housekeeping.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _hk_top_dirs(fleet, n=6):
+    """Where the host's space is — only computed when an alert actually fires."""
+    roots = [str(fleet["projects_root"]), str(fleet["state_root"])]
+    try:
+        out = subprocess.run(["du", "-xk", "--max-depth=2", *roots], capture_output=True, text=True,
+                             timeout=180).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    rows = sorted(((int(k), p) for k, p in (l.split("\t", 1) for l in out.splitlines() if "\t" in l)),
+                  reverse=True)
+    # skip the roots themselves; they are just the sum of everything under them
+    rows = [(k, p) for k, p in rows if p not in roots][:n]
+    dsys = docker("system", "df", "--format", "{{.Type}}: {{.Size}} ({{.Reclaimable}} reclaimable)", capture=True)
+    return ("Largest: " + "; ".join(f"{p.replace(str(Path.home()), '~')} {k / 1e6:.0f}G" for k, p in rows)
+            + ("\nDocker — " + dsys.replace("\n", "; ") if dsys else ""))
+
+
+def cmd_fleet_housekeeping(fleet, a):
+    hk = _hk_mod()
+    cfg = fleet.get("housekeeping") or {}
+    hw, hh = cfg.get("host_disk_pct") or [80, 90]
+    bw, bh = cfg.get("box_disk_gb") or [20, 50]
+    checks, notes = [], []
+
+    pct, free, total = hk.disk_usage(fleet["state_root"])
+    lvl = hk.level_for(pct, hw, hh)
+    if lvl != hk.OK and not a.dry_run:
+        # The one safe automatic cleanup: regenerable build cache, a week or older.
+        out = docker("builder", "prune", "-f", "--filter", "until=168h", capture=True)
+        m = re.search(r"Total(?: reclaimed space)?:\s*(\S+)", out or "")
+        if m and m.group(1) not in ("0B", "0"):
+            notes.append(f"pruned build cache >7d old, reclaimed {m.group(1)}")
+            pct, free, total = hk.disk_usage(fleet["state_root"])
+            lvl = hk.level_for(pct, hw, hh)
+    msg = f"host disk {pct:.0f}% used — {hk.gb(free)} free of {hk.gb(total)} (warn {hw}%, hard {hh}%)"
+    checks.append({"key": "host:disk", "level": lvl, "msg": msg + ("; " + "; ".join(notes) if notes else ""),
+                   "detail": (lambda: _hk_top_dirs(fleet)) if lvl != hk.OK else None})
+
+    # Every gent box's writable layer, in one `docker ps -s` call.
+    ps = docker("ps", "-a", "-s", "--filter", "name=^gent-", "--format", "{{.Names}}\t{{.State}}\t{{.Size}}",
+                capture=True)
+    for line in ps.splitlines():
+        cname, state, size = (line.split("\t") + ["", ""])[:3]
+        name = cname[len("gent-"):]
+        if state != "running":
+            checks.append({"key": f"box:{name}:state", "level": hk.WARN, "msg": f"box {name} is {state}, not running"})
+            continue
+        checks.append({"key": f"box:{name}:state", "level": hk.OK, "msg": f"box {name} is running"})
+        b = hk.parse_size(size)
+        if b is None:
+            continue
+        lim = (fleet.get("repos", {}).get(name) or {}).get("disk_gb") or [bw, bh]
+        checks.append({"key": f"box:{name}:disk", "level": hk.level_for(b / 1e9, lim[0], lim[1]),
+                       "msg": f"box {name} disk footprint {hk.gb(b)} (warn {lim[0]} GB, hard {lim[1]} GB) — "
+                              f"its own layer: /tmp, caches, anything off a mount"})
+
+    # A backup that stops is silent by nature (2026-11-19: four hours, nobody knew).
+    if backup_cfg(fleet):
+        for n, *_ in backup_targets(fleet):
+            st = backup_read_status(fleet, n)
+            fresh = bool(st.get("ok")) and age_s(st.get("last_success")) < BACKUP_STALE_S
+            checks.append({"key": f"backup:{n}", "level": hk.OK if fresh else hk.HARD,
+                           "msg": f"backup of {n} " + ("is fresh" if fresh else
+                                  f"is stale or failing ({st.get('error') or 'no recent success'}) — `gent fleet backup status`")})
+
+    if not IS_MAC:
+        r = subprocess.run(["systemctl", "--user", "--failed", "--no-legend", "--plain"],
+                           capture_output=True, text=True)
+        import fnmatch
+        ignore = cfg.get("ignore_units", ["snap.*"])      # desktop-image noise, not the fleet's
+        failed = {l.split()[0] for l in r.stdout.splitlines()
+                  if l.split() and not any(fnmatch.fnmatch(l.split()[0], g) for g in ignore)}
+        for u in sorted(failed):
+            checks.append({"key": f"unit:{u}", "level": hk.WARN, "msg": f"host unit {u} is in failed state"})
+
+    now = time.time()
+    sp = fleet["state_root"] / "housekeeping.json"
+    try:
+        prev = json.loads(sp.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    # a unit that was failed and no longer is → report recovery (it vanished from the list)
+    for k, v in prev.items():
+        if k.startswith("unit:") and v.get("level") != hk.OK and not any(c["key"] == k for c in checks):
+            checks.append({"key": k, "level": hk.OK, "msg": f"host unit {k[5:]} is no longer failed"})
+    alerts, new = hk.reconcile(prev, checks, now)
+
+    if a.dry_run or not a.quiet:
+        for c in checks:
+            print(f"{ {hk.OK: '✓', hk.WARN: '!', hk.HARD: '✗'}[c['level']] } {c['msg']}")
+    if a.dry_run:
+        for t in alerts:
+            print(f"\n[would alert]\n{t}")
+        return
+    if alerts:
+        text = f"gents housekeeping on {os.uname().nodename}:\n\n" + "\n\n".join(alerts)
+        err = hk.send_telegram(fleet["state_root"] / "secrets" / "alert.env", text)
+        print(("alert sent" if not err else f"ALERT NOT SENT ({err})") + f": {len(alerts)} item(s)", file=sys.stderr)
+        if err:                       # leave the state alone so the next run tries again
+            return
+    write_atomic(sp, json.dumps(new, indent=1) + "\n")
 
 
 def cmd_fleet_timers(fleet, a):
@@ -3237,6 +3363,9 @@ def main():
     fc.add_argument("--check", action="store_true", help="write nothing; exit 1 if the settings have drifted")
     ft = fsub.add_parser("timers", help="the host's recurring auth jobs (launchd on macOS, systemd on Linux)")
     ft.add_argument("action", nargs="?", choices=["install", "status", "uninstall"], default="status")
+    fhk = fsub.add_parser("housekeeping", help="measure host + box disks, backups, stopped boxes; alert on change (the half-hourly timer runs this)")
+    fhk.add_argument("--quiet", action="store_true", help="print nothing unless something is alerted")
+    fhk.add_argument("--dry-run", action="store_true", help="measure and show what would be alerted; send nothing, save nothing")
     fb = fsub.add_parser("backup", help="back up every box + the host's fleet state (restic; the hourly timer runs this)")
     fbs = fb.add_subparsers(dest="action", metavar="<action>")
     fbr = fbs.add_parser("run", help="back up now (default)")
