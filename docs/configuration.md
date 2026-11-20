@@ -707,6 +707,10 @@ in its repo with `name: <box>`; the **host** applies it. The repo holds no host 
   (`secrets_root/stack/<box>`, `*.env` files mode 0600, generated on the host and never printed).
   `fleet.json` `repos.<box>.stack.env` adds `{NAME: path under secrets_root}` for an extra secret
   file the stack mounts (a service-account key; chown it to the container's uid, mode 0400).
+- `repos.<box>.stack.compose` (`"ops/compose.yaml"`, a path inside the repo) names the compose file when it is
+  not `compose.yaml` at the repo root; `gent stack`, the timer jobs and housekeeping all pass it as `-f`. Relative
+  paths inside the file (build contexts, bind mounts) then resolve from that file's directory, as docker compose
+  always does. Change it in `fleet.json` in the same moment the box's move lands: until then the old path is the right one.
 - `repos.<box>.stack.jobs` (`{"pg-backup": {"every": 86400, "compose": [...]}}`) become the
   host timer `gent-<box>-<job>`, installed by `gent fleet timers install`.
 - Nothing is published on the host: a box's cloudflared sidecar reaches its API by service name

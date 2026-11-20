@@ -769,17 +769,29 @@ def stack_env(fleet, name, cfg):
     return env
 
 
+def stack_compose_args(cfg):
+    """`-f <file>` when fleet.json repos.<box>.stack.compose names the box's compose file (a path inside the repo,
+    e.g. "ops/compose.yaml"); otherwise nothing, and docker compose finds compose.yaml at the repo root. Relative
+    paths in the file resolve from its own directory, as docker compose always does."""
+    rel = (cfg.get("stack") or {}).get("compose")
+    return ["-f", str(cfg["abs_path"] / rel)] if rel else []
+
+
 def cmd_stack(fleet, a):
     """Run `docker compose` for a box's own stack with the host-supplied environment:
     `gent stack axt ps`, `gent stack axt up -d db`, `gent stack axt --profile backup run --rm backup`.
     The compose file lives in the box's repo (compose.yaml); the host applies it."""
     cfg = repo_cfg(fleet, a.repo)
-    if not (cfg["abs_path"] / "compose.yaml").exists() and not (cfg["abs_path"] / "docker-compose.yml").exists():
+    cf = stack_compose_args(cfg)
+    if cf:
+        if not Path(cf[1]).exists():
+            die(f"{a.repo}: stack.compose {cf[1]} does not exist")
+    elif not (cfg["abs_path"] / "compose.yaml").exists() and not (cfg["abs_path"] / "docker-compose.yml").exists():
         die(f"{a.repo}: no compose.yaml in {cfg['abs_path']}")
     args = list(a.compose_args)
     if args[:1] == ["--"]:
         args = args[1:]
-    r = subprocess.run(["docker", "compose", *args], cwd=str(cfg["abs_path"]),
+    r = subprocess.run(["docker", "compose", *cf, *args], cwd=str(cfg["abs_path"]),
                        env=stack_env(fleet, a.repo, cfg))
     sys.exit(r.returncode)
 
@@ -2741,7 +2753,8 @@ def cmd_fleet_housekeeping(fleet, a):
         stk = scfg.get("stack")
         if not stk or not scfg.get("allow"):
             continue
-        want = subprocess.run(["docker", "compose", "config", "--services"],
+        want = subprocess.run(["docker", "compose", *stack_compose_args(dict(scfg, abs_path=fleet["projects_root"] / scfg["path"])),
+                               "config", "--services"],
                               cwd=str(fleet["projects_root"] / scfg["path"]),
                               env=stack_env(fleet, sname, scfg), capture_output=True, text=True)
         expected = [x for x in want.stdout.split() if x]
