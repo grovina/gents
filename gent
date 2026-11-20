@@ -2293,6 +2293,36 @@ def backup_sqlite_snapshots(fleet, name, repo, rels):
     return stage
 
 
+def backup_pg_dumps(fleet, name, specs):
+    """A live Postgres cluster copied raw is a torn, unrestorable snapshot, so a box's
+    databases are covered by a CONSISTENT dump taken through the server: `pg_dump -Fc`
+    inside the box's own db container (as the OS user postgres: local peer auth, no
+    password handled here), streamed to a staging file that is backed up instead.
+    fleet.json repos.<box>.backup.pg: [{"container": "axt-db", "database": "axt"}].
+    Written atomically; a failed dump raises, so the run is reported as failed rather
+    than backing up a stale file as if it were fresh."""
+    stage = fleet["state_root"] / "backup-staging" / name / "pg"
+    stage.mkdir(parents=True, exist_ok=True)
+    for spec in specs:
+        dst = stage / f"{spec['database']}.dump"
+        tmp = dst.with_suffix(".dump.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                r = subprocess.run(["docker", "exec", "-u", spec.get("user", "postgres"), spec["container"],
+                                    "pg_dump", "-Fc", "-d", spec["database"]],
+                                   stdout=fh, stderr=subprocess.PIPE)
+            if r.returncode:
+                raise RuntimeError(f"pg_dump {spec['container']}/{spec['database']} failed "
+                                   f"(rc={r.returncode}): {r.stderr.decode(errors='replace').strip()[-300:]}")
+            if tmp.stat().st_size == 0:
+                raise RuntimeError(f"pg_dump {spec['container']}/{spec['database']} wrote nothing")
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return stage
+
+
 def backup_one(fleet, name, src, excludes, sqlite, keep, prev):
     st = {"box": name, "repository": backup_cfg(fleet)["repository"].replace("{name}", name),
           "last_run": now_iso(), "ok": False,
@@ -2303,6 +2333,9 @@ def backup_one(fleet, name, src, excludes, sqlite, keep, prev):
     if sqlite:
         src["/src/sqlite"] = str(backup_sqlite_snapshots(fleet, name, src["/src/repo"], sqlite))
         excludes = excludes + [f"/src/repo/{r}{sfx}" for r in sqlite for sfx in ("", "-wal", "-shm", "-journal")]
+    pg = (((fleet.get("repos") or {}).get(name) or {}).get("backup") or {}).get("pg")
+    if pg:
+        src["/src/pg"] = str(backup_pg_dumps(fleet, name, pg))
     args = ["backup", "--json", "--host", name, "--tag", "gent", "--skip-if-unchanged"]
     for e in BACKUP_EXCLUDES:
         args += ["--exclude", e]
