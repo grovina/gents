@@ -2182,7 +2182,11 @@ def backup_targets(fleet, only=None):
         # state_root (secrets catalog, per-box app state). The catalog's package cache
         # is regenerable.
         sr = fleet["state_root"]
-        ex = ["/src/state/backup-staging"]               # already inside each box's own repository
+        # backup-staging is already inside each box's own repository. data/<box>/ holds
+        # LIVE service data (a Postgres cluster, a SQLite file): copied raw while running it is
+        # a torn, unrestorable snapshot, so it never rides the host target. Each box's data is
+        # covered by a consistent dump staged into its own repository (backup.pg / backup.sqlite).
+        ex = ["/src/state/backup-staging", "/src/state/data"]
         if fleet["secrets_root"].is_relative_to(sr):
             ex.append(f"/src/state/{(fleet['secrets_root'] / 'cache').relative_to(sr)}")
         out.append(("host", {"/src/gents": str(HERE), "/src/state": str(sr)}, ex, [], HERE))
