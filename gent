@@ -749,6 +749,40 @@ def ensure_host_stack(fleet, name, cfg, gj):
         print(f"gent: {name} joined {net} — box reaches the stack by service name")
 
 
+def stack_env(fleet, name, cfg):
+    """The environment a box's own compose file expects from the host (the pattern in
+    docs/configuration.md, "Host stacks"): where its data lives, where its secrets live,
+    and any extra secret FILE the stack mounts. The repo holds no host path; the host
+    supplies them here, so the same compose file runs on any machine.
+      GENT_DATA / <BOX>_DATA        state_root/data/<box>          (bind-mounted service data)
+      GENT_SECRETS / <BOX>_SECRETS  secrets_root/stack/<box>       (env files, 0600, never in a repo)
+      fleet.json repos.<box>.stack.env {NAME: path under secrets_root}  e.g. a service-account key"""
+    data = fleet["state_root"] / "data" / name
+    sec = fleet["secrets_root"] / "stack" / name
+    up = re.sub(r"[^A-Z0-9]", "_", name.upper())
+    env = dict(os.environ)
+    env.update({"GENT_DATA": str(data), "GENT_SECRETS": str(sec),
+                f"{up}_DATA": str(data), f"{up}_SECRETS": str(sec)})
+    for k, rel in ((cfg.get("stack") or {}).get("env") or {}).items():
+        env[k] = str(fleet["secrets_root"] / rel)
+    return env
+
+
+def cmd_stack(fleet, a):
+    """Run `docker compose` for a box's own stack with the host-supplied environment:
+    `gent stack axt ps`, `gent stack axt up -d db`, `gent stack axt --profile backup run --rm backup`.
+    The compose file lives in the box's repo (compose.yaml); the host applies it."""
+    cfg = repo_cfg(fleet, a.repo)
+    if not (cfg["abs_path"] / "compose.yaml").exists() and not (cfg["abs_path"] / "docker-compose.yml").exists():
+        die(f"{a.repo}: no compose.yaml in {cfg['abs_path']}")
+    args = list(a.compose_args)
+    if args[:1] == ["--"]:
+        args = args[1:]
+    r = subprocess.run(["docker", "compose", *args], cwd=str(cfg["abs_path"]),
+                       env=stack_env(fleet, a.repo, cfg))
+    sys.exit(r.returncode)
+
+
 def host_stack_of(cfg):
     """(compose_path, project) for a repo's declared host_stack, else (None, None)."""
     hs = (read_gent_json(cfg) or {}).get("host_stack")
@@ -2468,7 +2502,22 @@ def host_jobs(fleet):
         ("gent-backup",
          [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "fleet", "backup", "run", "--quiet"],
          3600, "gent: back up every box and the host's fleet state (restic)"),
-    ] if backup_cfg(fleet) else [])
+    ] if backup_cfg(fleet) else []) + stack_jobs(fleet)
+
+
+def stack_jobs(fleet):
+    """A box's recurring stack jobs, from fleet.json repos.<box>.stack.jobs:
+        {"pg-backup": {"every": 86400, "compose": ["--profile","backup","run","--rm","backup"]}}
+    become the host timer gent-<box>-<job> running `gent stack <box> <compose…>`."""
+    out = []
+    for name, cfg in (fleet.get("repos") or {}).items():
+        if not cfg.get("allow"):
+            continue
+        for job, spec in ((cfg.get("stack") or {}).get("jobs") or {}).items():
+            out.append((f"gent-{name}-{job}",
+                        [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "stack", name, *spec["compose"]],
+                        int(spec["every"]), f"gent: {name} stack job {job}"))
+    return out
 
 
 def _systemd_linger_ok():
@@ -3436,6 +3485,9 @@ def main():
     sp.add_argument("repo", nargs="?")
     sp.add_argument("--wipe", action="store_true", help="also delete the home volume")
     sp.add_argument("--stack", action="store_true", help="also stop the repo's host_stack (e.g. HA infra)")
+    sp = sub.add_parser("stack", help="run docker compose for a box's own stack (compose.yaml in its repo) with the host-supplied data/secrets env")
+    sp.add_argument("repo")
+    sp.add_argument("compose_args", nargs=argparse.REMAINDER, help="passed to `docker compose` (e.g. ps | up -d db | --profile backup run --rm backup)")
     sp = sub.add_parser("shell", help="open a shell in a box (or run a one-off after --)")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("cmd_args", nargs="*", help="optional one-off command after --")

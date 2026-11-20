@@ -695,3 +695,22 @@ pasted as one prompt). No `.gent/hello.md` → nothing is replayed (claude still
 reloads the repo's `CLAUDE.md` either way). The same primitive is exposed as the
 in-box command `gent-hello` to re-send it by hand — `gent-hello "<note>"`
 appends a note below the brief, exactly as the post-clear greet does.
+
+## Host stacks (a box that serves something)
+
+A box that serves (a database, an API, its own Cloudflare tunnel) keeps a `compose.yaml`
+in its repo with `name: <box>`; the **host** applies it. The repo holds no host path.
+
+- `gent stack <box> <compose args…>` runs `docker compose` in the box's repo with the
+  environment the host supplies: `GENT_DATA`/`<BOX>_DATA` (`state_root/data/<box>`, bind-mounted
+  service data, never copied raw by the host backup) and `GENT_SECRETS`/`<BOX>_SECRETS`
+  (`secrets_root/stack/<box>`, `*.env` files mode 0600, generated on the host and never printed).
+  `fleet.json` `repos.<box>.stack.env` adds `{NAME: path under secrets_root}` for an extra secret
+  file the stack mounts (a service-account key; chown it to the container's uid, mode 0400).
+- `repos.<box>.stack.jobs` (`{"pg-backup": {"every": 86400, "compose": [...]}}`) become the
+  host timer `gent-<box>-<job>`, installed by `gent fleet timers install`.
+- Nothing is published on the host: a box's cloudflared sidecar reaches its API by service name
+  (one remotely-managed tunnel per box, token in `stack/<box>/tunnel.env`). Compose loads EVERY
+  service's `env_file`, so create an empty placeholder for one not yet configured.
+- A bind-mounted Postgres data dir must exist empty, owned by 999:999, mode 0700, before the first
+  start: the image entrypoint chowns only PGDATA, not the mount root.
