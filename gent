@@ -10,6 +10,7 @@ in tmux, attachable from the host.
 Stdlib only. The docker command is always printed before it runs — no magic.
 """
 import argparse, json, os, re, shlex, shutil, subprocess, sys, time
+import urllib.error, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2732,6 +2733,48 @@ def cmd_fleet_housekeeping(fleet, a):
         checks.append({"key": f"box:{name}:disk", "level": hk.level_for(b / 1e9, lim[0], lim[1]),
                        "msg": f"box {name} disk footprint {hk.gb(b)} (warn {lim[0]} GB, hard {lim[1]} GB) — "
                               f"its own layer: /tmp, caches, anything off a mount"})
+
+    # A box's own compose stack (docker compose project <box>): every service the compose file
+    # declares must be running and healthy, and each declared public URL must answer from outside
+    # the box. `stack.public` is a list of URLs expected to return 2xx (a health route).
+    for sname, scfg in (fleet.get("repos") or {}).items():
+        stk = scfg.get("stack")
+        if not stk or not scfg.get("allow"):
+            continue
+        want = subprocess.run(["docker", "compose", "config", "--services"],
+                              cwd=str(fleet["projects_root"] / scfg["path"]),
+                              env=stack_env(fleet, sname, scfg), capture_output=True, text=True)
+        expected = [x for x in want.stdout.split() if x]
+        if want.returncode or not expected:
+            checks.append({"key": f"stack:{sname}:config", "level": hk.WARN,
+                           "msg": f"stack {sname}: could not read its compose services "
+                                  f"({(want.stderr or 'none declared').strip()[-120:]})"})
+            continue
+        ps = docker("ps", "-a", "--filter", f"label=com.docker.compose.project={sname}",
+                    "--format", "{{.Label \"com.docker.compose.service\"}}\t{{.State}}\t{{.Status}}", capture=True)
+        seen = {}
+        for line in (ps or "").splitlines():
+            svc, state, status = (line.split("\t") + ["", ""])[:3]
+            seen[svc] = (state, status)
+        for svc in expected:
+            state, status = seen.get(svc, ("missing", ""))
+            ok = state == "running" and "unhealthy" not in status and "starting" not in status
+            checks.append({"key": f"stack:{sname}:{svc}", "level": hk.OK if ok else hk.HARD,
+                           "msg": f"stack {sname}/{svc} " + ("is running" + (" (healthy)" if "healthy" in status else "")
+                                  if ok else f"is {state}{' — ' + status if status else ''} — `gent stack {sname} ps`")})
+        for url in stk.get("public") or []:
+            try:
+                # Cloudflare's bot rules answer the default Python-urllib agent with 403, which would read as an outage.
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "gent-housekeeping"}), timeout=15) as resp:
+                    code = resp.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            except Exception as e:
+                code = f"{type(e).__name__}"
+            good = isinstance(code, int) and 200 <= code < 300
+            checks.append({"key": f"stack:{sname}:public:{url}", "level": hk.OK if good else hk.HARD,
+                           "msg": f"stack {sname} public {url} " + (f"answers {code}" if good else
+                                  f"did not answer 2xx ({code}) — tunnel or service down?")})
 
     # A backup that stops is silent by nature (2026-11-19: four hours, nobody knew).
     if backup_cfg(fleet):
