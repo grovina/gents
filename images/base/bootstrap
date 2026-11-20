@@ -672,11 +672,12 @@ if [ "$EVENT_BUS" = 1 ]; then
   ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
     absent_since=0   # start of the current absence episode; states log as EDGES, not every pass
+    unanswered=0     # consecutive pokes that never got the waiter back; drives the backoff below
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
       # Liveness — is the waiter running? A bare `pgrep` excludes its own PID;
       # NEVER wrap it in a shell whose argv holds the pattern.
-      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then absent_since=0; sleep 60; continue; fi
+      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then absent_since=0; unanswered=0; sleep 60; continue; fi
       [ "$absent_since" = 0 ] && absent_since="$(date +%s)"
       if [ -f "$_wdir/events.cursor" ]; then
         if gent-events pending --older-than "$WD_PENDING_AGE" >/dev/null 2>&1; then
@@ -735,6 +736,14 @@ if [ "$EVENT_BUS" = 1 ]; then
         _wlog "recovered before poke; no poke"
         absent_since=0; sleep 60; continue
       fi
+      # A session that cannot answer (login expired: "Login reached its time limit · Please
+      # run /login" comes back in 0s, no model call) turns every poke into a dead line in the
+      # transcript, once per debounce window, all night (homer, 2026-11-20: five in 30 min).
+      # Don't poke into a visible login wall — /login is a human's job, and the poke can't help.
+      if tmux capture-pane -p -t gent:claude 2>/dev/null | tail -n 15 | grep -q 'Please run /login'; then
+        _wlog "login wall on the pane; no poke (needs /login)"
+        unanswered=$((unanswered + 1)); sleep 300; continue
+      fi
       _rearm_text | tmux load-buffer -b gent-tgrearm -
       tmux paste-buffer -b gent-tgrearm -t gent:claude -p -d
       tmux send-keys -t gent:claude Enter
@@ -746,8 +755,16 @@ if [ "$EVENT_BUS" = 1 ]; then
         pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { rearmed=1; break; }
         sleep 2
       done
-      [ "$rearmed" = 1 ] && _wlog "re-armed after poke" || _wlog "NOT re-armed within ~5min after poke"
-      absent_since=0; sleep 60
+      # BACKOFF. A poke that goes unanswered (session wedged, not just slow) is not retried every
+      # ~6 min: the wait doubles per consecutive miss (2,4,8,16,32,64 min), and resets the moment
+      # the waiter is seen again. A real drop still gets its first poke at once.
+      if [ "$rearmed" = 1 ]; then _wlog "re-armed after poke"; unanswered=0; extra=0
+      else
+        unanswered=$((unanswered + 1)); _bo=$unanswered; [ "$_bo" -gt 6 ] && _bo=6
+        extra=$(( 60 * (1 << _bo) ))
+        _wlog "NOT re-armed within ~5min after poke (miss #$unanswered); backing off ${extra}s"
+      fi
+      absent_since=0; sleep $(( 60 + extra ))
     done ) &
 fi
 
