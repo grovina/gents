@@ -718,3 +718,7 @@ in its repo with `name: <box>`; the **host** applies it. The repo holds no host 
   restic run take a consistent `pg_dump -Fc` through the server (`docker exec -u postgres`) into
   `state_root/backup-staging/<box>/pg/` and back that up as `/src/pg`. A failed or empty dump fails
   the box's run. This is the second copy; the box's own restore-checked dump to its bucket is the first.
+- `gent fleet housekeeping` (half-hourly) watches each stack: every service its compose file declares must be
+  running and not unhealthy, and each URL in `repos.<box>.stack.public` must answer 2xx from the host
+  (alerts on a level change, over Telegram). It runs on the machine itself, so it cannot report a power or
+  internet outage of that machine: an outside probe (Cloudflare tunnel notifications, or an uptime service) must.
