@@ -659,20 +659,23 @@ if [ "$EVENT_BUS" = 1 ]; then
   # $WATCHDOG_LOG, classified real-drop vs. self-recovering false-alarm, so the
   # pokes are auditable. Telemetry only — the log never gates anything.
   #
-  # WHEN IT POKES. Two modes, chosen by whether `gent-events next` has ever run here
-  # (its cursor file exists):
+  # WHEN IT POKES (the rule itself lives in `gent-events wire`). Two modes, chosen by whether
+  # `gent-events next` has ever run here (its cursor file exists):
   #   watch mode (no cursor) — the waiter is a long-lived Monitor, so ABSENT means down:
   #     poke once it has been gone >6s AND is still gone at the moment of delivery.
   #   next mode (cursor)     — the waiter is legitimately ABSENT for seconds to minutes
   #     after every event, while the agent handles it. Absent alone is not down. Poke
   #     only when (a) it is absent AND a printable event has waited past the cursor for
-  #     >$WD_PENDING_AGE s (nobody came for it), or (b) it has been absent for
-  #     >$WD_ABSENT_MAX s (the agent forgot to re-arm; a quiet stream would hide that).
+  #     >GENT_WD_PENDING_AGE s (nobody came for it), or (b) it has been absent for
+  #     >GENT_WD_ABSENT_MAX s (the agent forgot to re-arm; a quiet stream would hide that).
   #     Absent with nothing pending, within the budget, is just the agent working.
   # Either way the poke waits for an idle pane, then CHECKS AGAIN right before pasting
   # (a restart after a 30-minute expiry takes 10-20s; by the time the pane is idle the
   # waiter is often back) — the same re-check at delivery the clear nudge does.
-  WD_PENDING_AGE="${GENT_WD_PENDING_AGE:-120}"; WD_ABSENT_MAX="${GENT_WD_ABSENT_MAX:-600}"
+  # GENT_WD_PENDING_AGE (120) / GENT_WD_ABSENT_MAX (600) are read by `gent-events wire` itself.
+  # The default waiter is found by its command line; a custom monitor.watch by its own `live` pattern.
+  _wire() { if [ "$MON_WATCH" = "gent-events watch" ]; then gent-events wire 2>/dev/null; else gent-events wire --live "$MON_LIVE" 2>/dev/null; fi; }
+  _wire_up() { case "$(_wire)" in OK\ next*|OK\ watch*|OK\ live*|DUPLICATE*) return 0;; esac; return 1; }
   _wdir="${GENT_EVENTS_PATH:-}"; _wdir="${_wdir%/*}"; [ -n "$_wdir" ] || _wdir="$HOME/.local/state/gent"
   mkdir -p "$_wdir" 2>/dev/null || true
   WATCHDOG_LOG="$_wdir/watchdog.log"
@@ -680,39 +683,20 @@ if [ "$EVENT_BUS" = 1 ]; then
   echo "gents: event watchdog armed (waiter: $MON_WATCH; log: $WATCHDOG_LOG)" >&2
   ( trap : INT; set +e   # a supervisor loop must outlive a failed command (errexit is inherited)
     sleep 30   # let a fresh session settle (hello, etc.) before the first check
-    absent_since=0   # start of the current absence episode; states log as EDGES, not every pass
     unanswered=0     # consecutive pokes that never got the waiter back; drives the backoff below
     while :; do
       tmux has-session -t gent 2>/dev/null || exit 0
-      # Liveness — is the waiter running? A bare `pgrep` excludes its own PID;
-      # NEVER wrap it in a shell whose argv holds the pattern.
-      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then absent_since=0; unanswered=0; sleep 60; continue; fi
-      [ "$absent_since" = 0 ] && absent_since="$(date +%s)"
-      if [ -f "$(gent-events cursor-path 2>/dev/null)" ]; then
-        if gent-events pending --older-than "$WD_PENDING_AGE" >/dev/null 2>&1; then
-          POKE_WHY="events have waited over ${WD_PENDING_AGE}s unconsumed"
-        elif [ $(( $(date +%s) - absent_since )) -ge "$WD_ABSENT_MAX" ]; then
-          POKE_WHY="absent for over ${WD_ABSENT_MAX}s"
-        else
-          sleep 15; continue   # the agent is handling an event; give it time to re-arm
-        fi
-        _wlog "DOWN '$MON_LIVE' absent, $POKE_WHY; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
-      else
-        # Looks down. Before poking, CONFIRM it isn't a brief blip (a CLI restart or
-        # pgrep race): re-check over ~6s. If it returns on its own it was a false
-        # alarm — log it and DON'T poke. This is how we tell real drops from noise.
-        recovered=0
-        for _ in 1 2 3; do
-          sleep 2
-          pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { recovered=1; break; }
-        done
-        if [ "$recovered" = 1 ]; then
-          _wlog "FALSE-ALARM '$MON_LIVE' vanished then self-recovered <6s; no poke. now: $(pgrep -af "$MON_LIVE" 2>/dev/null | tr '\n' '|')"
-          absent_since=0; sleep 60; continue
-        fi
-        POKE_WHY="absent over 6s"
-        _wlog "DOWN '$MON_LIVE' absent >6s; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
+      # Liveness — ask `gent-events wire`, which holds the one rule (exit 0 = fine, incl. "idle:
+      # the agent is handling the last wake"; 1 = down; 2 = duplicate waiters, which newest-wins
+      # settles by itself).
+      wire_out="$(_wire)"; wire_rc=$?
+      if [ "$wire_rc" != 1 ]; then
+        [ "$wire_rc" = 2 ] && _wlog "$wire_out"
+        case "$wire_out" in "OK idle"*) sleep 15; continue;; esac   # handling an event; give it time to re-arm
+        unanswered=0; sleep 60; continue
       fi
+      POKE_WHY="${wire_out#DOWN }"
+      _wlog "$wire_out; poking. ps: $(ps -eo pid,etime,args 2>/dev/null | grep -iE 'gent-events|claude' | grep -v grep | tr '\n' '|')"
       # Poke the model to re-arm + reconcile. Deliver it like gent-hello: a bare
       # `send-keys "$text" Enter` into a BUSY pane leaves the text unsent in the
       # composer, so wait for the pane to go idle (stable + not "esc to interrupt"),
@@ -741,9 +725,9 @@ if [ "$EVENT_BUS" = 1 ]; then
       greet_pending && { _wlog "gent-clear greet pending; deferring poke"; sleep 10; continue; }
       # RE-CHECK AT DELIVERY. The pane wait above can take up to ~2min; a waiter that was
       # re-armed meanwhile (the usual case after a 30-minute expiry) must not be poked.
-      if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then
+      if _wire_up; then
         _wlog "recovered before poke; no poke"
-        absent_since=0; sleep 60; continue
+        sleep 60; continue
       fi
       # A session that cannot answer (login expired: "Login reached its time limit · Please
       # run /login" comes back in 0s, no model call) turns every poke into a dead line in the
@@ -761,7 +745,7 @@ if [ "$EVENT_BUS" = 1 ]; then
       rearmed=0
       for _ in $(seq 1 150); do
         tmux has-session -t gent 2>/dev/null || exit 0
-        pgrep -f "$MON_LIVE" >/dev/null 2>&1 && { rearmed=1; break; }
+        _wire_up && { rearmed=1; break; }
         sleep 2
       done
       # BACKOFF. A poke that goes unanswered (session wedged, not just slow) is not retried every
@@ -773,7 +757,7 @@ if [ "$EVENT_BUS" = 1 ]; then
         extra=$(( 60 * (1 << _bo) ))
         _wlog "NOT re-armed within ~5min after poke (miss #$unanswered); backing off ${extra}s"
       fi
-      absent_since=0; sleep $(( 60 + extra ))
+      sleep $(( 60 + extra ))
     done ) &
 fi
 
