@@ -231,6 +231,24 @@ class PendingTests(Env):
         self.assertEqual(self.pending("--older-than", "120"), 1)   # the OLDEST pending is "fresh"
         self.assertEqual(self.pending("--older-than", "0"), 0)
 
+    def test_a_raw_line_with_its_own_ts_ages_by_that_ts_not_the_stream_mtime(self):
+        # A source that appends its own JSON lines (no `emit`) and stamps them in UTC ISO with an
+        # offset and microseconds: the line's ts decides its age, even though the stream was just written.
+        self.arm_at_end()
+        old = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=300)).isoformat()
+        self.raw(json.dumps({"ts": old, "kind": "telegram_reply", "text": "ok"}) + "\n")
+        self.assertTrue(old.endswith("+00:00") and "." in old)
+        self.assertEqual(self.pending("--older-than", "120"), 0)   # 300 s old by its ts
+        self.assertEqual(self.pending("--older-than", "600"), 1)   # not 600 s old
+
+    def test_a_raw_line_without_ts_ages_by_the_stream_mtime(self):
+        self.arm_at_end()
+        self.raw(json.dumps({"kind": "telegram_reply", "text": "ok"}) + "\n")
+        self.assertEqual(self.pending("--older-than", "120"), 1)   # just written: not old yet
+        past = time.time() - 300
+        os.utime(self.stream, (past, past))
+        self.assertEqual(self.pending("--older-than", "120"), 0)
+
 
 def sh(script):
     """A filter / reconcile command as an argv list (no shell in the tool itself)."""
