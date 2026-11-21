@@ -711,8 +711,10 @@ in its repo with `name: <box>`; the **host** applies it. The repo holds no host 
   not `compose.yaml` at the repo root; `gent stack`, the timer jobs and housekeeping all pass it as `-f`. Relative
   paths inside the file (build contexts, bind mounts) then resolve from that file's directory, as docker compose
   always does. Change it in `fleet.json` in the same moment the box's move lands: until then the old path is the right one.
-- `repos.<box>.stack.jobs` (`{"pg-backup": {"every": 86400, "compose": [...]}}`) become the
-  host timer `gent-<box>-<job>`, installed by `gent fleet timers install`.
+- `repos.<box>.stack.jobs` (`{"pg-backup": {"at": "03:30", "compose": [...]}}`) become the
+  host timer `gent-<box>-<job>`, installed by `gent fleet timers install`. `at` ("HH:MM", the
+  machine's local time) runs it daily at that clock time and catches up a run missed while the machine was off;
+  `every` (seconds) runs it that long after the last run instead, counted from when the timer was installed.
 - Nothing is published on the host: a box's cloudflared sidecar reaches its API by service name
   (one remotely-managed tunnel per box, token in `stack/<box>/tunnel.env`). Compose loads EVERY
   service's `env_file`, so create an empty placeholder for one not yet configured.

@@ -2553,8 +2553,9 @@ def host_jobs(fleet):
 
 def stack_jobs(fleet):
     """A box's recurring stack jobs, from fleet.json repos.<box>.stack.jobs:
-        {"pg-backup": {"every": 86400, "compose": ["--profile","backup","run","--rm","backup"]}}
-    become the host timer gent-<box>-<job> running `gent stack <box> <compose…>`."""
+        {"pg-backup": {"at": "03:30", "compose": ["--profile","backup","run","--rm","backup"]}}
+    `at` ("HH:MM", the machine's local time) runs it daily at that clock time; `every` (seconds) runs it that
+    long after the last run, starting from the moment the timer was installed. They become the host timer gent-<box>-<job> running `gent stack <box> <compose…>`."""
     out = []
     for name, cfg in (fleet.get("repos") or {}).items():
         if not cfg.get("allow"):
@@ -2562,7 +2563,7 @@ def stack_jobs(fleet):
         for job, spec in ((cfg.get("stack") or {}).get("jobs") or {}).items():
             out.append((f"gent-{name}-{job}",
                         [sys.executable or "/usr/bin/python3", str(HERE / "gent"), "stack", name, *spec["compose"]],
-                        int(spec["every"]), f"gent: {name} stack job {job}"))
+                        spec["at"] if spec.get("at") else int(spec["every"]), f"gent: {name} stack job {job}"))
     return out
 
 
@@ -2577,7 +2578,11 @@ def _systemd_linger_ok():
 
 
 def timer_install(label, argv, every, desc):
-    """Install a recurring host job. Idempotent."""
+    """Install a recurring host job. Idempotent. `every` is seconds, or "HH:MM" for a daily run at that
+    local clock time (launchd StartCalendarInterval / systemd OnCalendar)."""
+    at = every if isinstance(every, str) else None
+    if at and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+        die(f"{label}: bad time {at!r}, expected HH:MM")
     exec_line = " ".join(shlex.quote(a) for a in argv)
     if IS_MAC:
         LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
@@ -2589,8 +2594,9 @@ def timer_install(label, argv, every, desc):
   <key>Label</key><string>com.grovina.{label}</string>
   <key>ProgramArguments</key><array>
 {args_xml}  </array>
-  <key>StartInterval</key><integer>{every}</integer>
-  <key>RunAtLoad</key><true/>
+{(f"  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>{int(at[:2])}</integer>"
+   f"<key>Minute</key><integer>{int(at[3:])}</integer></dict>") if at else
+  f"  <key>StartInterval</key><integer>{every}</integer>" + chr(10) + "  <key>RunAtLoad</key><true/>"}
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
@@ -2620,13 +2626,15 @@ def timer_install(label, argv, every, desc):
         f"[Timer]\n"
         # OnBootSec so a reboot re-arms it without a login; OnUnitActiveSec (not
         # OnCalendar) to match launchd's StartInterval semantics — every N seconds
-        # after the last run, not at wall-clock marks. Persistent catches up a run
-        # missed while the box was off.
+        # after the last run, not at wall-clock marks. A job with a clock time (`at`)
+        # is the exception: OnCalendar / StartCalendarInterval, daily. Persistent
+        # catches up a run missed while the box was off.
         # AccuracySec must scale with the interval: systemd may delay a unit by up to
         # this much to batch wakeups, so a flat 30 s turns a 30 s timer into an
         # anything-from-30-to-60 s one — visible as lag to whoever is waiting on it.
-        f"OnBootSec=2min\nOnUnitActiveSec={every}s\nAccuracySec={max(1, min(30, every // 4))}s\n"
-        f"Persistent=true\n\n"
+        + (f"OnCalendar=*-*-* {at}:00\nAccuracySec=1min\n" if at else
+           f"OnBootSec=2min\nOnUnitActiveSec={every}s\nAccuracySec={max(1, min(30, every // 4))}s\n")
+        + f"Persistent=true\n\n"
         f"[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", f"{label}.timer"],
@@ -2851,7 +2859,7 @@ def cmd_fleet_timers(fleet, a):
     if action == "install":
         for label, argv, every, desc in jobs:
             p = timer_install(label, argv, every, desc)
-            print(f"✓ {label:<18} every {every}s  ({p})")
+            print(f"✓ {label:<18} {'daily at ' + every if isinstance(every, str) else f'every {every}s'}  ({p})")
         print(f"gent: {'launchd' if IS_MAC else 'systemd --user (lingering on)'} — "
               f"they run whether or not you are logged in.")
     elif action == "uninstall":
@@ -2862,7 +2870,7 @@ def cmd_fleet_timers(fleet, a):
         for label, _, every, _ in jobs:
             st = timer_status(label)
             mark = "✓" if st in ("loaded", "active") else "✗"
-            print(f"{mark} {label:<18} {st:<12} (every {every}s)")
+            print(f"{mark} {label:<18} {st:<12} ({'daily at ' + every if isinstance(every, str) else f'every {every}s'})")
 
 
 def host_job_path():
