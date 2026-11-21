@@ -358,7 +358,9 @@ it when it drops. Turn the bus on with `"events": true` (or any `.events` object
 
 - **`cron`** — the [cron file](#cron-slots-put-the-file-in-the-repo) (default:
   the box's state dir).
-- **`path`** — the stream (default: the box's state dir).
+- **`path`** — the stream (default: the box's state dir). Sources may append
+  JSON lines to it directly, without `gent-events emit`: the waiter only ever
+  reads it (it never writes, rotates or replaces the file).
 - **`tz`** — the zone cron slots fire in (default: the box's `$TZ`, then UTC).
 
 A **relative path is resolved against the repo**, an absolute one is taken as-is.
@@ -391,11 +393,15 @@ each wake**:
 gent-events next        # run_in_background; the wake is its exit; re-run after handling
 ```
 
-- **The cursor** (`events.cursor` next to the stream) is a byte offset, written
+- **The cursor** is a byte offset into the stream. It lives in the box's state
+  dir, never beside the stream (a stream may sit in a data directory of its own):
+  `events.cursor` for the default stream, `events-<hash of the stream path>.cursor`
+  for any other, so two streams never share one. A cursor left beside a custom
+  stream by an older layout is taken over once (said on stderr). It is written
   only after the batch is printed. An event that arrives while the agent is
   handling the previous one is the first thing the next `next` returns, at once:
-  there is no gap to reconcile with `tg pending`. First use starts at the end of
-  the stream (said on stderr: history is not replayed); a stream shorter than the
+  there is no gap to reconcile with `tg pending`. First use (no cursor) starts at the
+  **end** of the stream, never at 0 (said on stderr: history is not replayed); a stream shorter than the
   cursor (truncated) restarts at offset 0, also said.
 - **One waiter.** `next` takes the same pidfile as `watch` (newest wins), so two
   waiters never consume the same events; the older one prints that it stood
@@ -407,11 +413,77 @@ gent-events next        # run_in_background; the wake is its exit; re-run after 
   one is at least SECS old).
 - `watch` is unchanged, for boxes that keep the Monitor.
 
+### Per-box behaviour: `drop`, `filter`, `reconcile`
+
+The box's whole `events` object reaches `gent-events` as one JSON variable,
+`GENT_EVENTS_CONFIG` (exported by the bootstrap into the daemon's and the
+model's shells). Unset, or not a JSON object (one stderr line says so), means
+the defaults above.
+
+```json
+"events": {
+  "path": "var/events.jsonl",
+  "drop": ["heartbeat", "tick"],
+  "filter": ["./bin/event-filter", "--quiet"],
+  "reconcile": ["./bin/catch-up"],
+  "reconcile_after": 600,
+  "reconcile_timeout": 60,
+  "reconcile_max_bytes": 4096,
+  "filter_timeout": 10
+}
+```
+
+- **`drop`** — kinds that never wake the agent (`self_*` is always dropped). A
+  dropped line advances the cursor and is counted in the one stderr summary line
+  printed with the next wake.
+- **`filter`** — a command (argv list, or a string split like a shell would but
+  run **without** a shell), started from the repo dir once per batch. It gets the
+  batch's surviving lines on stdin and writes the passing lines to stdout, in
+  order; it may rewrite a line (add a field, shorten a text). It **fails open**:
+  if it cannot start, exits non-zero or runs past `filter_timeout` (10 s), every
+  line passes and one stderr line says so. `pending` applies the same drop and
+  filter, so the watchdog never pokes for an event `next` would not wake on.
+- **`reconcile`** — a command (same forms), run from the repo dir, that prints
+  what the stream may have missed. `next` runs it **concurrently** with the wait
+  when its previous exit is older than `reconcile_after` (600 s), when it has
+  never run, or when the last run was interrupted (state in the state dir). An
+  event batch that arrives first wakes as usual; the reconcile is stopped and
+  owed to the next arm. A reconcile that finishes first with output wakes `next`
+  at once: the output is printed after any events of the same ~200 ms window,
+  under a `RECONCILE (<command>)` line; with empty output `next` keeps waiting.
+  A failure or a run past `reconcile_timeout` (60 s) prints one stderr line, is
+  owed again, and `next` goes on waiting. Output beyond `reconcile_max_bytes`
+  (4096) is cut, ending with one line saying how much was cut.
+- **Order.** A batch keeps every line in file order, whatever the filter keeps.
+
+**Moving a box from a Monitor on its own log to `next`:** point `path` at the
+file the sources append to, list the kinds the Monitor's `grep -v` removed under
+`drop`, move any rewriting command into `filter`, and the command that followed
+the tail (`… & <reconcile>`) into `reconcile`. Drop the `monitor` block, so the
+watchdog watches the default waiter, and arm `gent-events next` as a background
+command.
+
+### `gent-events wire`: is a waiter armed?
+
+`gent-events wire` prints one line and sets the exit code. The watchdog asks it
+instead of looking at processes itself, and so can you:
+
+| Output | Exit | Meaning |
+|---|---|---|
+| `OK next pid=N` / `OK watch pid=N` | 0 | a waiter runs |
+| `OK idle (handling)` | 0 | none runs, but the rule below does not call it down yet: the agent is handling the last wake |
+| `DOWN <reason>` (e.g. `DOWN absent 312s, 2 waiting`) | 1 | re-arm it |
+| `DUPLICATE pids=N,M` | 2 | more than one waiter process runs |
+
+The rule is the one under "What the watchdog does" below and lives only in this
+command. `wire --live ERE` takes any process whose command line matches the
+pattern as the waiter (for a custom `monitor.watch`) and applies the same rule.
+
 **What the watchdog does** (default waiter: either command counts as alive; a
 custom `monitor.watch` keeps its own `live` pattern). Once `next` has run on a
 box (the cursor exists) the waiter is legitimately absent after every event,
 while the agent works, so absent alone is not "down". It pokes only if the
-waiter is absent **and** a real event has waited over 120 s
+waiter is absent **and** a real event (after `drop` and `filter`) has waited over 120 s
 (`GENT_WD_PENDING_AGE`), or it has been absent over 10 min
 (`GENT_WD_ABSENT_MAX`: the agent forgot to re-arm). Without a cursor (pure
 `watch` boxes) a gap over 6 s is down, as before. In both modes the poke waits

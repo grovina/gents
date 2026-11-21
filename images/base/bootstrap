@@ -560,6 +560,8 @@ fi
 #   .events {path,cron,tz}       → stream / cron-file paths (relative = repo-anchored)
 #                                  + cron TZ; defaults $GENT_STATE_DIR/{events.jsonl,
 #                                  cron.json}, UTC. `.events:true` = bus on, defaults.
+#                                  The object is also exported whole as GENT_EVENTS_CONFIG
+#                                  (JSON) for gent-events: drop, filter, reconcile, ...
 #   .monitor {watch,reconcile,live} → a box that watches its OWN raw stream (e.g.
 #                                  `tail -F events.log`); else Monitor defaults
 #                                  to `gent-events watch`. `.live` = liveness regex.
@@ -567,7 +569,7 @@ fi
 # the first event — no 30-minute cap, wakes the agent only for an event) or the
 # `gent-events watch` Monitor; the watchdog accepts both (see "The watchdog" below).
 TG_WATCH=""; TG_RECONCILE=""; MON_WATCH=""; MON_RECONCILE=""; MON_LIVE=""
-EV_PATH=""; CRON_PATH=""; SCHED_TZ=""
+EV_PATH=""; CRON_PATH=""; SCHED_TZ=""; EV_CONFIG=""
 if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   TG_WATCH="$(jq -r '.telegram.watch // empty' "$REPO/gent.json" 2>/dev/null || true)"
   TG_RECONCILE="$(jq -r '.telegram.reconcile // empty' "$REPO/gent.json" 2>/dev/null || true)"
@@ -580,6 +582,7 @@ if [ -f "$REPO/gent.json" ] && command -v jq >/dev/null 2>&1; then
   EV_PATH="$(jq -r '.events.path // empty' "$REPO/gent.json" 2>/dev/null || true)"
   CRON_PATH="$(jq -r '.events.cron // empty' "$REPO/gent.json" 2>/dev/null || true)"
   SCHED_TZ="$(jq -r '.events.tz // empty' "$REPO/gent.json" 2>/dev/null || true)"
+  EV_CONFIG="$(jq -c '.events | select(type == "object")' "$REPO/gent.json" 2>/dev/null || true)"
 fi
 EVENT_BUS=0
 { [ -n "$TG_WATCH" ] || [ -n "$MON_WATCH" ]; } && EVENT_BUS=1
@@ -594,7 +597,10 @@ if [ "$EVENT_BUS" = 1 ]; then
   [ -n "$EV_PATH" ] && export GENT_EVENTS_PATH="$(_abspath "$EV_PATH")"
   [ -n "$CRON_PATH" ] && export GENT_CRON_PATH="$(_abspath "$CRON_PATH")"
   [ -n "$SCHED_TZ" ] && export GENT_SCHEDULE_TZ="$SCHED_TZ"
-  { for _v in GENT_EVENTS_PATH GENT_CRON_PATH GENT_SCHEDULE_TZ; do
+  # The whole `.events` object, as JSON: gent-events reads drop/filter/reconcile from this one variable.
+  [ -n "$EV_CONFIG" ] && export GENT_EVENTS_CONFIG="$EV_CONFIG"
+  export GENT_REPO_DIR="$REPO"   # the directory `events.filter` / `events.reconcile` run from
+  { for _v in GENT_EVENTS_PATH GENT_CRON_PATH GENT_SCHEDULE_TZ GENT_EVENTS_CONFIG GENT_REPO_DIR; do
       eval "_val=\${$_v:-}"; [ -n "$_val" ] && printf 'export %s=%q\n' "$_v" "$_val"; done; } \
     | sudo tee /etc/profile.d/gents-events.sh >/dev/null 2>&1 || true
 
@@ -682,7 +688,7 @@ if [ "$EVENT_BUS" = 1 ]; then
       # NEVER wrap it in a shell whose argv holds the pattern.
       if pgrep -f "$MON_LIVE" >/dev/null 2>&1; then absent_since=0; unanswered=0; sleep 60; continue; fi
       [ "$absent_since" = 0 ] && absent_since="$(date +%s)"
-      if [ -f "$_wdir/events.cursor" ]; then
+      if [ -f "$(gent-events cursor-path 2>/dev/null)" ]; then
         if gent-events pending --older-than "$WD_PENDING_AGE" >/dev/null 2>&1; then
           POKE_WHY="events have waited over ${WD_PENDING_AGE}s unconsumed"
         elif [ $(( $(date +%s) - absent_since )) -ge "$WD_ABSENT_MAX" ]; then

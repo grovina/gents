@@ -14,6 +14,7 @@ Monitor is down (a gap is recovered by `tg pending` / `gent-schedule due` on re-
   gent-events watch                         tail + format the stream (the Monitor command)
   gent-events next                          block until new events exist, print them, exit
   gent-events pending [--older-than SECS]   exit 0 if unconsumed events wait (the watchdog's probe)
+  gent-events wire [--live ERE]             one line + exit code: is a waiter armed? (the watchdog's rule)
 
 `watch` is a NEWEST-WINS SINGLETON (pidfile, like the tg poller): arming a second
 one stands the older one down. Duplicate watchers are otherwise invisible — the
@@ -33,6 +34,21 @@ reconcile. First use starts at the END of the stream (history is not replayed); 
 stream shorter than the cursor (truncated / rotated) restarts at offset 0. `next`
 shares the watcher pidfile with `watch`, so newest-wins holds across both: two
 waiters never consume the same events. `watch` itself is unchanged.
+
+Per-box behaviour comes from ONE env var, GENT_EVENTS_CONFIG (the box's `events` object from
+gent.json, as JSON; unset or unparsable = defaults, plus one stderr line when unparsable):
+  drop              kinds that never wake (self_* is always dropped)
+  filter            command (argv list or shlex string, no shell): batch lines on stdin, passing
+                    lines on stdout, in order; may rewrite a line. Fails open (every line passes)
+                    when it cannot start, exits non-zero or exceeds filter_timeout (10 s).
+  reconcile         command run from the repo dir while `next` waits, when the previous exit is
+                    older than reconcile_after (600 s), it never ran, or it was interrupted.
+                    Non-empty output wakes with a RECONCILE block; empty keeps waiting; an event
+                    batch arriving first wakes as usual and the reconcile is owed on the next arm.
+                    Bounded by reconcile_timeout (60 s) and reconcile_max_bytes (4096).
+The cursor, the exit stamp and the reconcile state live in the state dir, named by the stream's
+path (the default stream keeps `events.cursor`); the stream itself is only ever READ, so sources
+may append JSON lines to it directly.
 """
 import sys
 import os
@@ -42,6 +58,8 @@ import signal
 import datetime
 import threading
 import subprocess
+import shlex
+import hashlib
 
 
 def state_dir():
@@ -61,6 +79,58 @@ def watch_pid_path():
     return os.path.join(d, "watch.pid")
 
 
+_CFG = None
+
+
+def config():
+    """The box's `events` object (GENT_EVENTS_CONFIG, JSON). Unset/unparsable -> {}."""
+    global _CFG
+    if _CFG is None:
+        _CFG = {}
+        raw = os.environ.get("GENT_EVENTS_CONFIG")
+        if raw:
+            try:
+                v = json.loads(raw)
+                if not isinstance(v, dict):
+                    raise ValueError("not an object")
+                _CFG = v
+            except Exception as e:
+                print("[gent-events] GENT_EVENTS_CONFIG is not a JSON object (%s) — using defaults" % e,
+                      file=sys.stderr, flush=True)
+    return _CFG
+
+
+def _num(key, default):
+    try:
+        return float(config().get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cmdline(v):
+    if isinstance(v, str):
+        return shlex.split(v)
+    if isinstance(v, list) and v:
+        return [str(x) for x in v]
+    return None
+
+
+def _repo_dir():
+    return os.environ.get("GENT_REPO_DIR") or os.getcwd()
+
+
+def _state_file(ext):
+    """Per-stream state (cursor, exit stamp, reconcile state) in the state dir. The default
+    stream keeps the plain `events.<ext>`; any other stream is keyed by its path, so two
+    streams never share a cursor."""
+    d = state_dir()
+    os.makedirs(d, exist_ok=True)
+    stream = os.path.realpath(events_path())
+    if stream == os.path.realpath(os.path.join(d, "events.jsonl")):
+        return os.path.join(d, "events." + ext)
+    return os.path.join(d, "events-%s.%s" % (hashlib.sha1(stream.encode()).hexdigest()[:12], ext))
+
+
 def cmd_emit(argv):
     if not argv:
         sys.exit("usage: gent-events emit <kind> [key=value ...]")
@@ -77,6 +147,8 @@ def cmd_emit(argv):
 
 def _fmt(ev):
     k = ev.get("kind")
+    if k is None:
+        return ev.get("line") or ev.get("text") or json.dumps(ev, ensure_ascii=False)
     if k == "reminder":
         rid = ev.get("id", "?")
         return "⏰ Reminder [%s]: %s  (run `gent-schedule done %s` once handled)" % (
@@ -169,40 +241,83 @@ def cmd_watch(_argv):
     finally:
         p.terminate()
         _release_watch()
+        _stamp_exit()
 
 
 def _cursor_path():
-    # Beside the stream (not in the state dir): the watchdog finds both from the stream's directory.
-    return os.path.join(os.path.dirname(events_path()), "events.cursor")
+    return _state_file("cursor")
 
 
 def _read_cursor():
+    path = _cursor_path()
     try:
-        with open(_cursor_path(), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return int(f.read().strip())
     except (OSError, ValueError):
-        return None
+        pass
+    # Layout from before the cursor moved into the state dir: a cursor beside a custom stream
+    # is taken over once.
+    old = os.path.join(os.path.dirname(os.path.abspath(events_path())), "events.cursor")
+    if os.path.abspath(old) != os.path.abspath(path) and os.path.exists(old):
+        try:
+            with open(old, encoding="utf-8") as f:
+                val = int(f.read().strip())
+            _write_cursor(val)
+            os.remove(old)
+            print("[gent-events] took over the cursor %s (offset %d) into %s" % (old, val, path),
+                  file=sys.stderr, flush=True)
+            return val
+        except (OSError, ValueError):
+            pass
+    return None
 
 
-def _write_cursor(off):
-    """Atomic replace: a crash mid-write must never leave a torn cursor."""
-    path = _cursor_path()
+def _atomic_write(path, text):
+    """Atomic replace: a crash mid-write must never leave a torn file."""
     tmp = "%s.%d" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(str(off))
+        f.write(text)
     os.replace(tmp, path)
 
 
-def _read_from(path, off):
-    """(events, new_offset, drops): the COMPLETE lines at/after `off`. A half-written
-    last line is left for the next pass (new_offset stops before it). Unparsable lines
-    fail OPEN — surfaced as a raw bullet, never silently dropped; self_* kinds are the
-    only intentional drop, and are reported in `drops` (the caller logs each to stderr)."""
-    with open(path, "rb") as f:
-        f.seek(off)
-        data = f.read()
+def _write_cursor(off):
+    _atomic_write(_cursor_path(), str(off))
+
+
+def _stamp_exit():
+    try:
+        _atomic_write(_state_file("exit"), str(time.time()))
+    except OSError:
+        pass
+
+
+def _last_exit():
+    for p in (_state_file("exit"), _cursor_path()):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            continue
+    return None
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _scan(path, off):
+    """(items, new_offset): COMPLETE lines at/after `off` as (raw_line, event_or_None). A
+    half-written last line is left for the next pass (new_offset stops before it). Read-only."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            data = f.read()
+    except OSError:
+        return [], off
     end = data.rfind(b"\n") + 1
-    evs, drops = [], []
+    items = []
     for raw in data[:end].splitlines():
         line = raw.decode("utf-8", "replace").strip()
         if not line:
@@ -212,18 +327,72 @@ def _read_from(path, off):
             if not isinstance(ev, dict):
                 raise ValueError("not an object")
         except Exception:
-            evs.append({"kind": "unparsable", "line": line})
-            continue
-        if str(ev.get("kind", "")).startswith("self_"):
+            ev = None
+        items.append((line, ev))
+    return items, off + end
+
+
+def _is_dropped(ev):
+    kind = str(ev.get("kind", ""))
+    if kind.startswith("self_"):
+        return True
+    d = config().get("drop")
+    return isinstance(d, list) and kind in [str(x) for x in d]
+
+
+def _run_filter(lines):
+    """Pass the batch through events.filter. Fail OPEN: any trouble -> every line passes."""
+    argv = _cmdline(config().get("filter")) if config().get("filter") else None
+    if not argv or not lines:
+        return lines
+    timeout = _num("filter_timeout", 10)
+    try:
+        r = subprocess.run(argv, input="\n".join(lines) + "\n", capture_output=True, text=True,
+                           timeout=timeout, cwd=_repo_dir())
+    except subprocess.TimeoutExpired:
+        print("[gent-events] filter timed out after %gs — every line passes" % timeout,
+              file=sys.stderr, flush=True)
+        return lines
+    except Exception as e:
+        print("[gent-events] filter could not run (%s) — every line passes" % e,
+              file=sys.stderr, flush=True)
+        return lines
+    if r.returncode != 0:
+        print("[gent-events] filter exited %d — every line passes" % r.returncode,
+              file=sys.stderr, flush=True)
+        return lines
+    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+
+
+def _collect(path, off, run_filter=True):
+    """(events, new_offset, drops): the ONE place drop + filter are applied, shared by `next`
+    and `pending` so the watchdog never pokes for an event `next` would not wake on. Unparsable
+    lines fail OPEN (a raw bullet); dropped kinds are returned in `drops` for stderr logging."""
+    items, new_off = _scan(path, off)
+    keep, drops = [], []
+    for line, ev in items:
+        if ev is not None and _is_dropped(ev):
             drops.append(ev.get("kind"))
-            continue
+        else:
+            keep.append(line)
+    if run_filter:
+        keep = _run_filter(keep)
+    evs = []
+    for line in keep:
+        try:
+            ev = json.loads(line)
+            if not isinstance(ev, dict):
+                raise ValueError
+        except Exception:
+            ev = {"kind": "unparsable", "line": line}
         evs.append(ev)
-    return evs, off + end, drops
+    return evs, new_off, drops
 
 
 def _start_offset(path):
-    """Where this run reads from, plus a note when the cursor could not be trusted."""
-    size = os.path.getsize(path)
+    """Where this run reads from, plus a note when the cursor could not be trusted. No cursor:
+    the END of the stream, never 0 (history is not replayed)."""
+    size = _size(path)
     cur = _read_cursor()
     if cur is None:
         return size, "no cursor yet — starting at the end of the stream (%d bytes)" % size
@@ -232,9 +401,114 @@ def _start_offset(path):
     return cur, None
 
 
+class _Reconcile:
+    """`events.reconcile`, run concurrently with the wait. Output is capped; the state file
+    says `running` / `owed` / `ok` so an interrupted or failed run is repeated on the next arm."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.limit = max(1, int(_num("reconcile_max_bytes", 4096)))
+        self.timeout = _num("reconcile_timeout", 60)
+        self.out = b""
+        self.cut = 0
+        self.rc = None
+        self.error = None
+        self.done = threading.Event()
+        self.started = time.time()
+        self.proc = None
+
+    @staticmethod
+    def due():
+        cfg = config()
+        if not cfg.get("reconcile") or not _cmdline(cfg.get("reconcile")):
+            return False
+        try:
+            with open(_state_file("reconcile"), encoding="utf-8") as f:
+                st = f.read().strip()
+        except OSError:
+            return True                  # never ran
+        if st != "ok":
+            return True                  # interrupted or owed
+        last = _last_exit()
+        return last is None or time.time() - last >= _num("reconcile_after", 600)
+
+    @staticmethod
+    def mark(state):
+        try:
+            _atomic_write(_state_file("reconcile"), state)
+        except OSError:
+            pass
+
+    def start(self):
+        self.mark("running")
+        try:
+            self.proc = subprocess.Popen(self.argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         stdin=subprocess.DEVNULL, cwd=_repo_dir(), start_new_session=True)
+        except Exception as e:
+            self.error = "could not start (%s)" % e
+            self.mark("owed")
+            self.done.set()
+            return
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                chunk = self.proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                room = self.limit - len(self.out)
+                if room > 0:
+                    self.out += chunk[:room]
+                self.cut += max(0, len(chunk) - max(room, 0))
+            self.rc = self.proc.wait()
+        except Exception as e:
+            self.error = str(e)
+        self.done.set()
+
+    def kill(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def check(self):
+        """Poll from the wait loop. Returns the text to print ('' = nothing) once finished,
+        None while still running."""
+        if not self.done.is_set():
+            if time.time() - self.started > self.timeout:
+                self.kill()
+                self.done.wait(2)
+                print("[gent-events] reconcile timed out after %gs — waiting on" % self.timeout,
+                      file=sys.stderr, flush=True)
+                self.mark("owed")
+                return ""
+            return None
+        if self.error or self.rc != 0:
+            print("[gent-events] reconcile failed (%s) — waiting on" % (
+                self.error or "exit %s" % self.rc), file=sys.stderr, flush=True)
+            self.mark("owed")
+            return ""
+        self.mark("ok")
+        text = self.out.decode("utf-8", "replace").strip()
+        if text and self.cut:
+            n = self.cut
+            size = "%d B" % n if n < 1024 else "%.1f KB" % (n / 1024)
+            text += "\n… %s more cut (reconcile_max_bytes %d)" % (size, self.limit)
+        return text
+
+    def abandon(self):
+        """An event batch woke first (or we are exiting): stop it, owe it to the next arm."""
+        if not self.done.is_set() or self.proc and self.proc.poll() is None:
+            self.kill()
+            self.mark("owed")
+
+
 def cmd_next(_argv):
     path = events_path()
-    open(path, "a").close()
+    if not os.path.exists(path):
+        open(path, "a").close()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     mypid = str(os.getpid())
     pidpath = watch_pid_path()
@@ -248,46 +522,93 @@ def cmd_next(_argv):
         except OSError:
             return False
 
+    rec = None
     try:
         off, note = _start_offset(path)
         if note:
             print("[gent-events] " + note, file=sys.stderr, flush=True)
             _write_cursor(off)
-        dropped = {}   # self_* kind -> count, summarised in one line when a real event wakes us
+        if _Reconcile.due():
+            rec = _Reconcile(_cmdline(config().get("reconcile")))
+            rec.start()
+        block = ""     # reconcile output that finished and wants to be printed
+        dropped = {}   # kind -> count, summarised in one line when a real event wakes us
         while True:
             if not mine():
                 # Superseded: leave the cursor alone, the newer waiter owns the events.
                 print("[gent-events] next superseded by a newer waiter — standing down", flush=True)
                 return
-            if os.path.getsize(path) < off:
+            if _size(path) < off:
                 off = 0
                 print("[gent-events] stream shrank below the cursor — restarting at offset 0",
                       file=sys.stderr, flush=True)
-            evs, new_off, drops = _read_from(path, off)
-            if evs:
+            if rec is not None and not block:
+                res = rec.check()
+                if res is not None:   # finished (output may be empty: keep waiting)
+                    block = res
+                    rec = None
+            evs, new_off, drops = _collect(path, off, run_filter=False)
+            if evs or block:
                 time.sleep(0.2)   # batch whatever else lands in the same burst
-                evs, new_off, drops = _read_from(path, off)
+                evs, new_off, drops = _collect(path, off)
                 if not mine():
                     continue      # superseded during the batch window: let the top handle it
                 for k in drops:
                     dropped[k] = dropped.get(k, 0) + 1
-                if dropped:   # ONE line per wake: the waiter's output IS the wake text, so a line per echo buries the event
-                    n = sum(dropped.values())
-                    print("[gent-events] dropped %d self event%s (%s)" % (
-                        n, "" if n == 1 else "s",
-                        ", ".join("%s x%d" % kv for kv in sorted(dropped.items()))), file=sys.stderr)
-                for ev in evs:
-                    print(_fmt(ev), flush=True)
-                _write_cursor(new_off)   # AFTER the print: a crash re-delivers, never loses
-                return
-            if new_off != off:           # only self_* / blank lines: consume, keep waiting
+                if evs or block:
+                    if rec is not None:
+                        rec.abandon()
+                        rec = None
+                    if dropped:   # ONE line per wake: the waiter's output IS the wake text
+                        n = sum(dropped.values())
+                        what = "self event" if all(str(k).startswith("self_") for k in dropped) else "event"
+                        print("[gent-events] dropped %d %s%s (%s)" % (
+                            n, what, "" if n == 1 else "s",
+                            ", ".join("%s x%d" % kv for kv in sorted(dropped.items()))), file=sys.stderr)
+                    for ev in evs:
+                        print(_fmt(ev), flush=True)
+                    if block:
+                        print("RECONCILE (%s)" % " ".join(_cmdline(config().get("reconcile"))), flush=True)
+                        print(block, flush=True)
+                    _write_cursor(new_off)   # AFTER the print: a crash re-delivers, never loses
+                    return
+                # everything dropped/filtered away: consume, keep waiting
+                off = new_off
+                _write_cursor(off)
+            elif new_off != off:         # only dropped / blank lines: consume, keep waiting
                 for k in drops:
                     dropped[k] = dropped.get(k, 0) + 1
                 off = new_off
                 _write_cursor(off)
-            time.sleep(0.5)
+            time.sleep(0.5 if rec is None else 0.1)
     finally:
+        if rec is not None:
+            rec.abandon()
         _release_watch()
+        _stamp_exit()
+
+
+def _pending_info():
+    """(count, oldest_age_seconds) of printable events waiting past the cursor, or None when
+    there is no cursor / nothing waits. Read-only; same drop + filter as `next`."""
+    path = events_path()
+    cur = _read_cursor()
+    if cur is None or not os.path.exists(path):
+        return None
+    evs, _off, _drops = _collect(path, 0 if cur > _size(path) else cur)
+    if not evs:
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(evs[0]["ts"])
+        age = (datetime.datetime.now(datetime.UTC) - ts).total_seconds()
+    except Exception:
+        # No usable ts (a source appended a bare line): the stream's last write bounds it
+        # from below, so the grace window is not skipped for an event that just landed.
+        try:
+            age = max(0.0, time.time() - os.path.getmtime(path))
+        except OSError:
+            age = 0.0
+    return len(evs), age
 
 
 def cmd_pending(argv):
@@ -298,24 +619,112 @@ def cmd_pending(argv):
         if len(argv) != 2 or argv[0] != "--older-than":
             sys.exit("usage: gent-events pending [--older-than SECS]")
         min_age = float(argv[1])
-    path = events_path()
-    cur = _read_cursor()
-    if cur is None or not os.path.exists(path):
-        sys.exit(1)
-    evs, _off, _drops = _read_from(path, 0 if cur > os.path.getsize(path) else cur)
-    if not evs:
-        sys.exit(1)
+    info = _pending_info()
+    sys.exit(0 if info and info[1] >= min_age else 1)
+
+
+def _same_state_dir(pid):
+    """True when process `pid` works on THIS state dir (its GENT_STATE_DIR, else its HOME's
+    default). Without /proc (not Linux) every candidate counts."""
+    if not os.path.isdir("/proc/self"):
+        return True
     try:
-        ts = datetime.datetime.fromisoformat(evs[0]["ts"])
-        age = (datetime.datetime.now(datetime.UTC) - ts).total_seconds()
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            env = dict(kv.split(b"=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
+    except OSError:
+        return False
+    theirs = env.get(b"GENT_STATE_DIR", b"").decode() or os.path.join(
+        env.get(b"HOME", b"").decode(), ".local", "state", "gent")
+    return os.path.realpath(theirs) == os.path.realpath(state_dir())
+
+
+def _waiters(live=None):
+    """[(pid, kind)] of running waiter processes. Default: `gent-events next|watch` (the
+    interpreter may precede the script). With `live` (an ERE): every process whose command
+    line matches, kind 'live'."""
+    import re
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True,
+                             timeout=10).stdout
     except Exception:
-        age = min_age   # no usable ts: treat as old enough rather than hide it
-    sys.exit(0 if age >= min_age else 1)
+        return []
+    me, found = os.getpid(), []
+    rx = re.compile(live) if live else None
+    for row in out.splitlines():
+        parts = row.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) == me:
+            continue
+        pid, args = int(parts[0]), parts[1]
+        if rx:
+            if rx.search(args):
+                found.append((pid, "live"))
+            continue
+        t = args.split()
+        if len(t) > 1 and os.path.basename(t[0]) != "gent-events" and os.path.basename(t[1]) == "gent-events":
+            t = t[1:]   # the interpreter of a #! script comes first
+        if len(t) >= 2 and os.path.basename(t[0]) == "gent-events" and t[1] in ("next", "watch"):
+            if _same_state_dir(pid):
+                found.append((pid, t[1]))
+    return found
+
+
+def cmd_wire(argv):
+    """THE liveness rule (the watchdog calls this; nothing else decides 'down'). One line, exit
+    code: OK next|watch pid=N / OK idle (handling) -> 0; DOWN <why> -> 1; DUPLICATE pids -> 2.
+    With a cursor (`next` has run) a waiter is legitimately absent while the agent handles a
+    wake: down only if absent AND a real event waited over GENT_WD_PENDING_AGE (120 s), or
+    absent over GENT_WD_ABSENT_MAX (600 s). Without a cursor, absent over 6 s is down."""
+    live = None
+    if argv:
+        if len(argv) != 2 or argv[0] != "--live":
+            sys.exit("usage: gent-events wire [--live ERE]")
+        live = argv[1]
+    pending_age = float(os.environ.get("GENT_WD_PENDING_AGE") or 120)
+    absent_max = float(os.environ.get("GENT_WD_ABSENT_MAX") or 600)
+
+    def verdict():
+        w = _waiters(live)
+        if live and w:
+            return 0, "OK live pid=%d" % w[0][0]
+        if len(w) > 1:
+            return 2, "DUPLICATE pids=%s" % ",".join(str(p) for p, _ in w)
+        if w:
+            return 0, "OK %s pid=%d" % (w[0][1], w[0][0])
+        return None
+
+    v = verdict()
+    if v:
+        print(v[1])
+        sys.exit(v[0])
+    last = _last_exit()
+    absent = int(time.time() - last) if last else None
+    if _read_cursor() is None:
+        for _ in range(3):               # no cursor: a blip check over ~6 s, then down
+            time.sleep(2)
+            v = verdict()
+            if v:
+                print(v[1])
+                sys.exit(v[0])
+        print("DOWN absent over 6s")
+        sys.exit(1)
+    info = _pending_info()
+    if info and info[1] >= pending_age:
+        print("DOWN absent %ss, %d waiting" % (absent if absent is not None else "?", info[0]))
+        sys.exit(1)
+    if absent is None or absent >= absent_max:
+        print("DOWN absent %s" % ("%ds" % absent if absent is not None else "(never seen)"))
+        sys.exit(1)
+    print("OK idle (handling)")
+    sys.exit(0)
+
+
+def cmd_cursor_path(_argv):
+    print(_cursor_path())
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("usage: gent-events <emit|watch|next|pending> ...")
+        sys.exit("usage: gent-events <emit|watch|next|pending|wire> ...")
     cmd, rest = sys.argv[1], sys.argv[2:]
     if cmd == "emit":
         return cmd_emit(rest)
@@ -325,7 +734,11 @@ def main():
         return cmd_next(rest)
     if cmd == "pending":
         return cmd_pending(rest)
-    sys.exit("gent-events: unknown subcommand %r (want emit|watch|next|pending)" % cmd)
+    if cmd == "wire":
+        return cmd_wire(rest)
+    if cmd == "cursor-path":
+        return cmd_cursor_path(rest)
+    sys.exit("gent-events: unknown subcommand %r (want emit|watch|next|pending|wire)" % cmd)
 
 
 if __name__ == "__main__":
