@@ -172,17 +172,6 @@ class NextTests(Env):
         self.assertEqual(r.stdout.strip().splitlines(), ["gap1", "gap2"])   # at once, in order
         self.assertEqual(self.cur(), os.path.getsize(self.stream))
 
-    def test_truncated_stream_restarts_at_zero(self):
-        for i in range(5):
-            self.emit("telegram", line="old%d" % i)
-        with open(self.cursor, "w") as f:
-            f.write(str(os.path.getsize(self.stream)))
-        open(self.stream, "w").close()                    # rotated / truncated
-        self.emit("telegram", line="fresh")               # smaller than the old cursor
-        r = self.run_cmd("next")
-        self.assertEqual(r.stdout.strip(), "fresh")
-        self.assertIn("shrank", r.stderr)
-
     def test_two_waiters_newest_wins(self):
         self.arm_at_end()
         old = self.spawn("next")
@@ -623,6 +612,172 @@ class WireTests(Cfg):
         r = subprocess.run([sys.executable, BIN, "wire", "--live", "sleep 31[.]7342"], env=self.env,
                            capture_output=True, text=True, timeout=20)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "OK live pid=%d" % p.pid))
+
+
+class ShrinkTests(Cfg):
+    def old_history(self, n=5):
+        for i in range(n):
+            self.emit("telegram", line="old%d" % i)
+        with open(self.cursor, "w") as f:
+            f.write(str(os.path.getsize(self.stream)))
+
+    def test_shrunk_stream_resumes_at_end_not_zero(self):
+        self.old_history()
+        with open(self.stream, "w") as f:               # truncated, then refilled with old-looking lines
+            f.write(json.dumps({"kind": "telegram", "line": "stale"}) + "\n")
+        p = self.spawn("next")
+        time.sleep(1.2)
+        self.assertIsNone(p.poll())                      # nothing old is delivered
+        self.emit("telegram", line="after")
+        out, err = p.communicate(timeout=10)
+        self.assertEqual(out.strip(), "after")
+        self.assertIn("shrank", err)
+        self.assertIn("resuming at the end", err)
+        self.assertIn("next reconcile covers the gap", err)
+
+    def test_shrink_while_waiting(self):
+        self.old_history()
+        p = self.spawn("next")
+        time.sleep(0.7)
+        open(self.stream, "w").close()
+        time.sleep(1.2)
+        self.assertIsNone(p.poll())
+        self.emit("telegram", line="after")
+        out, err = p.communicate(timeout=10)
+        self.assertEqual(out.strip(), "after")
+        self.assertIn("shrank", err)
+
+    def test_pending_after_shrink_is_nothing(self):
+        self.old_history()
+        with open(self.stream, "w") as f:
+            f.write(json.dumps({"kind": "telegram", "line": "stale"}) + "\n")
+        self.assertEqual(self.run_cmd("pending").returncode, 1)
+
+    def test_replaced_stream_resumes_at_end(self):
+        self.arm_at_end()
+        self.emit("telegram", line="old")
+        r = self.run_cmd("next")                         # consumes "old", records the inode
+        self.assertEqual(r.stdout.strip(), "old")
+        new = self.stream + ".new"                       # a bigger file swapped in under the name
+        with open(new, "w") as f:
+            for i in range(20):
+                f.write(json.dumps({"kind": "telegram", "line": "hist%d" % i}) + "\n")
+        os.replace(new, self.stream)
+        self.assertEqual(self.run_cmd("pending").returncode, 1)
+        p = self.spawn("next")
+        time.sleep(1.2)
+        self.assertIsNone(p.poll())
+        self.emit("telegram", line="fresh")
+        out, err = p.communicate(timeout=10)
+        self.assertEqual(out.strip(), "fresh")
+        self.assertIn("replaced", err)
+
+    def test_shrink_owes_the_reconcile(self):
+        self.cfg(reconcile=sh("echo gap-check"), reconcile_after=100000)
+        self.old_history()
+        with open(self.state("events.reconcile"), "w") as f:
+            f.write("ok")
+        with open(self.state("events.exit"), "w") as f:
+            f.write(str(time.time()))
+        open(self.stream, "w").close()
+        r = self.run_cmd("next")
+        self.assertIn("gap-check", r.stdout)
+
+
+class FormatTests(Cfg):
+    LINE = {"kind": "reminder", "id": "r1", "note": "n", "ts": "2026-01-01T00:00:00+00:00",
+            "meta": {"a": [1, 2, {"b": "ü"}]}}
+
+    def test_raw_prints_the_line_byte_identical(self):
+        self.cfg(format="raw")
+        self.arm_at_end()
+        text = json.dumps(self.LINE, ensure_ascii=False)
+        self.raw(text + "\n")
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout, text + "\n")
+
+    def test_raw_prints_filter_output_as_returned(self):
+        self.cfg(format="raw", filter=sh("cat"))
+        self.arm_at_end()
+        text = json.dumps(self.LINE, ensure_ascii=False)
+        self.raw(text + "\n")
+        self.assertEqual(self.run_cmd("next").stdout, text + "\n")
+
+    def test_default_format_is_formatted(self):
+        self.arm_at_end()
+        self.raw(json.dumps(self.LINE) + "\n")
+        out = self.run_cmd("next").stdout
+        self.assertIn("Reminder [r1]", out)
+        self.assertNotIn("meta", out)
+
+    def test_raw_keeps_reconcile_block_and_drop_lines(self):
+        self.cfg(format="raw", reconcile=sh("echo rec"), drop=["noise"])
+        open(self.stream, "a").close()
+        with open(self.cursor, "w") as f:
+            f.write(str(os.path.getsize(self.stream)))
+        self.emit("noise", x="1")
+        r = self.run_cmd("next")
+        self.assertIn("RECONCILE (", r.stdout)
+        self.assertIn("rec", r.stdout)
+        self.assertIn("dropped 1 event (noise x1)", r.stderr)
+
+
+class BatchCapTests(Cfg):
+    def test_cap_delivers_n_then_more_waiting_and_rest_next_arm(self):
+        self.cfg(batch_max_lines=3)
+        self.arm_at_end()
+        for i in range(10):
+            self.emit("telegram", line="n%d" % i)
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip().splitlines(), ["n0", "n1", "n2", "… 7 more waiting"])
+        with open(self.stream, "rb") as f:
+            lines = f.read().splitlines(keepends=True)
+        self.assertEqual(self.cur(), sum(len(l) for l in lines[:3]))
+        self.assertEqual(self.run_cmd("pending").returncode, 0)    # pending is unaffected
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip().splitlines(), ["n3", "n4", "n5", "… 4 more waiting"])
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip().splitlines(), ["n6", "n7", "n8", "… 1 more waiting"])
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip(), "n9")
+
+    def test_cap_does_not_skip_drops_after_the_cut(self):
+        self.cfg(batch_max_lines=1, drop=["noise"])
+        self.arm_at_end()
+        self.emit("noise", x="1")
+        self.emit("telegram", line="a")
+        self.emit("noise", x="2")
+        self.emit("telegram", line="b")
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip().splitlines(), ["a", "… 1 more waiting"])
+        self.assertIn("dropped 1 event (noise x1)", r.stderr)      # only the drop before the cut
+        self.assertEqual(self.run_cmd("next").stdout.strip(), "b")
+
+    def test_cap_bounds_the_lines_fed_to_the_filter(self):
+        self.cfg(batch_max_lines=3, filter=sh("grep -v skip || true"))
+        self.arm_at_end()
+        for l in ["a", "skip1", "b", "skip2", "c", "d"]:
+            self.emit("telegram", line=l)
+        r = self.run_cmd("next")           # takes a, skip1, b; the filter drops one: fewer than the cap
+        self.assertEqual(r.stdout.strip().splitlines(), ["a", "b", "… 3 more waiting"])
+        r = self.run_cmd("next")
+        self.assertEqual(r.stdout.strip().splitlines(), ["c", "d"])
+
+    def test_batch_the_filter_empties_keeps_waiting_then_delivers_the_rest(self):
+        self.cfg(batch_max_lines=2, filter=sh("grep -v skip || true"))
+        self.arm_at_end()
+        p = self.spawn("next")
+        time.sleep(0.5)
+        for l in ["skip1", "skip2", "z"]:
+            self.emit("telegram", line=l)
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(out.strip(), "z")
+
+    def test_no_cap_by_default(self):
+        self.arm_at_end()
+        for i in range(30):
+            self.emit("telegram", line="x%d" % i)
+        self.assertEqual(len(self.run_cmd("next").stdout.splitlines()), 30)
 
 
 if __name__ == "__main__":

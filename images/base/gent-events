@@ -282,6 +282,9 @@ def _atomic_write(path, text):
 
 def _write_cursor(off):
     _atomic_write(_cursor_path(), str(off))
+    ino = _inode(events_path())
+    if ino is not None:
+        _atomic_write(_inode_file(), str(ino))
 
 
 def _stamp_exit():
@@ -308,8 +311,8 @@ def _size(path):
 
 
 def _scan(path, off):
-    """(items, new_offset): COMPLETE lines at/after `off` as (raw_line, event_or_None). A
-    half-written last line is left for the next pass (new_offset stops before it). Read-only."""
+    """(items, new_offset): COMPLETE lines at/after `off` as (raw_line, event_or_None, end_offset).
+    A half-written last line is left for the next pass (new_offset stops before it). Read-only."""
     try:
         with open(path, "rb") as f:
             f.seek(off)
@@ -317,8 +320,9 @@ def _scan(path, off):
     except OSError:
         return [], off
     end = data.rfind(b"\n") + 1
-    items = []
-    for raw in data[:end].splitlines():
+    items, pos = [], off
+    for raw in data[:end].splitlines(keepends=True):
+        pos += len(raw)
         line = raw.decode("utf-8", "replace").strip()
         if not line:
             continue
@@ -328,7 +332,7 @@ def _scan(path, off):
                 raise ValueError("not an object")
         except Exception:
             ev = None
-        items.append((line, ev))
+        items.append((line, ev, pos))
     return items, off + end
 
 
@@ -340,7 +344,12 @@ def _is_dropped(ev):
     return isinstance(d, list) and kind in [str(x) for x in d]
 
 
-def _run_filter(lines):
+def _say(*a, **kw):
+    if not kw.pop("quiet_", False):
+        print(*a, **kw)
+
+
+def _run_filter(lines, quiet=False):
     """Pass the batch through events.filter. Fail OPEN: any trouble -> every line passes."""
     argv = _cmdline(config().get("filter")) if config().get("filter") else None
     if not argv or not lines:
@@ -350,55 +359,119 @@ def _run_filter(lines):
         r = subprocess.run(argv, input="\n".join(lines) + "\n", capture_output=True, text=True,
                            timeout=timeout, cwd=_repo_dir())
     except subprocess.TimeoutExpired:
-        print("[gent-events] filter timed out after %gs — every line passes" % timeout,
-              file=sys.stderr, flush=True)
+        _say("[gent-events] filter timed out after %gs — every line passes" % timeout,
+              file=sys.stderr, flush=True, quiet_=quiet)
         return lines
     except Exception as e:
-        print("[gent-events] filter could not run (%s) — every line passes" % e,
-              file=sys.stderr, flush=True)
+        _say("[gent-events] filter could not run (%s) — every line passes" % e,
+              file=sys.stderr, flush=True, quiet_=quiet)
         return lines
     if r.returncode != 0:
-        print("[gent-events] filter exited %d — every line passes" % r.returncode,
-              file=sys.stderr, flush=True)
+        _say("[gent-events] filter exited %d — every line passes" % r.returncode,
+              file=sys.stderr, flush=True, quiet_=quiet)
         return lines
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
-def _collect(path, off, run_filter=True):
-    """(events, new_offset, drops): the ONE place drop + filter are applied, shared by `next`
-    and `pending` so the watchdog never pokes for an event `next` would not wake on. Unparsable
-    lines fail OPEN (a raw bullet); dropped kinds are returned in `drops` for stderr logging."""
+class _Ev(dict):
+    """An event plus the exact line it came from (what `format: raw` prints)."""
+    raw = ""
+
+
+def _batch_cap():
+    try:
+        n = int(config().get("batch_max_lines"))
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
+
+
+def _to_ev(line):
+    try:
+        ev = json.loads(line)
+        if not isinstance(ev, dict):
+            raise ValueError
+    except Exception:
+        ev = {"kind": "unparsable", "line": line}
+    e = _Ev(ev)
+    e.raw = line
+    return e
+
+
+def _collect(path, off, run_filter=True, cap=None):
+    """(events, new_offset, drops, more): the ONE place drop + filter are applied, shared by
+    `next` and `pending` so the watchdog never pokes for an event `next` would not wake on.
+    Unparsable lines fail OPEN (a raw bullet); dropped kinds are returned in `drops` for stderr
+    logging. With `cap`, at most that many lines that survive `drop` are taken and filtered (one
+    filter run); new_offset then stops right after the last of them (drops before it count as
+    delivered, nothing after it is skipped) and `more` is the number of surviving lines left,
+    counted before the filter."""
     items, new_off = _scan(path, off)
-    keep, drops = [], []
-    for line, ev in items:
+    keep, ends, drops = [], [], []
+    for line, ev, end in items:
         if ev is not None and _is_dropped(ev):
-            drops.append(ev.get("kind"))
+            drops.append((ev.get("kind"), end))
         else:
             keep.append(line)
-    if run_filter:
-        keep = _run_filter(keep)
-    evs = []
-    for line in keep:
-        try:
-            ev = json.loads(line)
-            if not isinstance(ev, dict):
-                raise ValueError
-        except Exception:
-            ev = {"kind": "unparsable", "line": line}
-        evs.append(ev)
-    return evs, new_off, drops
+            ends.append(end)
+    more = 0
+    if cap and len(keep) > cap:
+        more = len(keep) - cap
+        keep = keep[:cap]
+        new_off = ends[cap - 1]
+        drops = [d for d in drops if d[1] <= new_off]
+    passing = _run_filter(keep) if run_filter else keep
+    return [_to_ev(l) for l in passing], new_off, [k for k, _ in drops], more
+
+
+def _inode(path):
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def _inode_file():
+    return _state_file("inode")
+
+
+def _known_inode():
+    try:
+        with open(_inode_file(), encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _gap(path, cur):
+    """None when the stream still is the one the cursor refers to, else why not: it shrank below
+    the cursor, or it is another file (inode changed). The caller resumes at the END, never at 0."""
+    size = _size(path)
+    if cur > size:
+        return "stream shrank below the cursor (%d > %d)" % (cur, size)
+    known = _known_inode()
+    if known is not None and _inode(path) not in (None, known):
+        return "stream was replaced (inode changed)"
+    return None
 
 
 def _start_offset(path):
-    """Where this run reads from, plus a note when the cursor could not be trusted. No cursor:
-    the END of the stream, never 0 (history is not replayed)."""
+    """Where this run reads from, plus a note when the cursor could not be trusted. No cursor, a
+    shrunk or replaced stream: the END of the stream, never 0 (history is not replayed)."""
     size = _size(path)
     cur = _read_cursor()
     if cur is None:
         return size, "no cursor yet — starting at the end of the stream (%d bytes)" % size
-    if cur > size:
-        return 0, "stream shrank below the cursor (%d > %d) — restarting at offset 0" % (cur, size)
+    why = _gap(path, cur)
+    if why:
+        _owe_reconcile()
+        return size, "%s — resuming at the end; the next reconcile covers the gap" % why
     return cur, None
+
+
+def _owe_reconcile():
+    if config().get("reconcile") and _cmdline(config().get("reconcile")):
+        _Reconcile.mark("owed")
 
 
 class _Reconcile:
@@ -538,19 +611,22 @@ def cmd_next(_argv):
                 # Superseded: leave the cursor alone, the newer waiter owns the events.
                 print("[gent-events] next superseded by a newer waiter — standing down", flush=True)
                 return
-            if _size(path) < off:
-                off = 0
-                print("[gent-events] stream shrank below the cursor — restarting at offset 0",
+            why = _gap(path, off)
+            if why:
+                off = _size(path)
+                print("[gent-events] %s — resuming at the end; the next reconcile covers the gap" % why,
                       file=sys.stderr, flush=True)
+                _owe_reconcile()
+                _write_cursor(off)
             if rec is not None and not block:
                 res = rec.check()
                 if res is not None:   # finished (output may be empty: keep waiting)
                     block = res
                     rec = None
-            evs, new_off, drops = _collect(path, off, run_filter=False)
+            evs, new_off, drops, _m = _collect(path, off, run_filter=False)
             if evs or block:
                 time.sleep(0.2)   # batch whatever else lands in the same burst
-                evs, new_off, drops = _collect(path, off)
+                evs, new_off, drops, more = _collect(path, off, cap=_batch_cap())
                 if not mine():
                     continue      # superseded during the batch window: let the top handle it
                 for k in drops:
@@ -565,8 +641,11 @@ def cmd_next(_argv):
                         print("[gent-events] dropped %d %s%s (%s)" % (
                             n, what, "" if n == 1 else "s",
                             ", ".join("%s x%d" % kv for kv in sorted(dropped.items()))), file=sys.stderr)
+                    raw = config().get("format") == "raw"
                     for ev in evs:
-                        print(_fmt(ev), flush=True)
+                        print(ev.raw if raw else _fmt(ev), flush=True)
+                    if more:
+                        print("… %d more waiting" % more, flush=True)
                     if block:
                         print("RECONCILE (%s)" % " ".join(_cmdline(config().get("reconcile"))), flush=True)
                         print(block, flush=True)
@@ -595,7 +674,9 @@ def _pending_info():
     cur = _read_cursor()
     if cur is None or not os.path.exists(path):
         return None
-    evs, _off, _drops = _collect(path, 0 if cur > _size(path) else cur)
+    if _gap(path, cur):
+        return None          # shrunk or replaced: `next` resumes at the end, nothing is pending
+    evs, _off, _drops, _more = _collect(path, cur)
     if not evs:
         return None
     try:

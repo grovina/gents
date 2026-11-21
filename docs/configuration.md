@@ -401,8 +401,11 @@ gent-events next        # run_in_background; the wake is its exit; re-run after 
   only after the batch is printed. An event that arrives while the agent is
   handling the previous one is the first thing the next `next` returns, at once:
   there is no gap to reconcile with `tg pending`. First use (no cursor) starts at the
-  **end** of the stream, never at 0 (said on stderr: history is not replayed); a stream shorter than the
-  cursor (truncated) restarts at offset 0, also said.
+  **end** of the stream, never at 0 (said on stderr: history is not replayed). The
+  same holds when the stream shrinks below the cursor or is replaced by another
+  file (its inode changed): `next` resumes at the current **end**, says so on
+  stderr, and marks the `reconcile` (if any) owed so it covers the gap. `pending`
+  reports nothing for such a stream.
 - **One waiter.** `next` takes the same pidfile as `watch` (newest wins), so two
   waiters never consume the same events; the older one prints that it stood
   down and exits without touching the cursor.
@@ -429,7 +432,9 @@ the defaults above.
   "reconcile_after": 600,
   "reconcile_timeout": 60,
   "reconcile_max_bytes": 4096,
-  "filter_timeout": 10
+  "filter_timeout": 10,
+  "format": "raw",
+  "batch_max_lines": 50
 }
 ```
 
@@ -454,6 +459,16 @@ the defaults above.
   A failure or a run past `reconcile_timeout` (60 s) prints one stderr line, is
   owed again, and `next` goes on waiting. Output beyond `reconcile_max_bytes`
   (4096) is cut, ending with one line saying how much was cut.
+- **`format`** — `"raw"` prints each passing line exactly as the filter returned
+  it (as read, without a filter), one per line, for every kind including
+  reminders. The default formats known kinds for reading. The `RECONCILE` block
+  and the stderr lines are the same in both.
+- **`batch_max_lines`** — at most N passing lines per wake (default: no cap). A
+  longer batch ends with `… K more waiting`; the cursor moves only past what was
+  delivered (drops before the cut count as delivered, nothing after it is
+  skipped), so the next `next` returns the rest at once; the cap applies to the lines
+  fed to the filter (one run per batch), so a filtering batch can print fewer than N
+  lines and `K` counts lines before the filter. `pending` is unaffected.
 - **Order.** A batch keeps every line in file order, whatever the filter keeps.
 
 **Moving a box from a Monitor on its own log to `next`:** point `path` at the
