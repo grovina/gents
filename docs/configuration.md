@@ -810,6 +810,9 @@ in its repo with `name: <box>`; the **host** applies it. The repo holds no host 
   service's `env_file`, so create an empty placeholder for one not yet configured.
 - A bind-mounted Postgres data dir must exist empty, owned by 999:999, mode 0700, before the first
   start: the image entrypoint chowns only PGDATA, not the mount root.
+- `repos.<box>.backup.data` (`["files"]`) lists folders of `state_root/data/<box>/` that hold plain files, never a live
+  database (content-addressed bytes, say). Each rides that box's own repository as `/src/data/<folder>`; the rest of
+  `data/` stays out of the host target, because a database copied raw while running is a torn snapshot.
 - `repos.<box>.backup.pg` (`[{"container": "axt-db", "database": "axt"}]`) makes the hourly fleet
   restic run take a consistent `pg_dump -Fc` through the server (`docker exec -u postgres`) into
   `state_root/backup-staging/<box>/pg/` and back that up as `/src/pg`. A failed or empty dump fails

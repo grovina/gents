@@ -2220,6 +2220,12 @@ def backup_targets(fleet, only=None):
         app = fleet["state_root"] / "app" / name
         if app.is_dir():
             src["/src/state"] = str(app)
+        # `backup.data`: folders of state_root/data/<box>/ that are plain files, never a live database (content-addressed bytes,
+        # say), so a raw copy is a good one. They ride this box's own repository, beside its checkout.
+        for rel in b.get("data", []):
+            d = fleet["state_root"] / "data" / name / rel
+            if d.is_dir():
+                src[f"/src/data/{rel.strip('/')}"] = str(d)
         ex = ([f"/src/repo/{e}" for e in BACKUP_REPO_EXCLUDES]
               + [f"/src/home/{e}" for e in BACKUP_HOME_EXCLUDES]
               + [f"/src/repo/{e.strip('/')}" for e in b.get("exclude", [])])
