@@ -2771,7 +2771,8 @@ def cmd_fleet_housekeeping(fleet, a):
                            "msg": f"stack {sname}: could not read its compose services "
                                   f"({(want.stderr or 'none declared').strip()[-120:]})"})
             continue
-        ps = docker("ps", "-a", "--filter", f"label=com.docker.compose.project={sname}",
+        # The compose project is named by the compose file's `name:`; it is the repo's name unless stack.project says otherwise (homer-next).
+        ps = docker("ps", "-a", "--filter", f"label=com.docker.compose.project={stk.get('project') or sname}",
                     "--format", "{{.Label \"com.docker.compose.service\"}}\t{{.State}}\t{{.Status}}", capture=True)
         seen = {}
         for line in (ps or "").splitlines():
