@@ -757,7 +757,8 @@ def stack_env(fleet, name, cfg):
     supplies them here, so the same compose file runs on any machine.
       GENT_DATA / <BOX>_DATA        state_root/data/<box>          (bind-mounted service data)
       GENT_SECRETS / <BOX>_SECRETS  secrets_root/stack/<box>       (env files, 0600, never in a repo)
-      fleet.json repos.<box>.stack.env {NAME: path under secrets_root}  e.g. a service-account key"""
+      fleet.json repos.<box>.stack.env {NAME: path under secrets_root}  e.g. a service-account key
+      fleet.json repos.<box>.stack.vars {NAME: value}                    a plain value, e.g. a host folder the stack mounts"""
     data = fleet["state_root"] / "data" / name
     sec = fleet["secrets_root"] / "stack" / name
     up = re.sub(r"[^A-Z0-9]", "_", name.upper())
@@ -766,6 +767,8 @@ def stack_env(fleet, name, cfg):
                 f"{up}_DATA": str(data), f"{up}_SECRETS": str(sec)})
     for k, rel in ((cfg.get("stack") or {}).get("env") or {}).items():
         env[k] = str(fleet["secrets_root"] / rel)
+    for k, v in ((cfg.get("stack") or {}).get("vars") or {}).items():
+        env[k] = str(v)
     return env
 
 
