@@ -1860,7 +1860,7 @@ def _ha_sweep_inflight(root, spool, verbose):
                 alive = True
             except OSError:
                 alive = False
-        if alive and age < HOST_ACTION_TIMEOUT_S + 60:
+        if alive and age < (mark.get("timeout") or HOST_ACTION_TIMEOUT_S) + 60:
             continue                                   # genuinely still running
         m.unlink(missing_ok=True)
         if verbose:
@@ -2047,12 +2047,18 @@ def _ha_handle(fleet, name, spool, st, cfg, specs, f, verbose):
                           detail=f"fleet.json's '{act}' has no valid argv list")
 
     started = _ha_stamp()
+    # `timeout_s` per action: a deploy that builds and migrates outlives the default five minutes.
+    timeout_s = spec.get("timeout_s", HOST_ACTION_TIMEOUT_S)
+    if not isinstance(timeout_s, int) or isinstance(timeout_s, bool) or not 1 <= timeout_s <= 3600:
+        f.unlink(missing_ok=True)
+        return _ha_answer(spool, rid, req, state="refused",
+                          detail=f"fleet.json's '{act}' has an invalid timeout_s (an integer of 1..3600)")
     # The request stops being a request and becomes an IN-FLIGHT record in one step: the
     # marker is written BEFORE the unlink, so no instant exists in which the ask is in
     # neither place. See `_ha_inflight` for the kill this closes.
     mark = _ha_inflight(host_actions_root(fleet, name)) / f"{rid}.json"
     mark.write_text(json.dumps({"rid": rid, "action": act, "req": req, "pid": os.getpid(),
-                                "at": time.time(), "started": started}))
+                                "at": time.time(), "started": started, "timeout": timeout_s}))
     f.unlink(missing_ok=True)
     if verbose:
         print(f"gent: {name}/{act} → {' '.join(shlex.quote(x) for x in argv)}"
@@ -2069,13 +2075,13 @@ def _ha_handle(fleet, name, spool, st, cfg, specs, f, verbose):
         # compose file. shell=False always: argv comes from fleet.json, but the habit is
         # the protection.
         r = subprocess.run(argv, cwd=str(cfg["abs_path"]), capture_output=True,
-                           text=True, timeout=HOST_ACTION_TIMEOUT_S)
+                           text=True, timeout=timeout_s)
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         return _ha_answer(spool, rid, req, state="done" if r.returncode == 0 else "failed",
                           rc=r.returncode, started=started, output=out[-4000:])
     except subprocess.TimeoutExpired:
         return _ha_answer(spool, rid, req, state="failed", rc=None, started=started,
-                          detail=f"timed out after {HOST_ACTION_TIMEOUT_S}s")
+                          detail=f"timed out after {timeout_s}s")
     except OSError as e:
         return _ha_answer(spool, rid, req, state="failed", rc=None, started=started,
                           detail=str(e))

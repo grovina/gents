@@ -149,6 +149,10 @@ and used to lose the ask entirely. The next drain now answers it instead, honest
   watching a staleness signal would otherwise restart in a loop forever, because
   the signal does not always clear (a lazily-imported module reads as stale until
   something imports it). The clock starts on *attempt*, not on success.
+- `timeout_s` — how long the command may run before it is cut off (an integer, 1..3600;
+  default 300). A deploy that builds an image and migrates a database outlives five minutes.
+  The runner is one pass at a time, so a long action holds back the other boxes' requests
+  until it ends.
 - `group` + `group_cooldown_s` — actions naming the same group are never run close
   together. Two BLE sidecars sharing one radio, restarted in one command, cost
   fifteen minutes of `starting`: the second one's scanner blocked past its radio
