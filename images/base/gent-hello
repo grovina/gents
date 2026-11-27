@@ -15,6 +15,12 @@
 # hello or note lands whole instead of each newline submitting a fragment.
 set -u
 
+# -h/--help prints this header and touches nothing; without it, "--help" would be
+# taken as the note and pasted into the pane as a prompt.
+case "${1:-}" in
+  -h|--help) sed -n '2,/^set -u$/{/^set -u$/d;s/^# \{0,1\}//;p;}' "$0"; exit 0 ;;
+esac
+
 REPO="${GENT_REPO_DIR:-$(pwd)}"
 # Same session parameter as gent-clear — a host-session clear must greet the host
 # session, not a box's. Unset -> `gent`, so boxes are unchanged.
