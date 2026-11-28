@@ -2720,6 +2720,34 @@ def _hk_top_dirs(fleet, n=6):
             + ("\nDocker — " + dsys.replace("\n", "; ") if dsys else ""))
 
 
+def _hk_trim_shared_cache(fleet, hk):
+    """Weekly: expire the shared package caches every box mounts at /cache (npm, pip, uv).
+    Nothing else ever trims them; they are regenerable, so the cost of a miss is a download.
+    Quiet unless it freed something worth saying."""
+    root = Path(fleet["state_root"]) / "secrets" / "cache"
+    stamp = Path(fleet["state_root"]) / "cache-trim.stamp"
+    if not root.is_dir():
+        return []
+    try:
+        if time.time() - stamp.stat().st_mtime < hk.CACHE_TRIM_EVERY_S:
+            return []
+    except OSError:
+        pass
+    stamp.touch()            # first, so a slow run is never started again by the next tick
+    freed = 0
+    for sub in ("npm", "pip"):
+        if (root / sub).is_dir():
+            freed += hk.trim_stale(str(root / sub), hk.CACHE_MAX_AGE_S, time.time())[1]
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    if (root / "uv").is_dir() and os.access(uv, os.X_OK):
+        try:     # detached: on a big cache this takes minutes, and the timer must not wait for it
+            subprocess.Popen([uv, "cache", "prune"], env={**os.environ, "UV_CACHE_DIR": str(root / "uv")},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+    return [f"trimmed shared package caches, freed {hk.gb(freed)} (npm/pip) + uv prune"] if freed else []
+
+
 def cmd_fleet_housekeeping(fleet, a):
     hk = _hk_mod()
     cfg = fleet.get("housekeeping") or {}
@@ -2737,6 +2765,8 @@ def cmd_fleet_housekeeping(fleet, a):
             notes.append(f"pruned build cache >7d old, reclaimed {m.group(1)}")
             pct, free, total = hk.disk_usage(fleet["state_root"])
             lvl = hk.level_for(pct, hw, hh)
+    if not a.dry_run:
+        notes.extend(_hk_trim_shared_cache(fleet, hk))
     msg = f"host disk {pct:.0f}% used — {hk.gb(free)} free of {hk.gb(total)} (warn {hw}%, hard {hh}%)"
     checks.append({"key": "host:disk", "level": lvl, "msg": msg + ("; " + "; ".join(notes) if notes else ""),
                    "detail": (lambda: _hk_top_dirs(fleet)) if lvl != hk.OK else None})

@@ -101,3 +101,35 @@ def send_telegram(alert_env, text):
         return None
     except Exception as e:                                   # noqa: BLE001 — see docstring
         return f"{type(e).__name__}: {e}"
+
+
+CACHE_TRIM_EVERY_S = 7 * 86400
+CACHE_MAX_AGE_S = 30 * 86400
+
+
+def trim_stale(root, max_age_s, now):
+    """Delete files under `root` not read for `max_age_s`, then empty directories.
+
+    For the shared package caches (npm, pip), which nothing else ever expires: a file
+    left unread for a month is a package no box has asked for in that time, and a cache
+    miss only costs a re-download. Reads atime, falling back to mtime when atime is
+    older (a mount with noatime). Returns (files_removed, bytes_freed)."""
+    n = freed = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            try:
+                st = os.lstat(fp)
+                if now - max(st.st_atime, st.st_mtime) > max_age_s:
+                    os.unlink(fp)
+                    n += 1
+                    freed += st.st_size
+            except OSError:
+                continue
+    for dirpath, _dirs, _files in os.walk(root, topdown=False):
+        if dirpath != root:
+            try:
+                os.rmdir(dirpath)       # only succeeds when empty
+            except OSError:
+                pass
+    return n, freed

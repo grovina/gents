@@ -2,6 +2,7 @@
 """Tests for scripts/housekeeping.py. Run: python3 tests/test_housekeeping.py"""
 import importlib.util
 import os
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -92,6 +93,32 @@ class Reconcile(unittest.TestCase):
         self.assertIn("Largest: x", alerts[0])
         hk.reconcile(st, [chk("a", hk.WARN, "w", detail=detail)], now=2)      # unchanged → not computed
         self.assertEqual(len(calls), 1)
+
+
+class TrimStale(unittest.TestCase):
+    def test_removes_only_files_unread_past_the_age(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "old", "deep"))
+            os.makedirs(os.path.join(root, "new"))
+            old, new = os.path.join(root, "old", "deep", "a"), os.path.join(root, "new", "b")
+            for fp, size in ((old, 10), (new, 5)):
+                open(fp, "wb").write(b"x" * size)
+            os.utime(old, (1000, 1000))
+            os.utime(new, (9000, 9000))
+            n, freed = hk.trim_stale(root, 5000, now=10000)
+            self.assertEqual((n, freed), (1, 10))
+            self.assertFalse(os.path.exists(old))
+            self.assertFalse(os.path.exists(os.path.join(root, "old")))   # emptied dirs go too
+            self.assertTrue(os.path.exists(new))
+            self.assertTrue(os.path.isdir(root))
+
+    def test_a_recent_read_or_write_keeps_the_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            fp = os.path.join(root, "f")
+            open(fp, "w").write("x")
+            os.utime(fp, (1000, 9500))          # read long ago, written recently
+            self.assertEqual(hk.trim_stale(root, 5000, now=10000), (0, 0))
+            self.assertTrue(os.path.exists(fp))
 
 
 if __name__ == "__main__":

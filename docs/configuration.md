@@ -226,6 +226,10 @@ Two things worth knowing:
   not on a mount. Docker cannot cap that without xfs+pquota, so `hard` is a louder alert, not a
   limit. The one automatic action is the safe one: once the host crosses its warn level, build
   cache older than a week is pruned (regenerable; volumes and images are never touched).
+- **The shared package caches are trimmed weekly.** Every box mounts one npm/pip/uv cache at
+  `/cache` (`$state_root/secrets/cache`, regenerable, skipped by the backup sync). Nothing
+  else expires it, and it reached 40 GB. Housekeeping deletes npm/pip files unread for 30 days
+  and runs `uv cache prune`; a miss only costs a download. Stamp: `$state_root/cache-trim.stamp`.
 
 ## Backups — the host backs up every box, boxes do nothing
 
