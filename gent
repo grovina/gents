@@ -2748,6 +2748,76 @@ def _hk_trim_shared_cache(fleet, hk):
     return [f"trimmed shared package caches, freed {hk.gb(freed)} (npm/pip) + uv prune"] if freed else []
 
 
+# ---- agent worktrees ------------------------------------------------------------------
+# Claude Code's subagents each get a git worktree under <repo>/.claude/worktrees, about a
+# gigabyte apiece (node_modules), and nothing removes them: 83 GB across two repos by
+# 2026-11-28. The paths resolve only inside the box (the worktree's .git file points at
+# /repos/...), so the host asks the box. The rule is scripts/housekeeping.worktree_verdict:
+# merged into main, no tracked changes, no running session holding the lock, idle a week.
+_WT_SCAN = r"""
+git worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch /{b=substr($0,8)} /^locked/{l=1; r=substr($0,8)} /^$/{if (p ~ /\/\.claude\/worktrees\/agent-[^\/]*$/) print p "\t" b "\t" l "\t" r; p=b=r=""; l=0}' |
+while IFS=$'\t' read -r p b l r; do
+  br=${b#refs/heads/}; merged=0; git merge-base --is-ancestor "$br" main 2>/dev/null && merged=1
+  dirty=$(git -C "$p" status --porcelain --untracked-files=no 2>/dev/null | wc -l)
+  gd=$(git -C "$p" rev-parse --git-dir 2>/dev/null)
+  t=$(git log -1 --format=%ct "$br" 2>/dev/null); for f in "$gd/HEAD" "$gd/index"; do m=$(stat -c %Y "$f" 2>/dev/null); [ -n "$m" ] && [ "$m" -gt "${t:-0}" ] && t=$m; done
+  alive=0; pid=$(echo "$r" | sed -n 's/.*pid \([0-9]*\).*/\1/p'); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$br" "$merged" "$dirty" "${l:-0}" "$alive" "${t:-0}"
+done
+"""
+
+
+def cmd_fleet_worktrees(fleet, a):
+    """Remove merged, idle agent worktrees from each running box (--apply); list otherwise."""
+    hk = _hk_mod()
+    now, removed, kept = time.time(), 0, 0
+    for name, cfg in fleet["repos"].items():
+        if container_state(name) != "running":
+            continue
+        repo = "/repos/" + cfg["path"].strip("/")
+        out = subprocess.run(["docker", "exec", "-w", repo, container(name), "bash", "-c", _WT_SCAN],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            f = line.split("\t")
+            if len(f) != 7:
+                continue
+            p, br, merged, dirty, locked, alive, t = f
+            ok, why = hk.worktree_verdict(
+                {"merged": merged == "1", "tracked_dirty": int(dirty), "locked": locked == "1",
+                 "lock_alive": alive == "1", "last_touch": float(t)}, now, a.min_age_days * 86400)
+            if not ok:
+                kept += 1
+                if a.verbose:
+                    print(f"  keep   {name}:{os.path.basename(p)} — {why}")
+                continue
+            if not a.apply:
+                print(f"  would remove {name}:{os.path.basename(p)} ({br})")
+                continue
+            rm = subprocess.run(
+                ["docker", "exec", "-w", repo, container(name), "bash", "-c",
+                 'git worktree unlock "$1" 2>/dev/null; git worktree remove --force "$1" && git branch -d "$2" >/dev/null 2>&1; true',
+                 "_", p, br], capture_output=True, text=True)
+            print(f"  removed {name}:{os.path.basename(p)} ({br})" if rm.returncode == 0
+                  else f"  FAILED  {name}:{os.path.basename(p)}: {rm.stderr.strip()[:200]}")
+            removed += rm.returncode == 0
+    print(f"worktrees: {removed} removed, {kept} kept" if a.apply else f"worktrees: {kept} kept (dry run; --apply removes)")
+
+
+def _hk_weekly_worktrees(fleet, hk):
+    """Weekly: remove merged, idle agent worktrees from the boxes (`gent fleet worktrees`)."""
+    stamp = Path(fleet["state_root"]) / "worktrees-trim.stamp"
+    try:
+        if time.time() - stamp.stat().st_mtime < hk.CACHE_TRIM_EVERY_S:
+            return
+    except OSError:
+        pass
+    stamp.touch()
+    try:
+        cmd_fleet_worktrees(fleet, argparse.Namespace(apply=True, min_age_days=7, verbose=False))
+    except Exception as e:                      # noqa: BLE001 — a cleanup must not stop the alerting run
+        print(f"worktree cleanup failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def cmd_fleet_housekeeping(fleet, a):
     hk = _hk_mod()
     cfg = fleet.get("housekeeping") or {}
@@ -2767,6 +2837,7 @@ def cmd_fleet_housekeeping(fleet, a):
             lvl = hk.level_for(pct, hw, hh)
     if not a.dry_run:
         notes.extend(_hk_trim_shared_cache(fleet, hk))
+        _hk_weekly_worktrees(fleet, hk)
     msg = f"host disk {pct:.0f}% used — {hk.gb(free)} free of {hk.gb(total)} (warn {hw}%, hard {hh}%)"
     checks.append({"key": "host:disk", "level": lvl, "msg": msg + ("; " + "; ".join(notes) if notes else ""),
                    "detail": (lambda: _hk_top_dirs(fleet)) if lvl != hk.OK else None})
@@ -3575,6 +3646,10 @@ def main():
     fhk = fsub.add_parser("housekeeping", help="measure host + box disks, backups, stopped boxes; alert on change (the half-hourly timer runs this)")
     fhk.add_argument("--quiet", action="store_true", help="print nothing unless something is alerted")
     fhk.add_argument("--dry-run", action="store_true", help="measure and show what would be alerted; send nothing, save nothing")
+    fw = fsub.add_parser("worktrees", help="remove merged, idle agent worktrees from the boxes (dry run unless --apply)")
+    fw.add_argument("--apply", action="store_true", help="actually remove (default: list what would go)")
+    fw.add_argument("--min-age-days", type=float, default=7, help="idle at least this long (default 7)")
+    fw.add_argument("--verbose", action="store_true", help="also say why each kept worktree stays")
     fb = fsub.add_parser("backup", help="back up every box + the host's fleet state (restic; the hourly timer runs this)")
     fbs = fb.add_subparsers(dest="action", metavar="<action>")
     fbr = fbs.add_parser("run", help="back up now (default)")

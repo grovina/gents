@@ -230,6 +230,13 @@ Two things worth knowing:
   `/cache` (`$state_root/secrets/cache`, regenerable, skipped by the backup sync). Nothing
   else expires it, and it reached 40 GB. Housekeeping deletes npm/pip files unread for 30 days
   and runs `uv cache prune`; a miss only costs a download. Stamp: `$state_root/cache-trim.stamp`.
+  (It reads access time, so after a one-off mass read of the cache nothing qualifies for 30 days.)
+- **Merged agent worktrees are removed weekly.** Claude Code's subagents leave a ~1 GB git worktree
+  each under `<repo>/.claude/worktrees/agent-*`; 69 in homer alone, 83 GB across two repos.
+  `gent fleet worktrees` (dry run; `--apply` removes) asks each running box, from inside, and
+  removes a worktree only when its branch is merged into main, it has no changed tracked files,
+  no running session holds its lock, and it has been idle 7 days (`--min-age-days`). Untracked
+  scratch does not block; unmerged work is never touched. Stamp: `$state_root/worktrees-trim.stamp`.
 
 ## Backups — the host backs up every box, boxes do nothing
 

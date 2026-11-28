@@ -133,3 +133,26 @@ def trim_stale(root, max_age_s, now):
             except OSError:
                 pass
     return n, freed
+
+
+WORKTREE_MIN_AGE_S = 7 * 86400
+
+
+def worktree_verdict(w, now, min_age_s=WORKTREE_MIN_AGE_S):
+    """Is this agent worktree safe to delete? Returns (ok, reason). Conservative on purpose:
+    a worktree is removed only when nothing can be lost and nothing is using it.
+
+    `w` has: merged (branch is an ancestor of main), tracked_dirty (count of modified or
+    staged tracked files), locked (git lock present), lock_alive (the lock names a pid that is
+    still running), last_touch (epoch: newest of the branch tip's commit time and the
+    worktree's HEAD/index files). Untracked scratch (gate.log, census.txt) does not block."""
+    if not w.get("merged"):
+        return False, "not merged into main"
+    if w.get("tracked_dirty"):
+        return False, f"{w['tracked_dirty']} tracked file(s) changed"
+    if w.get("locked") and w.get("lock_alive"):
+        return False, "locked by a running session"
+    age = now - w.get("last_touch", now)
+    if age < min_age_s:
+        return False, f"touched {age / 86400:.1f}d ago"
+    return True, "merged, no tracked changes, idle"

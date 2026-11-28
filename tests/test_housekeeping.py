@@ -121,5 +121,25 @@ class TrimStale(unittest.TestCase):
             self.assertTrue(os.path.exists(fp))
 
 
+class WorktreeVerdict(unittest.TestCase):
+    NOW = 100 * 86400
+
+    def w(self, **kw):
+        base = dict(merged=True, tracked_dirty=0, locked=False, lock_alive=False, last_touch=self.NOW - 10 * 86400)
+        base.update(kw)
+        return base
+
+    def test_merged_clean_idle_goes(self):
+        self.assertTrue(hk.worktree_verdict(self.w(), self.NOW)[0])
+
+    def test_each_guard_keeps_it(self):
+        for kw in (dict(merged=False), dict(tracked_dirty=2), dict(locked=True, lock_alive=True),
+                   dict(last_touch=self.NOW - 3600)):
+            self.assertFalse(hk.worktree_verdict(self.w(**kw), self.NOW)[0], kw)
+
+    def test_a_lock_from_a_dead_session_does_not_hold_it(self):
+        self.assertTrue(hk.worktree_verdict(self.w(locked=True, lock_alive=False), self.NOW)[0])
+
+
 if __name__ == "__main__":
     unittest.main()
